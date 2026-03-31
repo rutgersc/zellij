@@ -277,6 +277,7 @@ message Action {
     SetDarkThemeAction set_dark_theme = 137;
     SetLightThemeAction set_light_theme = 138;
     ToggleThemeAction toggle_theme = 139;
+    PaneNameInputAction rename_active_pane = 140;
   }
 }
 
