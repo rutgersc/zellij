@@ -422,6 +422,8 @@ pub mod action {
         HideFloatingPanesPayload(super::HideFloatingPanesPayload),
         #[prost(message, tag="60")]
         AreFloatingPanesVisiblePayload(super::AreFloatingPanesVisiblePayload),
+        #[prost(message, tag="61")]
+        RenameActivePanePayload(super::RenameActivePanePayload),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -469,6 +471,12 @@ pub struct HideFloatingPanesPayload {
 pub struct AreFloatingPanesVisiblePayload {
     #[prost(uint32, optional, tag="1")]
     pub tab_id: ::core::option::Option<u32>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenameActivePanePayload {
+    #[prost(bytes="vec", tag="1")]
+    pub name: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1120,6 +1128,7 @@ pub enum ActionName {
     SetDarkTheme = 101,
     SetLightTheme = 102,
     ToggleTheme = 103,
+    RenameActivePane = 104,
 }
 impl ActionName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1229,6 +1238,7 @@ impl ActionName {
             ActionName::SetDarkTheme => "SetDarkTheme",
             ActionName::SetLightTheme => "SetLightTheme",
             ActionName::ToggleTheme => "ToggleTheme",
+            ActionName::RenameActivePane => "RenameActivePane",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1335,6 +1345,7 @@ impl ActionName {
             "SetDarkTheme" => Some(Self::SetDarkTheme),
             "SetLightTheme" => Some(Self::SetLightTheme),
             "ToggleTheme" => Some(Self::ToggleTheme),
+            "RenameActivePane" => Some(Self::RenameActivePane),
             _ => None,
         }
     }
