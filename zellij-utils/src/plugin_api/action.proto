@@ -247,6 +247,7 @@ message Action {
     HideFloatingPanesPayload hide_floating_panes_payload = 59;
     AreFloatingPanesVisiblePayload are_floating_panes_visible_payload = 60;
     SetPaneFrameStylePayload set_pane_frame_style_payload = 61;
+    RenameActivePanePayload rename_active_pane_payload = 62;
   }
 }
 
@@ -281,6 +282,10 @@ message HideFloatingPanesPayload {
 
 message AreFloatingPanesVisiblePayload {
   optional uint32 tab_id = 1;
+}
+
+message RenameActivePanePayload {
+  bytes name = 1;
 }
 
 message PaneIdAndShouldFloat {
@@ -505,6 +510,7 @@ enum ActionName {
     FocusHostSession = 107;
     ToggleHostFullscreen = 108;
     FocusGuestSession = 109;
+    RenameActivePane = 110;
 }
 
 message Position {
