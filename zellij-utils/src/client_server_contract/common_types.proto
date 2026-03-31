@@ -285,6 +285,7 @@ message Action {
     FocusHostSessionAction focus_host_session = 145;
     ToggleHostFullscreenAction toggle_host_fullscreen = 146;
     FocusGuestSessionAction focus_guest_session = 147;
+    PaneNameInputAction rename_active_pane = 148;
   }
 }
 
