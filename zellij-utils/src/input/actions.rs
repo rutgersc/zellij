@@ -305,6 +305,11 @@ pub enum Action {
         input: Vec<u8>,
     },
     UndoRenamePane,
+    /// Rename the focused pane, fully replacing any existing name.
+    /// Used by CLI `rename-pane` without `--pane-id`.
+    RenameActivePane {
+        name: Vec<u8>,
+    },
     /// Create a new tab, optionally with a specified tab layout.
     NewTab {
         tiled_layout: Option<TiledPaneLayout>,
