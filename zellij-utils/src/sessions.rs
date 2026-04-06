@@ -180,7 +180,7 @@ fn assert_socket(name: &str) -> bool {
             return false;
         },
     };
-    let pid: u32 = match pid_str.trim().parse() {
+    let pid: u32 = match pid_str.lines().next().unwrap_or("").trim().parse() {
         Ok(p) => p,
         Err(_) => {
             // Marker file exists but has no valid PID (e.g. empty from old version).
