@@ -36,13 +36,9 @@ pub(crate) fn stdin_loop(
     // decision before the startup ANSI query below.
     //
     // 1. VT reader (preferred): Enable ENABLE_VIRTUAL_TERMINAL_INPUT so
-    //    ReadFile on stdin returns raw VT bytes, bypassing ConPTY's lossy
-    //    VT→INPUT_RECORD translation. Uses the termwiz byte parser (same as
-    //    Unix) plus the kitty keyboard parser so CSI u sequences (e.g.
-    //    `ESC[102;6u` for Ctrl+Shift+F) are correctly parsed as key events.
-    //    Without this, terminals like Windows Terminal that emit kitty keyboard
-    //    protocol sequences see them leak as literal text into panes because
-    //    ConPTY cannot translate CSI u to INPUT_RECORDs.
+    //    ReadFile on stdin returns raw VT bytes. Uses the termwiz byte parser
+    //    (same as Unix) plus the kitty keyboard parser so CSI u sequences
+    //    (e.g. `ESC[102;6u` for Ctrl+Shift+F) are correctly parsed.
     //
     // 2. Native console (fallback): Use crossterm's event::read() which reads
     //    INPUT_RECORDs via ReadConsoleInput. Only used when enable_vt_input()
