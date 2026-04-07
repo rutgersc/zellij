@@ -1,0 +1,9 @@
+[package]
+name = "vt-input-test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Console", "Win32_Foundation"] }
