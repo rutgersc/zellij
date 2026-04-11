@@ -649,7 +649,9 @@ fn assert_socket(name: &str) -> bool {
 #[cfg(windows)]
 fn assert_socket(name: &str) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     let path = &*ZELLIJ_SOCK_DIR.join(name);
     let pid_str = match fs::read_to_string(path) {
@@ -659,7 +661,7 @@ fn assert_socket(name: &str) -> bool {
             return false;
         },
     };
-    let pid: u32 = match pid_str.trim().parse() {
+    let pid: u32 = match pid_str.lines().next().unwrap_or("").trim().parse() {
         Ok(p) => p,
         Err(_) => {
             // Marker file exists but has no valid PID (e.g. empty from old version).
@@ -673,8 +675,14 @@ fn assert_socket(name: &str) -> bool {
         if handle == 0 {
             false
         } else {
+            // OpenProcess can succeed for zombie/exited processes whose
+            // handles haven't been fully released, or for reused PIDs.
+            // Check if the process is actually still running.
+            let mut exit_code: u32 = 0;
+            let still_running = GetExitCodeProcess(handle, &mut exit_code) != 0
+                && exit_code == 259; // 259 = STILL_ACTIVE
             CloseHandle(handle);
-            true
+            still_running
         }
     };
     if !alive {
