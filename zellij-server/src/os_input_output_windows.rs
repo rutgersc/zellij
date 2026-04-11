@@ -29,7 +29,8 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcess, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOEXW, STARTUPINFOW,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 use zellij_utils::{errors::prelude::*, input::command::RunCommand};
@@ -349,14 +350,36 @@ fn spawn_child_process(
 
 fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
     unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        let handle = OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        );
         if handle == 0 {
-            return Err(std::io::Error::last_os_error());
+            // Process may already be gone — treat as success
+            let err = std::io::Error::last_os_error();
+            return if err.raw_os_error() == Some(87) || err.raw_os_error() == Some(5) {
+                Ok(())
+            } else {
+                Err(err)
+            };
+        }
+        // Check if the process is still alive before terminating
+        let mut exit_code: u32 = 0;
+        if GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code != 259 {
+            CloseHandle(handle);
+            return Ok(()); // already exited
         }
         let ok = TerminateProcess(handle, 1);
         CloseHandle(handle);
         if ok == 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            // ERROR_INVALID_PARAMETER (87) can occur if the process exited
+            // between our check and the TerminateProcess call — treat as success
+            if err.raw_os_error() == Some(87) {
+                return Ok(());
+            }
+            return Err(err);
         }
     }
     Ok(())
