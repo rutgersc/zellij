@@ -467,14 +467,18 @@ impl Drop for SessionMetaData {
 
 macro_rules! remove_client {
     ($client_id:expr, $os_input:expr, $session_state:expr) => {
-        $os_input.remove_client($client_id).unwrap();
+        if let Err(e) = $os_input.remove_client($client_id) {
+            log::error!("Failed to remove client {}: {:?}", $client_id, e);
+        }
         $session_state.write().unwrap().remove_client($client_id);
     };
 }
 
 macro_rules! remove_watcher {
     ($client_id:expr, $os_input:expr, $session_state:expr) => {
-        $os_input.remove_client($client_id).unwrap();
+        if let Err(e) = $os_input.remove_client($client_id) {
+            log::error!("Failed to remove watcher client {}: {:?}", $client_id, e);
+        }
         $session_state.write().unwrap().remove_watcher($client_id);
     };
 }
