@@ -276,6 +276,8 @@ impl ClientOsApi for ClientOsInputOutput {
         }
     }
     fn connect_to_server(&self, path: &Path) {
+        let timeout = time::Duration::from_secs(3);
+        let started = time::Instant::now();
         let socket;
         loop {
             match zellij_utils::consts::ipc_connect(path) {
@@ -284,6 +286,17 @@ impl ClientOsApi for ClientOsInputOutput {
                     break;
                 },
                 Err(_) => {
+                    if started.elapsed() > timeout {
+                        eprintln!(
+                            "Session server is not responding. \
+                             The session may be in a broken state.\n\
+                             You can try: zellij delete-session {}",
+                            path.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        );
+                        std::process::exit(1);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 },
             }
