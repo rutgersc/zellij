@@ -126,7 +126,8 @@ opt-level = 3
 
 [profile.release]
 lto = true
-strip = true
+strip = "none"
+debug = "line-tables-only"
 codegen-units = 1
 
 [package.metadata.deb]
