@@ -21,16 +21,16 @@ pub(crate) fn stdin_loop(
     // On Windows, choose between two input strategies early — we need this
     // decision before the startup ANSI query below.
     //
-    // 1. Native console (no TERM env var): Use crossterm's event::read() which
-    //    reads INPUT_RECORDs via ReadConsoleInput. Works in cmd.exe, PowerShell,
-    //    and Windows Terminal where ALT is reported as a modifier flag.
+    // 1. VT reader (preferred): Enable ENABLE_VIRTUAL_TERMINAL_INPUT so
+    //    ReadFile on stdin returns raw VT bytes. Uses the termwiz byte parser
+    //    (same as Unix) plus the kitty keyboard parser so CSI u sequences
+    //    (e.g. `ESC[102;6u` for Ctrl+Shift+F) are correctly parsed.
     //
-    // 2. Terminal emulator (TERM is set, e.g. Alacritty): Enable
-    //    ENABLE_VIRTUAL_TERMINAL_INPUT so ReadFile on stdin returns raw VT bytes,
-    //    bypassing conpty's lossy VT→INPUT_RECORD translation. Then use the
-    //    termwiz byte parser (same as Unix) which understands ESC-prefixed ALT.
+    // 2. Native console (fallback): Use crossterm's event::read() which reads
+    //    INPUT_RECORDs via ReadConsoleInput. Only used when enable_vt_input()
+    //    fails (e.g. no valid console handle).
     #[cfg(windows)]
-    let use_vt_reader = std::env::var("TERM").is_ok() && enable_vt_input();
+    let use_vt_reader = enable_vt_input();
 
     // Send the startup host query string so the host terminal replies
     // with its live pixel dimensions, fg/bg, sync-output support, and
