@@ -843,7 +843,8 @@ pub(crate) fn start_client(opts: CliArgs) {
 
                 if let Ok(val) = std::env::var(envs::SESSION_NAME_ENV_KEY) {
                     if val == *client.get_session_name() {
-                        panic!("You are trying to attach to the current session (\"{}\"). This is not supported.", val);
+                        eprintln!("Cannot attach to the current session (\"{val}\").");
+                        std::process::exit(1);
                     }
                 }
 
