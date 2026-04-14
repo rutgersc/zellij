@@ -166,6 +166,7 @@ pub(crate) fn stdin_loop(
                                 .write_cache(ansi_stdin_events.drain(..).collect());
                         }
                         current_buffer.append(&mut buf.to_vec());
+                        log::info!("STDIN bytes: {:?}", &buf);
 
                         if !explicitly_disable_kitty_keyboard_protocol {
                             // first we try to parse with the KittyKeyboardParser
