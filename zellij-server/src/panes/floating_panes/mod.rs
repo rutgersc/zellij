@@ -128,6 +128,11 @@ impl FloatingPanes {
         self.panes.keys()
     }
     pub fn add_pane(&mut self, pane_id: PaneId, pane: Box<dyn Pane>) {
+        log::info!(
+            "floating_panes.add_pane: pane_id={:?}, existing_panes_before={}",
+            pane_id,
+            self.panes.len(),
+        );
         self.desired_pane_positions
             .insert(pane_id, pane.position_and_size());
         self.panes.insert(pane_id, pane);
@@ -189,6 +194,13 @@ impl FloatingPanes {
         removed_pane
     }
     pub fn remove_pane(&mut self, pane_id: PaneId) -> Option<Box<dyn Pane>> {
+        let bt = std::backtrace::Backtrace::force_capture();
+        log::info!(
+            "floating_panes.remove_pane: pane_id={:?}, existing_panes={}, backtrace:\n{}",
+            pane_id,
+            self.panes.len(),
+            bt,
+        );
         self.z_indices.retain(|p_id| *p_id != pane_id);
         self.desired_pane_positions.remove(&pane_id);
         self.panes.remove(&pane_id)
