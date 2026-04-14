@@ -1378,6 +1378,12 @@ impl Tab {
         default_shell: Option<TerminalAction>,
         completion_tx: Option<NotificationEnd>,
     ) -> Result<()> {
+        log::info!(
+            "toggle_floating_panes: visible={}, selectable_count={}, client_id={:?}",
+            self.floating_panes.panes_are_visible(),
+            self.floating_panes.pane_ids().count(),
+            client_id,
+        );
         if self.floating_panes.panes_are_visible() {
             self.hide_floating_panes();
             self.set_force_render();
@@ -1445,6 +1451,7 @@ impl Tab {
         client_id: Option<ClientId>,
         blocking_notification: Option<NotificationEnd>,
     ) -> Result<()> {
+        log::info!("new_pane: pid={:?}, placement={:?}, client_id={:?}, should_focus={}", pid, new_pane_placement, client_id, should_focus_pane);
         let invoked_with = self.normalize_invoked_with_for_default_shell(invoked_with);
         match new_pane_placement {
             NewPanePlacement::NoPreference { borderless } => self.new_no_preference_pane(
@@ -5300,7 +5307,16 @@ impl Tab {
         should_focus_new_pane: bool,
     ) -> Result<()> {
         let err_context = || format!("failed to add floating pane");
+        let viewport = { *self.viewport.borrow() };
+        log::info!(
+            "add_floating_pane: pane_id={:?}, viewport=({}, {}, {}x{}), existing_floating_panes={}, show_panes={}",
+            pane_id,
+            viewport.x, viewport.y, viewport.cols, viewport.rows,
+            self.floating_panes.pane_ids().count(),
+            self.floating_panes.panes_are_visible(),
+        );
         if let Some(mut new_pane_geom) = self.floating_panes.find_room_for_new_pane() {
+            log::info!("add_floating_pane: found room at geom=({}, {}, {}x{})", new_pane_geom.x, new_pane_geom.y, new_pane_geom.cols.as_usize(), new_pane_geom.rows.as_usize());
             if let Some(floating_pane_coordinates) = &floating_pane_coordinates {
                 let viewport = self.viewport.borrow();
                 if let Some(pinned) = floating_pane_coordinates.pinned.as_ref() {
@@ -5327,6 +5343,8 @@ impl Tab {
             if should_focus_new_pane {
                 self.floating_panes.focus_pane_for_all_clients(pane_id);
             }
+        } else {
+            log::error!("add_floating_pane: find_room_for_new_pane returned None! Cannot place floating pane {:?}", pane_id);
         }
         if self.auto_layout && !self.swap_layouts.is_floating_damaged() {
             // only do this if we're already in this layout, otherwise it might be
