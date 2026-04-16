@@ -376,19 +376,44 @@ pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
 /// DETACHED_PROCESS) so the server gets valid standard handles;
 /// DETACHED_PROCESS leaves stdin/stdout/stderr as NULL, which breaks PTY
 /// creation, WASM plugin loading, and logging.
+///
+/// CREATE_BREAKAWAY_FROM_JOB detaches the server from the terminal's Job
+/// Object.  Without this, terminals like Windows Terminal and WezTerm kill
+/// the server (and all attached clients) when a tab is closed or the
+/// terminal crashes, because their Job Object has KILL_ON_JOB_CLOSE set.
+/// If the parent job doesn't allow breakaway we fall back without it.
 #[cfg(windows)]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+    let base_flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+
     let mut cmd = Command::new(current_exe()?);
     cmd.arg("--server").arg(socket_path);
     if debug {
         cmd.arg("--debug");
     }
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    cmd.spawn()?;
-    Ok(())
+
+    // Try with breakaway first so the server survives terminal closure.
+    // Fall back without it if the parent job disallows breakaway.
+    cmd.creation_flags(base_flags | CREATE_BREAKAWAY_FROM_JOB);
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let mut cmd = Command::new(current_exe()?);
+            cmd.arg("--server").arg(socket_path);
+            if debug {
+                cmd.arg("--debug");
+            }
+            cmd.creation_flags(base_flags);
+            cmd.spawn()?;
+            Ok(())
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
