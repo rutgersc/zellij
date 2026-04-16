@@ -3884,6 +3884,7 @@ impl Tab {
             };
         }
         let closed_pane = if self.floating_panes.panes_contain(&id) {
+            log::info!("close_pane (floating) caller: id={:?}", id);
             let closed_pane = self.floating_panes.remove_pane(id);
             self.floating_panes.move_clients_out_of_pane(id);
             if !self.floating_panes.has_selectable_panes() {
@@ -3958,6 +3959,7 @@ impl Tab {
             };
         }
         if self.floating_panes.panes_contain(&id) {
+            log::info!("extract_pane (floating) caller: id={:?}", id);
             let mut closed_pane = self.floating_panes.remove_pane(id);
             self.floating_panes.move_clients_out_of_pane(id);
             if !self.floating_panes.has_panes() {
