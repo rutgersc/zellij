@@ -5370,7 +5370,17 @@ impl Tab {
         }
         let should_auto_layout =
             self.auto_layout && !self.swap_layouts.is_tiled_damaged() && !without_relayout;
-        if self.tiled_panes.has_room_for_new_pane() {
+        let has_room = self.tiled_panes.has_room_for_new_pane();
+        log::info!(
+            "add_tiled_pane: pane_id={:?}, has_room={}, existing_tiled_panes={}, fullscreen_active={}, auto_layout={}, should_auto_layout={}",
+            pane_id,
+            has_room,
+            self.tiled_panes.pane_ids().count(),
+            self.tiled_panes.fullscreen_is_active(),
+            self.auto_layout,
+            should_auto_layout,
+        );
+        if has_room {
             pane.set_active_at(Instant::now());
             if should_auto_layout {
                 // no need to relayout here, we'll do it when reapplying the swap layout
@@ -5384,6 +5394,11 @@ impl Tab {
             if let Some(client_id) = client_id {
                 self.tiled_panes.focus_pane(pane_id, client_id);
             }
+        } else {
+            log::error!(
+                "add_tiled_pane: SILENT DROP — no room for pane_id={:?}, dropping Box<dyn Pane>",
+                pane_id,
+            );
         }
         if should_auto_layout {
             // only do this if we're already in this layout, otherwise it might be
