@@ -342,9 +342,22 @@ fn spawn_child_process(
     unsafe { DeleteProcThreadAttributeList(attr_list) };
 
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        log::error!(
+            "CreateProcessW failed for terminal_id={}, cmd='{}': {}",
+            terminal_id,
+            cmd.command.to_string_lossy(),
+            e
+        );
+        return Err(e);
     }
 
+    log::info!(
+        "CreateProcessW ok terminal_id={} child_pid={} cmd='{}'",
+        terminal_id,
+        pi.dwProcessId,
+        cmd.command.to_string_lossy()
+    );
     Ok((pi.hProcess, pi.hThread, pi.dwProcessId))
 }
 
@@ -480,6 +493,7 @@ impl WindowsPtyBackend {
         // 7. Exit-monitoring thread (zero CPU — spends all time in kernel wait)
         let cmd_for_monitor = cmd.clone();
         std::thread::spawn(move || {
+            let spawned_at = std::time::Instant::now();
             let exit_code = unsafe {
                 WaitForSingleObject(process_handle, INFINITE);
                 let mut code: u32 = 0;
@@ -487,6 +501,16 @@ impl WindowsPtyBackend {
                 CloseHandle(process_handle);
                 code
             };
+            let lifetime_ms = spawned_at.elapsed().as_millis();
+            log::info!(
+                "child exit terminal_id={} child_pid={} exit_code=0x{:08x} ({}) lifetime_ms={} cmd='{}'",
+                terminal_id,
+                child_pid,
+                exit_code,
+                exit_code as i32,
+                lifetime_ms,
+                cmd_for_monitor.command.to_string_lossy()
+            );
             quit_cb(
                 PaneId::Terminal(terminal_id),
                 Some(exit_code as i32),

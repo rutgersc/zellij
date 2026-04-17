@@ -3873,7 +3873,7 @@ impl Tab {
             };
         }
         let closed_pane = if self.floating_panes.panes_contain(&id) {
-            log::info!("close_pane (floating) caller: id={:?}", id);
+            log::info!("close_pane (floating) caller: id={:?}, exit_status={:?}", id, exit_status);
             let closed_pane = self.floating_panes.remove_pane(id);
             self.floating_panes.move_clients_out_of_pane(id);
             if !self.floating_panes.has_selectable_panes() {
@@ -3893,6 +3893,7 @@ impl Tab {
             }
             closed_pane
         } else {
+            log::info!("close_pane (tiled) caller: id={:?}, exit_status={:?}", id, exit_status);
             if self.tiled_panes.fullscreen_is_active() {
                 self.tiled_panes.unset_fullscreen();
             }
