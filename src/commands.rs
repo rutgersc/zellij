@@ -958,14 +958,28 @@ pub(crate) fn start_client(opts: CliArgs) {
                 }
 
                 let use_cwd_name = config_options.session_name_from_cwd.unwrap_or(false);
-                let session_name = generate_unique_session_name_or_exit(use_cwd_name);
-                start_client_plan(session_name.clone());
+                let existing_cwd_session = if use_cwd_name {
+                    let current_session = std::env::var(envs::SESSION_NAME_ENV_KEY).ok();
+                    session_name_from_cwd().filter(|name| {
+                        session_exists(name).unwrap_or(false)
+                            && current_session.as_deref() != Some(name.as_str())
+                    })
+                } else {
+                    None
+                };
+                let client = if let Some(existing) = existing_cwd_session {
+                    ClientInfo::Attach(existing, config_options.clone())
+                } else {
+                    let session_name = generate_unique_session_name_or_exit(use_cwd_name);
+                    start_client_plan(session_name.clone());
+                    ClientInfo::New(session_name, layout_info, new_session_cwd)
+                };
                 reconnect_to_session = start_client_impl(
                     Box::new(os_input),
                     opts,
                     config,
                     config_options,
-                    ClientInfo::New(session_name, layout_info, new_session_cwd),
+                    client,
                     None,
                     None,
                     is_a_reconnect,
