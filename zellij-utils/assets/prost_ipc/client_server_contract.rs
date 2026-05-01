@@ -2369,6 +2369,7 @@ pub enum InputMode {
     Move = 12,
     Prompt = 13,
     Tmux = 14,
+    CopyMode = 15,
 }
 impl InputMode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2392,6 +2393,7 @@ impl InputMode {
             InputMode::Move => "INPUT_MODE_MOVE",
             InputMode::Prompt => "INPUT_MODE_PROMPT",
             InputMode::Tmux => "INPUT_MODE_TMUX",
+            InputMode::CopyMode => "INPUT_MODE_COPY_MODE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2412,6 +2414,7 @@ impl InputMode {
             "INPUT_MODE_MOVE" => Some(Self::Move),
             "INPUT_MODE_PROMPT" => Some(Self::Prompt),
             "INPUT_MODE_TMUX" => Some(Self::Tmux),
+            "INPUT_MODE_COPY_MODE" => Some(Self::CopyMode),
             _ => None,
         }
     }

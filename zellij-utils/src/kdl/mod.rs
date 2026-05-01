@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::input::actions::{Action, SearchDirection, SearchOption};
+use crate::input::actions::{Action, CopyMotion, SearchDirection, SearchOption};
 use crate::input::command::RunCommandAction;
 
 #[macro_export]
@@ -84,6 +84,8 @@ macro_rules! parse_kdl_action_arguments {
                 "PreviousSwapLayout" => Ok(Action::PreviousSwapLayout),
                 "NextSwapLayout" => Ok(Action::NextSwapLayout),
                 "Clear" => Ok(Action::ClearScreen),
+                "ToggleCopyVisual" => Ok(Action::ToggleCopyVisual),
+                "CopyAndExitCopyMode" => Ok(Action::CopyAndExitCopyMode),
                 _ => Err(ConfigError::new_kdl_error(
                     format!("Unsupported action: {:?}", $action_name),
                     $action_node.span().offset(),
@@ -496,6 +498,16 @@ impl Action {
                     )
                 })?;
                 Ok(Action::MoveFocus { direction })
+            },
+            "MoveCopyCursor" => {
+                let motion = CopyMotion::from_str(string.as_str()).map_err(|_| {
+                    ConfigError::new_kdl_error(
+                        format!("Invalid copy-mode motion: '{}'", string),
+                        action_node.span().offset(),
+                        action_node.span().len(),
+                    )
+                })?;
+                Ok(Action::MoveCopyCursor { motion })
             },
             "MoveFocusOrTab" => {
                 let direction = Direction::from_str(string.as_str()).map_err(|_| {
@@ -1629,6 +1641,17 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
             },
             "Copy" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
             "Clear" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
+            "ToggleCopyVisual" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "CopyAndExitCopyMode" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "MoveCopyCursor" => parse_kdl_action_char_or_string_arguments!(
+                action_name,
+                action_arguments,
+                kdl_action
+            ),
             "Confirm" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
             "Deny" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
             "Write" => parse_kdl_action_u8_arguments!(action_name, action_arguments, kdl_action),

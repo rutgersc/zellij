@@ -47,6 +47,7 @@ use zellij_utils::data::{
     ResizeStrategy, SessionInfo, Styling, TabInfo, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
+use zellij_utils::input::actions::CopyMotion;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::config::Config;
 use zellij_utils::input::keybinds::Keybinds;
@@ -407,6 +408,9 @@ pub enum ScreenInstruction {
         response_channel: crossbeam::channel::Sender<Option<TabInfo>>,
     },
     EditScrollback(ClientId, bool, Option<NotificationEnd>),
+    MoveCopyCursor(ClientId, CopyMotion, Option<NotificationEnd>),
+    ToggleCopyVisual(ClientId, Option<NotificationEnd>),
+    CopyAndExitCopyMode(ClientId, Option<NotificationEnd>),
     GetPaneScrollback {
         pane_id: PaneId,
         client_id: ClientId,
@@ -945,6 +949,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::GetPaneInfo { .. } => ScreenContext::GetPaneInfo,
             ScreenInstruction::GetTabInfo { .. } => ScreenContext::GetTabInfo,
             ScreenInstruction::EditScrollback(..) => ScreenContext::EditScrollback,
+            ScreenInstruction::MoveCopyCursor(..) => ScreenContext::MoveCopyCursor,
+            ScreenInstruction::ToggleCopyVisual(..) => ScreenContext::ToggleCopyVisual,
+            ScreenInstruction::CopyAndExitCopyMode(..) => ScreenContext::CopyAndExitCopyMode,
             ScreenInstruction::GetPaneScrollback { .. } => ScreenContext::GetPaneScrollback,
             ScreenInstruction::ScrollUp(..) => ScreenContext::ScrollUp,
             ScreenInstruction::ScrollDown(..) => ScreenContext::ScrollDown,
@@ -3804,6 +3811,16 @@ impl Screen {
             }
         }
 
+        if mode_info.mode == InputMode::CopyMode && previous_mode != InputMode::CopyMode {
+            if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
+                active_tab.enter_copy_mode_in_active_pane(client_id);
+            }
+        } else if previous_mode == InputMode::CopyMode && mode_info.mode != InputMode::CopyMode {
+            if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
+                active_tab.exit_copy_mode_in_active_pane(client_id);
+            }
+        }
+
         if mode_info.mode == InputMode::RenamePane {
             if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
                 if let Some(active_pane) =
@@ -6592,6 +6609,32 @@ pub(crate) fn screen_thread_main(
                 );
                 screen.render(None)?;
                 screen.log_and_report_session_state()?;
+            },
+            ScreenInstruction::MoveCopyCursor(client_id, motion, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .move_copy_mode_cursor(motion, client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::ToggleCopyVisual(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab.toggle_copy_mode_visual(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::CopyAndExitCopyMode(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab.copy_mode_yank(client_id),
+                    ?
+                );
+                screen.render(None)?;
             },
             ScreenInstruction::GetPaneScrollback {
                 pane_id,
