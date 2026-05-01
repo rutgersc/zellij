@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::time::{self, Instant};
 use vte;
 use zellij_utils::data::PaneContents;
+use zellij_utils::input::actions::CopyMotion;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::pane_size::Offset;
@@ -637,6 +638,32 @@ impl Pane for TerminalPane {
 
     fn get_selected_text(&self, _client_id: ClientId) -> Option<String> {
         self.grid.get_selected_text()
+    }
+
+    fn enter_copy_mode(&mut self, _client_id: ClientId) {
+        self.grid.enter_copy_mode();
+        self.set_should_render(true);
+    }
+
+    fn exit_copy_mode(&mut self, _client_id: ClientId) {
+        self.grid.exit_copy_mode();
+        self.set_should_render(true);
+    }
+
+    fn apply_copy_motion(&mut self, motion: CopyMotion, _client_id: ClientId) {
+        self.grid.apply_copy_motion(motion);
+        self.set_should_render(true);
+    }
+
+    fn toggle_copy_visual(&mut self, _client_id: ClientId) {
+        self.grid.toggle_copy_visual();
+        self.set_should_render(true);
+    }
+
+    fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
+        let text = self.grid.copy_mode_yank_text();
+        self.set_should_render(true);
+        text
     }
 
     fn set_frame(&mut self, _frame: bool) {

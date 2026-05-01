@@ -97,6 +97,44 @@ impl FromStr for SearchOption {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum CopyMotion {
+    #[default]
+    Left,
+    Right,
+    Up,
+    Down,
+    WordForward,
+    WordEnd,
+    WordBackward,
+    LineStart,
+    LineFirstNonBlank,
+    LineEnd,
+    BufferTop,
+    BufferBottom,
+}
+
+impl FromStr for CopyMotion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "left" | "h" => Ok(CopyMotion::Left),
+            "right" | "l" => Ok(CopyMotion::Right),
+            "up" | "k" => Ok(CopyMotion::Up),
+            "down" | "j" => Ok(CopyMotion::Down),
+            "wordforward" | "w" => Ok(CopyMotion::WordForward),
+            "wordend" | "e" => Ok(CopyMotion::WordEnd),
+            "wordbackward" | "b" => Ok(CopyMotion::WordBackward),
+            "linestart" | "0" => Ok(CopyMotion::LineStart),
+            "linefirstnonblank" | "^" => Ok(CopyMotion::LineFirstNonBlank),
+            "lineend" | "$" => Ok(CopyMotion::LineEnd),
+            "buffertop" | "gg" | "top" => Ok(CopyMotion::BufferTop),
+            "bufferbottom" | "G" | "bottom" => Ok(CopyMotion::BufferBottom),
+            _ => Err(format!("Failed to parse CopyMotion. Unknown motion: {}", s)),
+        }
+    }
+}
+
 // As these actions are bound to the default config, please
 // do take care when refactoring - or renaming.
 // They might need to be adjusted in the default config
@@ -188,6 +226,14 @@ pub enum Action {
     EditScrollback {
         ansi: bool,
     },
+    /// Move the copy-mode cursor in a vim-style direction within the active pane.
+    MoveCopyCursor {
+        motion: CopyMotion,
+    },
+    /// Toggle visual selection in the active pane's copy mode.
+    ToggleCopyVisual,
+    /// Yank the current copy-mode selection to the system clipboard and exit copy mode.
+    CopyAndExitCopyMode,
     /// Scroll up in focus pane.
     ScrollUp,
     /// Scroll up at point

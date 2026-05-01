@@ -730,6 +730,7 @@ enum InputMode {
   INPUT_MODE_MOVE = 12;
   INPUT_MODE_PROMPT = 13;
   INPUT_MODE_TMUX = 14;
+  INPUT_MODE_COPY_MODE = 15;
 }
 
 enum Direction {

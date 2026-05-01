@@ -37,4 +37,6 @@ enum InputMode {
     Prompt = 12;
     /// `Tmux` mode allows for basic tmux keybindings functionality
     Tmux = 13;
+    /// `CopyMode` mode allows vim-style navigation and copying of pane contents.
+    CopyMode = 14;
 }
