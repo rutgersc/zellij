@@ -508,6 +508,31 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::MoveCopyCursor { motion } => {
+            senders
+                .send_to_screen(ScreenInstruction::MoveCopyCursor(
+                    client_id,
+                    motion,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::ToggleCopyVisual => {
+            senders
+                .send_to_screen(ScreenInstruction::ToggleCopyVisual(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::CopyAndExitCopyMode => {
+            senders
+                .send_to_screen(ScreenInstruction::CopyAndExitCopyMode(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
 
         Action::ScrollUp => {
             senders

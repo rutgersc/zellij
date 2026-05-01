@@ -158,6 +158,23 @@ keybinds {
             SwitchToMode "Normal"
         }
     }
+    copymode {
+        bind "Esc" "q" { SwitchToMode "Normal"; }
+        bind "h" "Left" { MoveCopyCursor "left"; }
+        bind "j" "Down" { MoveCopyCursor "down"; }
+        bind "k" "Up" { MoveCopyCursor "up"; }
+        bind "l" "Right" { MoveCopyCursor "right"; }
+        bind "w" { MoveCopyCursor "wordforward"; }
+        bind "e" { MoveCopyCursor "wordend"; }
+        bind "b" { MoveCopyCursor "wordbackward"; }
+        bind "0" { MoveCopyCursor "linestart"; }
+        bind "^" { MoveCopyCursor "linefirstnonblank"; }
+        bind "$" { MoveCopyCursor "lineend"; }
+        bind "g" { MoveCopyCursor "buffertop"; }
+        bind "G" { MoveCopyCursor "bufferbottom"; }
+        bind "v" { ToggleCopyVisual; }
+        bind "y" { CopyAndExitCopyMode; SwitchToMode "Normal"; }
+    }
     tmux {
         bind "[" { SwitchToMode "Scroll"; }
         bind "Ctrl b" { Write 2; SwitchToMode "Normal"; }

@@ -1179,6 +1179,9 @@ pub enum InputMode {
     /// `Tmux` mode allows for basic tmux keybindings functionality
     #[serde(alias = "tmux")]
     Tmux,
+    /// `CopyMode` allows vim-style navigation and copying of pane contents.
+    #[serde(alias = "copymode")]
+    CopyMode,
 }
 
 impl Default for InputMode {
@@ -1323,6 +1326,7 @@ impl FromStr for InputMode {
             "move" | "Move" => Ok(InputMode::Move),
             "prompt" | "Prompt" => Ok(InputMode::Prompt),
             "tmux" | "Tmux" => Ok(InputMode::Tmux),
+            "copymode" | "Copymode" | "CopyMode" => Ok(InputMode::CopyMode),
             "entersearch" | "Entersearch" | "EnterSearch" => Ok(InputMode::EnterSearch),
             e => Err(ConversionError::UnknownInputMode(e.into())),
         }
