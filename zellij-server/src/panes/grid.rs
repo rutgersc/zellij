@@ -4967,7 +4967,15 @@ impl Grid {
                 col = 0;
             },
             CopyMotion::LineEnd => {
-                col = row_len(self, line).saturating_sub(1);
+                col = self
+                    .viewport
+                    .get(line.max(0) as usize)
+                    .and_then(|r| {
+                        r.columns
+                            .iter()
+                            .rposition(|c| !c.character.is_whitespace())
+                    })
+                    .unwrap_or(0);
             },
             CopyMotion::LineFirstNonBlank => {
                 col = self
