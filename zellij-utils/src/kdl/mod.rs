@@ -5204,9 +5204,43 @@ impl BareKey {
     }
 }
 
+/// Pre-parse hook that activates fork-only KDL by removing fork markers, so the
+/// same config file remains valid for vanilla zellij (which sees comments) and
+/// fork zellij (which sees real KDL).
+///
+/// Two marker styles are supported:
+/// - Line prefix `// FORK ` at the start of a line (after optional indent) is
+///   replaced with same-length whitespace, exposing the rest of the line.
+/// - Block markers `/* FORK` and `FORK */` are replaced with same-length
+///   whitespace, exposing whatever lies between.
+///
+/// Replacements preserve byte offsets so KDL parser error spans still point at
+/// the right column in the original source.
+fn strip_fork_markers(input: &str) -> String {
+    let s = input
+        .replace("/* FORK", "       ") // 7 spaces, same length as `/* FORK`
+        .replace("FORK */", "       "); // 7 spaces, same length as `FORK */`
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let indent_len = line
+            .bytes()
+            .take_while(|b| *b == b' ' || *b == b'\t')
+            .count();
+        if line[indent_len..].starts_with("// FORK ") {
+            out.push_str(&line[..indent_len]);
+            out.push_str("        "); // 8 spaces, same length as `// FORK `
+            out.push_str(&line[indent_len + 8..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 impl Config {
     pub fn from_kdl(kdl_config: &str, base_config: Option<Config>) -> Result<Config, ConfigError> {
         let mut config = base_config.unwrap_or_else(|| Config::default());
+        let kdl_config = strip_fork_markers(kdl_config);
         let kdl_config: KdlDocument = kdl_config.parse()?;
 
         let config_options = Options::from_kdl(&kdl_config)?;
