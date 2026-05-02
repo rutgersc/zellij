@@ -228,6 +228,13 @@ pub(crate) struct Tab {
     pub tab_has_pending_bell: bool,
     pub tab_bell_flash: bool, // currently in mid-notification-flash
     pub tab_bell_ring: bool,  // need to send ANSI BEL to the controlling terminal
+    // Floating panes spawned via `Run … close_on_exit=true` flip the per-tab
+    // show_panes flag to true on creation; without this set, that flip never
+    // gets reversed when other (hidden) floats exist, leaking float visibility
+    // across the tab. Pane ids in here mean "I'm the only reason show_panes is
+    // currently true — hide floats again on my close." Cleared on any explicit
+    // user toggle of float visibility.
+    ephemeral_floats: HashSet<PaneId>,
 }
 
 // FIXME: Use a struct that has a pane_type enum, to reduce all of the duplication
@@ -887,6 +894,7 @@ impl Tab {
             tab_has_pending_bell: false,
             tab_bell_flash: false,
             tab_bell_ring: false,
+            ephemeral_floats: HashSet::new(),
         }
     }
 
@@ -1436,6 +1444,7 @@ impl Tab {
             self.floating_panes.pane_ids().count(),
             client_id,
         );
+        self.ephemeral_floats.clear();
         if self.floating_panes.panes_are_visible() {
             self.hide_floating_panes();
             self.set_force_render();
@@ -1818,7 +1827,15 @@ impl Tab {
     ) -> Result<()> {
         let err_context = || format!("failed to create new pane with id {pid:?}");
         if should_focus_pane {
+            let floats_were_hidden = !self.floating_panes.panes_are_visible();
             self.show_floating_panes();
+            let is_ephemeral = matches!(
+                &invoked_with,
+                Some(Run::Command(rc)) if !rc.hold_on_close
+            );
+            if floats_were_hidden && is_ephemeral {
+                self.ephemeral_floats.insert(pid);
+            }
         }
         self.close_down_to_max_terminals()
             .with_context(err_context)?;
@@ -4031,11 +4048,14 @@ impl Tab {
             };
         }
         let closed_pane = if self.floating_panes.panes_contain(&id) {
+            let was_ephemeral = self.ephemeral_floats.remove(&id);
             log::info!("close_pane (floating) caller: id={:?}", id);
             let closed_pane = self.floating_panes.remove_pane(id);
             self.floating_panes.move_clients_out_of_pane(id);
             if !self.floating_panes.has_selectable_panes() {
                 self.swap_layouts.reset_floating_damage();
+                self.hide_floating_panes();
+            } else if was_ephemeral {
                 self.hide_floating_panes();
             }
             self.set_force_render();
@@ -4106,6 +4126,7 @@ impl Tab {
             };
         }
         if self.floating_panes.panes_contain(&id) {
+            self.ephemeral_floats.remove(&id);
             log::info!("extract_pane (floating) caller: id={:?}", id);
             let mut closed_pane = self.floating_panes.remove_pane(id);
             self.floating_panes.move_clients_out_of_pane(id);
@@ -5248,6 +5269,7 @@ impl Tab {
     }
 
     pub fn show_floating_panes_atomic(&mut self, mut completion: Option<NotificationEnd>) {
+        self.ephemeral_floats.clear();
         if self.floating_panes.panes_are_visible() {
             if let Some(c) = completion.as_mut() {
                 c.set_exit_status(2);
@@ -5274,6 +5296,7 @@ impl Tab {
     }
 
     pub fn hide_floating_panes_atomic(&mut self, mut completion: Option<NotificationEnd>) {
+        self.ephemeral_floats.clear();
         if !self.floating_panes.panes_are_visible() {
             if let Some(c) = completion.as_mut() {
                 c.set_exit_status(2);
