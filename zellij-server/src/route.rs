@@ -2293,11 +2293,10 @@ pub(crate) fn route_thread_main(
                             let cli_client_id = client_id;
                             let client_id = if is_cli_client {
                                 // for cli clients, we want to default to the last active client
-                                // (i.e. the last client to have issued a keystroke) this is to
-                                // interpret actions that require a client_id (such as move focus,
-                                // detach, etc.) for which using the cli client id will not be
-                                // doing the right thing - using the last_active_client is almost
-                                // certainly correct in almost all cases
+                                // (i.e. the last client to have attached or issued a keystroke)
+                                // this is to interpret actions that require a client_id (such as
+                                // move focus, detach, etc.) for which using the cli client id
+                                // will not be doing the right thing.
                                 session_state
                                     .read()
                                     .unwrap()
@@ -2443,6 +2442,14 @@ pub(crate) fn route_thread_main(
                             cli_assets,
                             is_web_client,
                         } => {
+                            // Same reason as the AttachClient branch below:
+                            // the very first client of a fresh session is
+                            // otherwise invisible to is_cli_client routing
+                            // until it sends its first Key.
+                            session_state
+                                .write()
+                                .unwrap()
+                                .set_last_active_client(client_id);
                             let new_client_instruction = ServerInstruction::FirstClientConnected(
                                 cli_assets,
                                 is_web_client,
@@ -2467,6 +2474,16 @@ pub(crate) fn route_thread_main(
                                 .unwrap_or(false);
                             let should_allow_connection = !is_web_client || allow_web_connections;
                             if should_allow_connection {
+                                // Mark this real client as the "last active" so cli-invoked
+                                // actions can route to it even before it has typed anything.
+                                // Without this, last_active_client only updates on Key
+                                // messages, and a freshly-attached client is invisible to
+                                // is_cli_client routing — `zellij --session X action ...`
+                                // silently no-ops on the transient CLI client.
+                                session_state
+                                    .write()
+                                    .unwrap()
+                                    .set_last_active_client(client_id);
                                 let attach_client_instruction = ServerInstruction::AttachClient(
                                     cli_assets,
                                     tab_position_to_focus,
