@@ -626,7 +626,12 @@ pub(crate) struct SessionState {
     clients: HashMap<ClientId, Option<(Size, bool)>>, // bool -> is_web_client
     pipes: HashMap<String, ClientId>,                 // String => pipe_id
     watchers: HashMap<ClientId, bool>, // watcher clients (read-only observers) bool -> is_web_client
-    last_active_client: Option<ClientId>, // last client that sent a Key message
+    // Stack of clients ordered by most-recent activity (attach or Key).
+    // The top (last element) is the current "last active client". When that
+    // client detaches, the next element down becomes last-active automatically.
+    // Only real clients ever appear here — CLI clients send neither Key nor
+    // AttachClient, so they can never enter the stack.
+    last_active_client: Vec<ClientId>,
     /// Host-query forward tokens that have been dispatched to a
     /// specific client and are waiting for a reply. Used to clean up
     /// when that client disconnects (or when there's no client to
@@ -642,7 +647,7 @@ impl SessionState {
             clients: HashMap::new(),
             pipes: HashMap::new(),
             watchers: HashMap::new(),
-            last_active_client: None,
+            last_active_client: Vec::new(),
             forwards_in_flight: HashMap::new(),
         }
     }
@@ -752,15 +757,14 @@ impl SessionState {
         self.watchers.remove(&client_id);
     }
     pub fn set_last_active_client(&mut self, client_id: ClientId) {
-        self.last_active_client = Some(client_id);
+        self.last_active_client.retain(|&id| id != client_id);
+        self.last_active_client.push(client_id);
     }
     pub fn get_last_active_client(&self) -> Option<ClientId> {
-        self.last_active_client
+        self.last_active_client.last().copied()
     }
     pub fn clear_last_active_client(&mut self, client_id: ClientId) {
-        if self.last_active_client == Some(client_id) {
-            self.last_active_client = None;
-        }
+        self.last_active_client.retain(|&id| id != client_id);
     }
     pub fn mark_forward_in_flight(&mut self, token: u32, client_id: ClientId) {
         self.forwards_in_flight.insert(token, client_id);
@@ -773,7 +777,7 @@ impl SessionState {
     /// to any currently-connected non-watcher client. Returns `None`
     /// only when no regular client is connected.
     pub fn pick_forward_target(&self) -> Option<ClientId> {
-        if let Some(candidate) = self.last_active_client {
+        if let Some(candidate) = self.get_last_active_client() {
             if self.clients.contains_key(&candidate) {
                 return Some(candidate);
             }
@@ -809,7 +813,7 @@ mod session_state_tests {
         // Client 3 was last active but has since disconnected — not in
         // `clients` map anymore. Must fall through to any connected
         // client rather than returning None.
-        s.last_active_client = Some(3);
+        s.last_active_client = vec![3];
         let picked = s
             .pick_forward_target()
             .expect("some client still connected");
