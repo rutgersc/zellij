@@ -520,7 +520,12 @@ pub(crate) struct SessionState {
     clients: HashMap<ClientId, Option<(Size, bool)>>, // bool -> is_web_client
     pipes: HashMap<String, ClientId>,                 // String => pipe_id
     watchers: HashMap<ClientId, bool>, // watcher clients (read-only observers) bool -> is_web_client
-    last_active_client: Option<ClientId>, // last client that sent a Key message
+    // Stack of clients ordered by most-recent activity (attach or Key).
+    // The top (last element) is the current "last active client". When that
+    // client detaches, the next element down becomes last-active automatically.
+    // Only real clients ever appear here — CLI clients send neither Key nor
+    // AttachClient, so they can never enter the stack.
+    last_active_client: Vec<ClientId>,
 }
 
 impl SessionState {
@@ -529,7 +534,7 @@ impl SessionState {
             clients: HashMap::new(),
             pipes: HashMap::new(),
             watchers: HashMap::new(),
-            last_active_client: None,
+            last_active_client: Vec::new(),
         }
     }
     pub fn new_client(&mut self) -> ClientId {
@@ -651,15 +656,14 @@ impl SessionState {
         self.watchers.remove(&client_id);
     }
     pub fn set_last_active_client(&mut self, client_id: ClientId) {
-        self.last_active_client = Some(client_id);
+        self.last_active_client.retain(|&id| id != client_id);
+        self.last_active_client.push(client_id);
     }
     pub fn get_last_active_client(&self) -> Option<ClientId> {
-        self.last_active_client
+        self.last_active_client.last().copied()
     }
     pub fn clear_last_active_client(&mut self, client_id: ClientId) {
-        if self.last_active_client == Some(client_id) {
-            self.last_active_client = None;
-        }
+        self.last_active_client.retain(|&id| id != client_id);
     }
 }
 
