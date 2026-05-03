@@ -2516,6 +2516,14 @@ pub(crate) fn route_thread_main(
                             cli_assets,
                             is_web_client,
                         } => {
+                            // Same reason as the AttachClient branch below:
+                            // the very first client of a fresh session is
+                            // otherwise invisible to is_cli_client routing
+                            // until it sends its first Key.
+                            session_state
+                                .write()
+                                .unwrap()
+                                .set_last_active_client(client_id);
                             let new_client_instruction = ServerInstruction::FirstClientConnected(
                                 cli_assets,
                                 is_web_client,
