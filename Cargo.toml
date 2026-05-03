@@ -45,6 +45,7 @@ vte = { workspace = true }
 
 [workspace]
 members = [
+    "default-plugins/agent-bar",
     "default-plugins/compact-bar",
     "default-plugins/status-bar",
     "default-plugins/strider",
