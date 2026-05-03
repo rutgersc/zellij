@@ -1,4 +1,5 @@
 mod action_types;
+mod agents;
 mod clipboard_utils;
 mod keybind_utils;
 mod line;
@@ -6,16 +7,20 @@ mod tab;
 mod tooltip;
 
 use std::cmp::{max, min};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
+use std::path::PathBuf;
 
 use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
+use crate::agents::AgentStatus;
 use crate::clipboard_utils::{system_clipboard_error, text_copied_hint};
 use crate::line::tab_line;
 use crate::tab::tab_style;
 use crate::tooltip::TooltipRenderer;
+
+const AGENT_POLL_SECS: f64 = 1.5;
 
 static ARROW_SEPARATOR: &str = "";
 
@@ -63,6 +68,12 @@ struct State {
 
     // Keybinding cache
     cached_keybinds: KeybindsVec,
+
+    // Agent indicator (read from ~/.claude/readmodel/agents.json via /host preopen)
+    agent_snapshot_host_path: Option<PathBuf>,
+    pane_manifest: PaneManifest,
+    pane_to_agent: HashMap<u32, AgentStatus>,
+    tab_agents: HashMap<usize, AgentStatus>,
 }
 
 struct TabRenderData {
@@ -82,6 +93,7 @@ impl ZellijPlugin for State {
         self.initialize_configuration(configuration);
         self.setup_subscriptions();
         self.configure_keybinds();
+        self.setup_agent_indicator();
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -105,6 +117,8 @@ impl ZellijPlugin for State {
             },
             Event::TabUpdate(tabs) => self.handle_tab_update(tabs),
             Event::PaneUpdate(pane_manifest) => self.handle_pane_update(pane_manifest),
+            Event::Timer(_) => self.handle_agent_timer(),
+            Event::PermissionRequestResult(_) => self.handle_permission_grant(),
             Event::Mouse(mouse_event) => {
                 self.handle_mouse_event(mouse_event);
                 false
@@ -178,6 +192,8 @@ impl State {
                 EventType::InputReceived,
                 EventType::SystemClipboardFailure,
                 EventType::InitialKeybinds,
+                EventType::Timer,
+                EventType::PermissionRequestResult,
             ]
         };
 
@@ -262,11 +278,66 @@ impl State {
     }
 
     fn handle_pane_update(&mut self, pane_manifest: PaneManifest) -> bool {
+        let mut should_render = false;
         if self.toggle_tooltip_key.is_some() {
             let previous_tooltip_state = self.tooltip_is_active;
             self.tooltip_is_active = self.detect_tooltip_presence(&pane_manifest);
             self.own_tab_index = self.find_own_tab_index(&pane_manifest);
-            previous_tooltip_state != self.tooltip_is_active
+            should_render = previous_tooltip_state != self.tooltip_is_active;
+        }
+        if !self.is_tooltip && self.pane_manifest != pane_manifest {
+            self.pane_manifest = pane_manifest;
+            should_render |= self.recompute_tab_agents();
+        }
+        should_render
+    }
+
+    fn setup_agent_indicator(&mut self) {
+        if self.is_tooltip {
+            return;
+        }
+        // Builtin plugins auto-grant via is_builtin(); a file:// load needs
+        // explicit grants. PermissionRequestResult fires either way, which is
+        // where we kick off the snapshot polling.
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::FullHdAccess,
+            PermissionType::ReadSessionEnvironmentVariables,
+        ]);
+    }
+
+    fn handle_permission_grant(&mut self) -> bool {
+        if self.is_tooltip || self.agent_snapshot_host_path.is_some() {
+            return false;
+        }
+        let env = get_session_environment_variables();
+        if let Some(loc) = agents::locate_snapshot(&env) {
+            change_host_folder(loc.host_root);
+            self.agent_snapshot_host_path = Some(loc.wasi_path);
+        }
+        set_timeout(AGENT_POLL_SECS);
+        false
+    }
+
+    fn handle_agent_timer(&mut self) -> bool {
+        let mut should_render = false;
+        if let Some(path) = &self.agent_snapshot_host_path {
+            let session = self.mode_info.session_name.as_deref().unwrap_or_default();
+            let new_pane_to_agent = agents::project_for_session(path, session);
+            if new_pane_to_agent != self.pane_to_agent {
+                self.pane_to_agent = new_pane_to_agent;
+                should_render = self.recompute_tab_agents();
+            }
+        }
+        set_timeout(AGENT_POLL_SECS);
+        should_render
+    }
+
+    fn recompute_tab_agents(&mut self) -> bool {
+        let new_tab_agents = agents::tabs_with_agents(&self.pane_to_agent, &self.pane_manifest);
+        if new_tab_agents != self.tab_agents {
+            self.tab_agents = new_tab_agents;
+            true
         } else {
             false
         }
@@ -549,12 +620,14 @@ impl State {
                 }
             }
 
+            let agent_status = self.tab_agents.get(&tab.position).copied();
             let styled_tab = tab_style(
                 tab_name,
                 tab,
                 is_alternate_tab,
                 self.mode_info.style.colors,
                 self.mode_info.capabilities,
+                agent_status,
             );
 
             is_alternate_tab = !is_alternate_tab;
