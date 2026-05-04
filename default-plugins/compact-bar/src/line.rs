@@ -275,8 +275,8 @@ impl TabLinePrefixBuilder {
     }
 
     fn build(&self, session_name: Option<&str>, mode: InputMode) -> Vec<LinePart> {
-        let mut parts = vec![self.create_zellij_part()];
-        let mut used_len = parts.get(0).map_or(0, |p| p.len);
+        let mut parts = Vec::new();
+        let mut used_len = 0;
 
         if let Some(name) = session_name {
             if let Some(name_part) = self.create_session_name_part(name, used_len) {
@@ -292,22 +292,8 @@ impl TabLinePrefixBuilder {
         parts
     }
 
-    fn create_zellij_part(&self) -> LinePart {
-        let prefix_text = " Zellij ";
-        let colors = self.get_text_colors();
-
-        LinePart {
-            part: style!(colors.text, colors.background)
-                .bold()
-                .paint(prefix_text)
-                .to_string(),
-            len: prefix_text.chars().count(),
-            tab_index: None,
-        }
-    }
-
     fn create_session_name_part(&self, name: &str, used_len: usize) -> Option<LinePart> {
-        let name_part = format!("({})", name);
+        let name_part = format!(" {} ", name);
         let name_part_len = name_part.width();
 
         if self.cols.saturating_sub(used_len) >= name_part_len {
