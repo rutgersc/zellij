@@ -13,7 +13,7 @@
 
 mod agents;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use ansi_term::ANSIString;
@@ -32,6 +32,7 @@ const MAX_NAME_WIDTH: usize = 18;
 const BUSY_FG: PaletteColor = PaletteColor::EightBit(46); // bright green
 const IDLE_FG: PaletteColor = PaletteColor::EightBit(231); // near-white
 const UNROUTED_FG: PaletteColor = PaletteColor::EightBit(196); // bright red
+const ATTENTION_BG: PaletteColor = PaletteColor::EightBit(130); // dark orange — needs attention
 const DIM_COLOR: PaletteColor = PaletteColor::EightBit(8); // dim grey
 const ERROR_COLOR: PaletteColor = PaletteColor::EightBit(9); // bright red
 const UNROUTED: &str = "\u{2717}";
@@ -73,6 +74,10 @@ struct State {
     /// PaneManifest + active tab index let us decide which agents are "here".
     pane_manifest: PaneManifest,
     active_tab_idx: Option<usize>,
+    /// Per-claude-session: the highest `attention_at_ms` the user has been
+    /// shown. `agent.attention_at_ms > seen_at[claude_id]` means there's an
+    /// unseen attention event. In-memory only — clears on plugin reload.
+    seen_at: HashMap<String, i64>,
 }
 
 register_plugin!(State);
@@ -206,10 +211,16 @@ impl ZellijPlugin for State {
                 Some(ReadResult::Ok(agents)) => {
                     let session = self.mode_info.session_name.as_deref().unwrap_or("");
                     let here = active_tab_pane_ids(&self.pane_manifest, self.active_tab_idx);
+                    // Drop seen entries for claude sessions that no longer
+                    // exist in the snapshot, so the map stays bounded.
+                    let live: HashSet<&str> =
+                        agents.iter().map(|a| a.session_id.as_str()).collect();
+                    self.seen_at.retain(|k, _| live.contains(k.as_str()));
                     render_agents(
                         agents,
                         &mut self.cell_ranges,
                         self.last_click.as_ref(),
+                        &mut self.seen_at,
                         bg,
                         cols,
                         session,
@@ -248,8 +259,8 @@ impl Cell {
 
     /// `folder:name` (routed) or `folder✗name` (unrouted) — colon and cross
     /// are mutually exclusive separators, no whitespace around either. When
-    /// folder is empty: `name` or `✗name`.
-    fn width(&self, unrouted: bool) -> usize {
+    /// folder is empty: `name` or `✗name`. Attention prepends `!` to the name.
+    fn width(&self, unrouted: bool, needs_attention: bool) -> usize {
         let folder_w = self.folder.width();
         let folder_present = !self.folder.is_empty();
         let mid = match (folder_present, unrouted) {
@@ -258,7 +269,8 @@ impl Cell {
             (false, true) => UNROUTED.width(),
             (false, false) => 0,
         };
-        folder_w + mid + self.name.width()
+        let attn = if needs_attention { 1 } else { 0 };
+        folder_w + mid + attn + self.name.width()
     }
 
     /// Drop one char from the name (with `…` suffix on first truncation).
@@ -298,33 +310,49 @@ fn render_agents(
     agents: &[Agent],
     cell_ranges: &mut Vec<(usize, usize, String)>,
     last_click: Option<&ClickFeedback>,
+    seen_at: &mut HashMap<String, i64>,
     bg: PaletteColor,
     cols: usize,
     current_session: &str,
     here: &HashSet<u32>,
 ) {
-    // Reserve room on the right for click feedback. Cells get the leftover.
+    // Match compact-bar's leading inset so the first cell doesn't ride the
+    // left border. Reserve room on the right for click feedback too.
+    const LEFT_INSET: usize = 1;
     let feedback = last_click.map(format_feedback);
     let feedback_width = feedback.as_ref().map(|(s, _)| s.width() + 1).unwrap_or(0);
-    let cell_budget = cols.saturating_sub(feedback_width);
+    let cell_budget = cols.saturating_sub(LEFT_INSET).saturating_sub(feedback_width);
+
+    // Compute per-agent flags up front. `check_and_mark_attention` mutates
+    // `seen_at` for any agent currently in the active tab — the presence
+    // trigger.
+    let flags: Vec<AgentFlags> = agents
+        .iter()
+        .map(|a| {
+            let unrouted = a.zellij_pane_id.is_none();
+            let in_here = is_in_current_tab(a, current_session, here);
+            let needs_attention = check_and_mark_attention(a, in_here, seen_at);
+            AgentFlags { unrouted, in_current_tab: in_here, needs_attention }
+        })
+        .collect();
 
     let mut cells: Vec<Cell> = agents.iter().map(Cell::from).collect();
-    fit_to_width(agents, &mut cells, cell_budget);
+    fit_to_width(&flags, &mut cells, cell_budget);
 
     let mut out = String::new();
-    let mut col = 0;
-    for (i, (agent, cell)) in agents.iter().zip(cells.iter()).enumerate() {
-        let unrouted = agent.zellij_pane_id.is_none();
-        let width = cell.width(unrouted);
-        if col + width > cell_budget {
+    out.push(' ');
+    let mut col = LEFT_INSET;
+    let cell_limit = LEFT_INSET + cell_budget;
+    for (i, ((agent, cell), flag)) in agents.iter().zip(cells.iter()).zip(flags.iter()).enumerate() {
+        let width = cell.width(flag.unrouted, flag.needs_attention);
+        if col + width > cell_limit {
             break;
         }
         if i > 0 {
             out.push_str(&style!(DIM_COLOR, bg).paint(SEPARATOR).to_string());
             col += SEPARATOR_WIDTH;
         }
-        let in_here = is_in_current_tab(agent, current_session, here);
-        out.push_str(&render_cell(agent, cell, unrouted, in_here, bg));
+        out.push_str(&render_cell(agent, cell, flag, bg));
         cell_ranges.push((col, col + width, agent.session_id.clone()));
         col += width;
     }
@@ -375,15 +403,15 @@ fn print_diag(bg: PaletteColor, fg: PaletteColor, msg: &str) {
 }
 
 /// Round-robin shrink: while total cell+separator width overshoots `cols`,
-/// shave the longest *name* by one char. Folders and the unrouted mark are
-/// preserved.
-fn fit_to_width(agents: &[Agent], cells: &mut [Cell], cols: usize) {
-    let separator_total = agents.len().saturating_sub(1) * SEPARATOR_WIDTH;
+/// shave the longest *name* by one char. Folders, unrouted mark, and
+/// attention prefix are all preserved.
+fn fit_to_width(flags: &[AgentFlags], cells: &mut [Cell], cols: usize) {
+    let separator_total = cells.len().saturating_sub(1) * SEPARATOR_WIDTH;
     loop {
-        let total: usize = agents
+        let total: usize = flags
             .iter()
             .zip(cells.iter())
-            .map(|(a, c)| c.width(a.zellij_pane_id.is_none()))
+            .map(|(f, c)| c.width(f.unrouted, f.needs_attention))
             .sum::<usize>()
             + separator_total;
         if total <= cols {
@@ -401,20 +429,21 @@ fn fit_to_width(agents: &[Agent], cells: &mut [Cell], cols: usize) {
 fn render_cell(
     agent: &Agent,
     cell: &Cell,
-    unrouted: bool,
-    in_current_tab: bool,
-    bg: PaletteColor,
+    flag: &AgentFlags,
+    bar_bg: PaletteColor,
 ) -> String {
     let fg = match agent.status {
         AgentStatus::Busy => BUSY_FG,
         AgentStatus::Idle => IDLE_FG,
     };
+    // Cell bg flips to the attention fill when there's an unseen event.
+    let cell_bg = if flag.needs_attention { ATTENTION_BG } else { bar_bg };
     let paint = |fg: PaletteColor, text: &str, bold: bool| -> String {
-        let mut s = style!(fg, bg);
+        let mut s = style!(fg, cell_bg);
         if bold {
             s = s.bold();
         }
-        if in_current_tab {
+        if flag.in_current_tab {
             s = s.underline();
         }
         s.paint(text.to_string()).to_string()
@@ -422,13 +451,16 @@ fn render_cell(
     let mut body = String::new();
     if !cell.folder.is_empty() {
         body.push_str(&paint(fg, &cell.folder, true));
-        if unrouted {
+        if flag.unrouted {
             body.push_str(&paint(UNROUTED_FG, UNROUTED, true));
         } else {
             body.push_str(&paint(fg, ":", false));
         }
-    } else if unrouted {
+    } else if flag.unrouted {
         body.push_str(&paint(UNROUTED_FG, UNROUTED, true));
+    }
+    if flag.needs_attention {
+        body.push_str(&paint(fg, "!", true));
     }
     body.push_str(&paint(fg, &cell.name, false));
     body
@@ -449,6 +481,35 @@ fn active_tab_pane_ids(manifest: &PaneManifest, active_tab_idx: Option<usize>) -
 fn is_in_current_tab(agent: &Agent, current_session: &str, here: &HashSet<u32>) -> bool {
     agent.zellij_session.as_deref() == Some(current_session)
         && matches!(agent.zellij_pane_id, Some(id) if here.contains(&id))
+}
+
+struct AgentFlags {
+    unrouted: bool,
+    in_current_tab: bool,
+    needs_attention: bool,
+}
+
+/// Decide whether this agent has an unseen attention event, and apply the
+/// presence-based "mark seen" rule: an agent currently in the active tab is
+/// considered seen, so its `seen_at` is bumped to the latest attention
+/// timestamp (or 0 if none) and the indicator never fires while it's here.
+///
+/// Swapping in a keybinding-driven trigger is one new event handler that
+/// also writes to `seen_at` — same data, different cause.
+fn check_and_mark_attention(
+    agent: &Agent,
+    in_current_tab: bool,
+    seen_at: &mut HashMap<String, i64>,
+) -> bool {
+    if in_current_tab {
+        seen_at.insert(agent.session_id.clone(), agent.attention_at_ms);
+        return false;
+    }
+    if agent.attention_at_ms == 0 {
+        return false;
+    }
+    let last_seen = seen_at.get(&agent.session_id).copied().unwrap_or(0);
+    agent.attention_at_ms > last_seen
 }
 
 fn same_result(a: Option<&ReadResult>, b: &ReadResult) -> bool {

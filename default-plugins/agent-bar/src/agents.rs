@@ -28,6 +28,12 @@ pub struct Agent {
     pub zellij_session: Option<String>,
     #[serde(default)]
     pub zellij_pane_id: Option<u32>,
+    /// Wall-clock millis of the latest attention-worthy event (done,
+    /// waiting-for-input, …). The daemon decides what "attention-worthy"
+    /// means; the plugin only compares against its own per-agent
+    /// `seen_at` to decide whether to flag the cell. Default 0 = none.
+    #[serde(default)]
+    pub attention_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]

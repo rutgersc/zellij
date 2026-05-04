@@ -1,4 +1,4 @@
-use crate::agents::AgentStatus;
+use crate::agents::TabFlag;
 use crate::{line::tab_separator, LinePart};
 use ansi_term::{ANSIString, ANSIStrings};
 use unicode_width::UnicodeWidthStr;
@@ -6,7 +6,7 @@ use zellij_tile::prelude::*;
 use zellij_tile_utils::style;
 
 const AGENT_BUSY_FG: PaletteColor = PaletteColor::EightBit(46); // bright green
-const AGENT_IDLE_FG: PaletteColor = PaletteColor::EightBit(220); // amber
+const AGENT_ATTENTION_FG: PaletteColor = PaletteColor::EightBit(130); // dark orange — same as agent-bar's attention bg
 
 fn cursors<'a>(
     focused_clients: &'a [ClientId],
@@ -31,7 +31,7 @@ pub fn render_tab(
     is_alternate_tab: bool,
     palette: Styling,
     separator: &str,
-    agent_status: Option<AgentStatus>,
+    tab_flag: Option<TabFlag>,
 ) -> LinePart {
     let focused_clients = tab.other_focused_clients.as_slice();
     let separator_width = separator.width();
@@ -47,7 +47,7 @@ pub fn render_tab(
     } else {
         palette.ribbon_unselected.background
     };
-    // Tint inactive tabs by agent status so the bar reads at a glance. The
+    // Tint inactive tabs by their flag so the bar reads at a glance. The
     // active tab keeps its standard highlight colour — its bg is already
     // distinct, and a status tint there would fight the highlight.
     let foreground_color = if tab.is_flashing_bell {
@@ -59,9 +59,9 @@ pub fn render_tab(
     } else if tab.active {
         palette.ribbon_selected.base
     } else {
-        match agent_status {
-            Some(AgentStatus::Busy) => AGENT_BUSY_FG,
-            Some(AgentStatus::Idle) => AGENT_IDLE_FG,
+        match tab_flag {
+            Some(TabFlag::Attention) => AGENT_ATTENTION_FG,
+            Some(TabFlag::Busy) => AGENT_BUSY_FG,
             None => palette.ribbon_unselected.base,
         }
     };
@@ -112,7 +112,7 @@ pub fn tab_style(
     mut is_alternate_tab: bool,
     palette: Styling,
     capabilities: PluginCapabilities,
-    agent_status: Option<AgentStatus>,
+    tab_flag: Option<TabFlag>,
 ) -> LinePart {
     let separator = tab_separator(capabilities);
 
@@ -136,7 +136,7 @@ pub fn tab_style(
         is_alternate_tab = false;
     }
 
-    render_tab(tabname, tab, is_alternate_tab, palette, separator, agent_status)
+    render_tab(tabname, tab, is_alternate_tab, palette, separator, tab_flag)
 }
 
 pub(crate) fn get_tab_to_focus(

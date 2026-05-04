@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
-use crate::agents::AgentStatus;
+use crate::agents::{PaneAgent, TabFlag};
 use crate::clipboard_utils::{system_clipboard_error, text_copied_hint};
 use crate::line::tab_line;
 use crate::tab::tab_style;
@@ -72,8 +72,10 @@ struct State {
     // Agent indicator (read from ~/.claude/readmodel/agents.json via /host preopen)
     agent_snapshot_host_path: Option<PathBuf>,
     pane_manifest: PaneManifest,
-    pane_to_agent: HashMap<u32, AgentStatus>,
-    tab_agents: HashMap<usize, AgentStatus>,
+    pane_agents: HashMap<u32, PaneAgent>,
+    tab_flags: HashMap<usize, TabFlag>,
+    /// claude_id → highest attention_at_ms the user was shown. In-memory only.
+    seen_at: HashMap<String, i64>,
 }
 
 struct TabRenderData {
@@ -263,7 +265,8 @@ impl State {
 
         if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
             let active_tab_idx = active_tab_index + 1; // Convert to 1-based indexing
-            let should_render = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
+            let mut should_render = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
+            let active_tab_changed = self.active_tab_idx != active_tab_idx;
 
             if self.is_tooltip && self.active_tab_idx != active_tab_idx {
                 self.move_tooltip_to_new_tab(active_tab_idx);
@@ -271,6 +274,11 @@ impl State {
 
             self.active_tab_idx = active_tab_idx;
             self.tabs = tabs;
+            // Active tab change resets mark-seen state for the new tab's
+            // agents — recompute so the orange tint clears immediately.
+            if active_tab_changed && !self.is_tooltip {
+                should_render |= self.recompute_tab_flags();
+            }
             should_render
         } else {
             false
@@ -287,7 +295,7 @@ impl State {
         }
         if !self.is_tooltip && self.pane_manifest != pane_manifest {
             self.pane_manifest = pane_manifest;
-            should_render |= self.recompute_tab_agents();
+            should_render |= self.recompute_tab_flags();
         }
         should_render
     }
@@ -323,20 +331,35 @@ impl State {
         let mut should_render = false;
         if let Some(path) = &self.agent_snapshot_host_path {
             let session = self.mode_info.session_name.as_deref().unwrap_or_default();
-            let new_pane_to_agent = agents::project_for_session(path, session);
-            if new_pane_to_agent != self.pane_to_agent {
-                self.pane_to_agent = new_pane_to_agent;
-                should_render = self.recompute_tab_agents();
+            let new_pane_agents = agents::project_for_session(path, session);
+            if new_pane_agents != self.pane_agents {
+                self.pane_agents = new_pane_agents;
+                should_render = self.recompute_tab_flags();
+            } else {
+                // Even with no snapshot change, attention may have ticked or
+                // the active tab may have changed since last recompute.
+                should_render = self.recompute_tab_flags();
             }
         }
         set_timeout(AGENT_POLL_SECS);
         should_render
     }
 
-    fn recompute_tab_agents(&mut self) -> bool {
-        let new_tab_agents = agents::tabs_with_agents(&self.pane_to_agent, &self.pane_manifest);
-        if new_tab_agents != self.tab_agents {
-            self.tab_agents = new_tab_agents;
+    fn recompute_tab_flags(&mut self) -> bool {
+        // Bound seen_at to live agents.
+        let live: std::collections::HashSet<&str> =
+            self.pane_agents.values().map(|a| a.claude_id.as_str()).collect();
+        self.seen_at.retain(|k, _| live.contains(k.as_str()));
+
+        let active_tab_position = self.active_tab_idx.checked_sub(1);
+        let new_tab_flags = agents::compute_tab_flags(
+            &self.pane_agents,
+            &self.pane_manifest,
+            active_tab_position,
+            &mut self.seen_at,
+        );
+        if new_tab_flags != self.tab_flags {
+            self.tab_flags = new_tab_flags;
             true
         } else {
             false
@@ -620,14 +643,14 @@ impl State {
                 }
             }
 
-            let agent_status = self.tab_agents.get(&tab.position).copied();
+            let tab_flag = self.tab_flags.get(&tab.position).copied();
             let styled_tab = tab_style(
                 tab_name,
                 tab,
                 is_alternate_tab,
                 self.mode_info.style.colors,
                 self.mode_info.capabilities,
-                agent_status,
+                tab_flag,
             );
 
             is_alternate_tab = !is_alternate_tab;
