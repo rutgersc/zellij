@@ -14,11 +14,12 @@ use zellij_client::{
 };
 
 use zellij_utils::sessions::{
-    assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
-    generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
-    get_sessions_sorted_by_mtime, kill_session as kill_session_impl, match_session_name,
-    print_sessions, print_sessions_with_index, resurrection_layout, session_exists,
-    validate_session_name, ActiveSession, SessionNameMatch,
+    assert_dead_session, assert_session, assert_session_ne, check_session_state,
+    delete_session as delete_session_impl, generate_unique_session_name, get_active_session,
+    get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
+    kill_session as kill_session_impl, match_session_name, print_sessions,
+    print_sessions_with_index, resurrection_layout, session_exists, validate_session_name,
+    ActiveSession, SessionDisplayStatus, SessionLiveness, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
@@ -644,7 +645,7 @@ fn attach_with_session_name(
                 print_sessions(
                     sessions
                         .iter()
-                        .map(|s| (s.clone(), Duration::default(), false))
+                        .map(|s| (s.clone(), Duration::default(), SessionDisplayStatus::Alive))
                         .collect(),
                     false,
                     false,
@@ -960,9 +961,31 @@ pub(crate) fn start_client(opts: CliArgs) {
                 let use_cwd_name = config_options.session_name_from_cwd.unwrap_or(false);
                 let existing_cwd_session = if use_cwd_name {
                     let current_session = std::env::var(envs::SESSION_NAME_ENV_KEY).ok();
-                    session_name_from_cwd().filter(|name| {
-                        session_exists(name).unwrap_or(false)
-                            && current_session.as_deref() != Some(name.as_str())
+                    session_name_from_cwd().and_then(|name| {
+                        if current_session.as_deref() == Some(name.as_str()) {
+                            return None;
+                        }
+                        // Check the registry directly so a stuck session for
+                        // this name surfaces a clear error instead of being
+                        // silently filtered (and then re-created with a suffix).
+                        let registry = zellij_utils::sessions::ensure_registry();
+                        let entry = registry
+                            .running_sessions()
+                            .into_iter()
+                            .find(|s| s.display_name == name)?;
+                        match check_session_state(&entry.id) {
+                            SessionLiveness::Alive => Some(name),
+                            SessionLiveness::Dead => None,
+                            SessionLiveness::Stuck => {
+                                eprintln!(
+                                    "Session '{name}' exists but its server is not responding \
+                                     (stuck).\n\
+                                     Run `zellij delete-session {name}` to clear it, or kill \
+                                     the server process, then try again."
+                                );
+                                process::exit(1);
+                            },
+                        }
                     })
                 } else {
                     None
@@ -1067,7 +1090,7 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
                 print_sessions(
                     sessions
                         .iter()
-                        .map(|s| (s.clone(), Duration::default(), false))
+                        .map(|s| (s.clone(), Duration::default(), SessionDisplayStatus::Alive))
                         .collect(),
                     false,
                     false,
