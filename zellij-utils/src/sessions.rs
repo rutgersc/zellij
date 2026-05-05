@@ -722,15 +722,30 @@ pub fn check_session_state(name: &str) -> SessionLiveness {
 
 #[cfg(windows)]
 pub fn check_session_state(name: &str) -> SessionLiveness {
-    use crate::consts::ipc_connect;
+    use crate::consts::{ipc_connect, ipc_connect_reply};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
+    // Do the full handshake: main pipe THEN reply pipe. The Windows server's
+    // accept thread is sequential — after accepting a main connect it blocks
+    // at `reply_listener.accept()` waiting for the matching reply connect on
+    // the same thread before it can accept the next client. If we connect to
+    // main only, we leave the server's accept loop wedged forever, which
+    // breaks every future cli action / attach against that server.
     let path = ZELLIJ_SOCK_DIR.join(name);
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(ipc_connect(&path));
+        let result = match ipc_connect(&path) {
+            Ok(main_stream) => match ipc_connect_reply(&path) {
+                Ok(reply_stream) => Ok((main_stream, reply_stream)),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
+        // Both streams are dropped here when the thread exits, releasing
+        // both pipe instances cleanly.
     });
     match rx.recv_timeout(Duration::from_millis(500)) {
         Ok(Ok(_)) => SessionLiveness::Alive,
