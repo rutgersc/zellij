@@ -756,16 +756,28 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                 #[cfg(windows)]
                 let reply_listener = zellij_utils::consts::ipc_bind_reply(&socket_path).unwrap();
 
+                log::info!("server_accept: entering incoming() loop");
                 for stream in listener.incoming() {
+                    log::info!("server_accept: main listener.incoming() returned");
                     match stream {
                         Ok(stream) => {
+                            log::info!("server_accept: accepted main stream");
                             let mut os_input = os_input.clone();
                             let client_id = session_state.write().unwrap().new_client();
+                            log::info!(
+                                "server_accept: assigned client_id={}, awaiting reply pipe accept",
+                                client_id
+                            );
 
                             #[cfg(windows)]
                             let reply_stream = reply_listener
                                 .accept()
                                 .expect("failed to accept reply connection");
+                            #[cfg(windows)]
+                            log::info!(
+                                "server_accept: reply accepted for client_id={}",
+                                client_id
+                            );
 
                             #[cfg(windows)]
                             let receiver = os_input
@@ -773,6 +785,10 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                                 .unwrap();
                             #[cfg(not(windows))]
                             let receiver = os_input.new_client(client_id, stream).unwrap();
+                            log::info!(
+                                "server_accept: receiver registered for client_id={}, spawning router",
+                                client_id
+                            );
 
                             let session_data = session_data.clone();
                             let session_state = session_state.clone();
@@ -791,12 +807,18 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                                     .fatal()
                                 })
                                 .unwrap();
+                            log::info!(
+                                "server_accept: router spawned for client_id={}, looping",
+                                client_id
+                            );
                         },
                         Err(err) => {
+                            log::error!("server_accept: main listener error: {:?}", err);
                             panic!("err {:?}", err);
                         },
                     }
                 }
+                log::warn!("server_accept: incoming() loop exited");
             }
         });
 
