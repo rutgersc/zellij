@@ -171,7 +171,10 @@ pub(crate) fn setup_ipc(
     let started = std::time::Instant::now();
     let reply_socket;
     loop {
-        match zellij_utils::consts::ipc_connect_reply(path) {
+        match crate::os_input_output::ipc_connect_reply_with_timeout(
+            path,
+            std::time::Duration::from_millis(500),
+        ) {
             Ok(sock) => {
                 reply_socket = sock;
                 break;
