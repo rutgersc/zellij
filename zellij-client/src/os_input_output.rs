@@ -27,6 +27,54 @@ use zellij_utils::{
 
 const SIGWINCH_CB_THROTTLE_DURATION: time::Duration = time::Duration::from_millis(50);
 
+/// Connect to a server's IPC pipe with a hard per-attempt deadline.
+///
+/// `zellij_utils::consts::ipc_connect` can block indefinitely on Windows
+/// when the named pipe is bound but the server's accept thread is wedged
+/// (the pipe exists, but no instance is available for new clients to bind
+/// to). The retry loops in `connect_to_server` and `setup_ipc` only check
+/// elapsed time after `ipc_connect` *returns* — if it never returns, the
+/// 3s timeout never fires and the cli client hangs forever.
+///
+/// Dispatch the connect to a worker thread; if it doesn't return within
+/// `timeout`, surface an `Err(io::ErrorKind::TimedOut)` so the caller can
+/// fall through to its existing "server is not responding" exit path.
+pub(crate) fn ipc_connect_with_timeout(
+    path: &Path,
+    timeout: time::Duration,
+) -> io::Result<interprocess::local_socket::Stream> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path_owned = path.to_path_buf();
+    thread::spawn(move || {
+        let _ = tx.send(zellij_utils::consts::ipc_connect(&path_owned));
+    });
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ipc_connect did not return within deadline",
+        ))
+    })
+}
+
+/// Same shape as `ipc_connect_with_timeout`, but for the Windows reply pipe.
+#[cfg(windows)]
+pub(crate) fn ipc_connect_reply_with_timeout(
+    path: &Path,
+    timeout: time::Duration,
+) -> io::Result<interprocess::local_socket::Stream> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path_owned = path.to_path_buf();
+    thread::spawn(move || {
+        let _ = tx.send(zellij_utils::consts::ipc_connect_reply(&path_owned));
+    });
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ipc_connect_reply did not return within deadline",
+        ))
+    })
+}
+
 pub(crate) const ENABLE_MOUSE_SUPPORT: &str =
     "\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1003h\u{1b}[?1015h\u{1b}[?1006h";
 pub(crate) const DISABLE_MOUSE_SUPPORT: &str =
@@ -280,7 +328,7 @@ impl ClientOsApi for ClientOsInputOutput {
         let started = time::Instant::now();
         let socket;
         loop {
-            match zellij_utils::consts::ipc_connect(path) {
+            match ipc_connect_with_timeout(path, time::Duration::from_millis(500)) {
                 Ok(sock) => {
                     socket = sock;
                     break;
