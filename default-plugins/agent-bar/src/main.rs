@@ -74,17 +74,29 @@ struct State {
     /// PaneManifest + active tab index let us decide which agents are "here".
     pane_manifest: PaneManifest,
     active_tab_idx: Option<usize>,
-    /// Per-claude-session: the highest `attention_at_ms` the user has been
-    /// shown. `agent.attention_at_ms > seen_at[claude_id]` means there's an
-    /// unseen attention event. In-memory only — clears on plugin reload.
-    seen_at: HashMap<String, i64>,
+    /// Latest scan of `agent-seen-events/` keyed by claude_id. Refreshed
+    /// each Timer tick alongside the readmodel.
+    seen_disk: HashMap<String, i64>,
+    /// Optimistic mark-seen overlay. After firing
+    /// `agent-seen-events/<sid>.json` we patch this map so the next render
+    /// sees the agent as "seen" before the file write propagates to the
+    /// next disk scan. `effective_seen = max(seen_disk, overlay)`.
+    seen_overlay: HashMap<String, i64>,
+    /// Where the seen-event files live, set after permission grant when the
+    /// WASI host root is known. Same dir is read for `seen_disk` and
+    /// written for mark-seen.
+    seen_events_dir: Option<PathBuf>,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        set_selectable(false);
+        // Start selectable so the user can mouse-click to focus this pane
+        // and answer the permission prompt with y/n. We switch to
+        // set_selectable(false) after the grant lands — see the
+        // PermissionRequestResult handler below.
+        // Bug ref: https://github.com/zellij-org/zellij/issues/4749
         subscribe(&[
             EventType::ModeUpdate,
             EventType::TabUpdate,
@@ -106,10 +118,20 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(_) => {
                 if matches!(self.load, LoadState::AwaitingPermission) {
+                    // Permission granted (or denied — either way the prompt is
+                    // over and we no longer need to be navigable).
+                    set_selectable(false);
                     let env = get_session_environment_variables();
                     self.load = match agents::locate_snapshot(&env) {
                         Some(loc) => {
                             change_host_folder(loc.host_root);
+                            // agent-seen-events is plugin-owned: we both
+                            // read this dir to overlay seen state and write
+                            // here on mark-seen. Daemon does not consume.
+                            self.seen_events_dir = Some(PathBuf::from(
+                                "/host/.claude/custom-state/agent-seen-events",
+                            ));
+                            self.refresh_seen_disk();
                             LoadState::Polling {
                                 path: loc.wasi_path,
                                 last: None,
@@ -139,7 +161,7 @@ impl ZellijPlugin for State {
                 changed
             },
             Event::Timer(_) => {
-                let changed = if let LoadState::Polling { path, last } = &mut self.load {
+                let mut changed = if let LoadState::Polling { path, last } = &mut self.load {
                     let new = agents::read(path);
                     let changed = !same_result(last.as_ref(), &new);
                     *last = Some(new);
@@ -147,6 +169,9 @@ impl ZellijPlugin for State {
                 } else {
                     false
                 };
+                if self.refresh_seen_disk() {
+                    changed = true;
+                }
                 set_timeout(POLL_SECS);
                 changed
             },
@@ -187,48 +212,145 @@ impl ZellijPlugin for State {
     fn render(&mut self, _rows: usize, cols: usize) {
         self.cell_ranges.clear();
         let bg = self.mode_info.style.colors.text_unselected.background;
-        match &self.load {
+        // Decide what to do under the immutable borrow, then either print
+        // a diagnostic immediately or fall through to a method call that
+        // wants &mut self. Clone the agents Vec out so the &self.load
+        // borrow can drop before the cell render begins.
+        enum Action {
+            Diag(PaletteColor, String),
+            Cells(Vec<Agent>),
+        }
+        let action = match &self.load {
             LoadState::AwaitingPermission => {
-                print_diag(bg, DIM_COLOR, "awaiting permission grant");
+                Action::Diag(DIM_COLOR, "awaiting permission grant".to_string())
             },
-            LoadState::NoHomeInEnv => {
-                print_diag(bg, ERROR_COLOR, "$HOME / $USERPROFILE not in session env");
-            },
+            LoadState::NoHomeInEnv => Action::Diag(
+                ERROR_COLOR,
+                "$HOME / $USERPROFILE not in session env".to_string(),
+            ),
             LoadState::Polling { path, last } => match last {
-                None => print_diag(bg, DIM_COLOR, &format!("reading {}", path.display())),
+                None => Action::Diag(DIM_COLOR, format!("reading {}", path.display())),
                 Some(ReadResult::Missing) => {
-                    print_diag(bg, ERROR_COLOR, &format!("missing: {}", path.display()))
+                    Action::Diag(ERROR_COLOR, format!("missing: {}", path.display()))
                 },
                 Some(ReadResult::Unreadable(e)) => {
-                    print_diag(bg, ERROR_COLOR, &format!("unreadable {}: {e}", path.display()))
+                    Action::Diag(ERROR_COLOR, format!("unreadable {}: {e}", path.display()))
                 },
                 Some(ReadResult::ParseError(e)) => {
-                    print_diag(bg, ERROR_COLOR, &format!("parse error: {e}"))
+                    Action::Diag(ERROR_COLOR, format!("parse error: {e}"))
                 },
                 Some(ReadResult::Ok(agents)) if agents.is_empty() => {
-                    print_diag(bg, DIM_COLOR, &format!("no agents @ {}", path.display()))
+                    Action::Diag(DIM_COLOR, format!("no agents @ {}", path.display()))
                 },
-                Some(ReadResult::Ok(agents)) => {
-                    let session = self.mode_info.session_name.as_deref().unwrap_or("");
-                    let here = active_tab_pane_ids(&self.pane_manifest, self.active_tab_idx);
-                    // Drop seen entries for claude sessions that no longer
-                    // exist in the snapshot, so the map stays bounded.
-                    let live: HashSet<&str> =
-                        agents.iter().map(|a| a.session_id.as_str()).collect();
-                    self.seen_at.retain(|k, _| live.contains(k.as_str()));
-                    render_agents(
-                        agents,
-                        &mut self.cell_ranges,
-                        self.last_click.as_ref(),
-                        &mut self.seen_at,
-                        bg,
-                        cols,
-                        session,
-                        &here,
-                    );
-                },
+                Some(ReadResult::Ok(agents)) => Action::Cells(agents.clone()),
             },
+        };
+        match action {
+            Action::Diag(fg, msg) => print_diag(bg, fg, &msg),
+            Action::Cells(agents) => self.render_agent_cells(&agents, bg, cols),
         }
+    }
+}
+
+impl State {
+    /// Effective seen timestamp = max(latest disk scan, optimistic overlay).
+    /// The disk scan reflects mark-seen events from any plugin instance or
+    /// the `sessions ingest_agent_seen` CLI; the overlay covers the gap
+    /// between firing a mark-seen and the next disk scan picking it up.
+    fn effective_seen_at(&self, agent: &Agent) -> i64 {
+        let disk = self.seen_disk.get(&agent.session_id).copied().unwrap_or(0);
+        let overlay = self.seen_overlay.get(&agent.session_id).copied().unwrap_or(0);
+        disk.max(overlay)
+    }
+
+    /// Fire a mark-seen event for `agent` and patch the local overlay so
+    /// subsequent renders don't re-fire while the daemon catches up.
+    fn fire_mark_seen(&mut self, agent: &Agent, at_ms: i64) {
+        // Optimistic patch first — even if the file write fails, the
+        // overlay alone prevents per-render re-fires until the agent gets
+        // a fresh attention_at_ms.
+        let entry = self.seen_overlay.entry(agent.session_id.clone()).or_insert(0);
+        if at_ms > *entry {
+            *entry = at_ms;
+        }
+        let Some(dir) = &self.seen_events_dir else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let event = serde_json::json!({
+            "session_id": agent.session_id,
+            "seen_at_ms": at_ms,
+        });
+        let Ok(json) = serde_json::to_vec(&event) else { return };
+        let target = dir.join(format!("{}.json", agent.session_id));
+        let tmp = dir.join(format!("{}.json.tmp", agent.session_id));
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &target);
+        }
+    }
+
+    /// Drop overlay entries for dead agents or whose disk-side `seen_at_ms`
+    /// already covers our optimistic patch.
+    fn prune_overlay(&mut self, agents: &[Agent]) {
+        let live: HashSet<&str> = agents.iter().map(|a| a.session_id.as_str()).collect();
+        self.seen_overlay.retain(|sid, overlay_seen| {
+            if !live.contains(sid.as_str()) {
+                return false;
+            }
+            let disk_seen = self.seen_disk.get(sid).copied().unwrap_or(0);
+            *overlay_seen > disk_seen
+        });
+    }
+
+    /// Refresh `seen_disk` from `agent-seen-events/` and return whether
+    /// anything changed. Called on each Timer tick so cross-instance
+    /// mark-seen propagates.
+    fn refresh_seen_disk(&mut self) -> bool {
+        let Some(dir) = &self.seen_events_dir else { return false };
+        let new = agents::read_seen_events(dir);
+        if new == self.seen_disk {
+            return false;
+        }
+        self.seen_disk = new;
+        true
+    }
+
+    fn render_agent_cells(&mut self, agents: &[Agent], bg: PaletteColor, cols: usize) {
+        self.prune_overlay(agents);
+
+        let session = self.mode_info.session_name.as_deref().unwrap_or("");
+        let here = active_tab_pane_ids(&self.pane_manifest, self.active_tab_idx);
+
+        // Pass 1: compute flags and collect mark-seen actions.
+        let mut to_mark_seen: Vec<(String, i64)> = Vec::new();
+        let mut flags: Vec<AgentFlags> = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let unrouted = agent.zellij_pane_id.is_none();
+            let in_current_tab = is_in_current_tab(agent, session, &here);
+            let unseen = agent.attention_at_ms > 0
+                && agent.attention_at_ms > self.effective_seen_at(agent);
+            if in_current_tab && unseen {
+                to_mark_seen.push((agent.session_id.clone(), agent.attention_at_ms));
+            }
+            let needs_attention = !in_current_tab && unseen;
+            flags.push(AgentFlags { unrouted, in_current_tab, needs_attention });
+        }
+
+        // Pass 2: dispatch mark-seen events. Optimistic patch + file write.
+        for (sid, at_ms) in &to_mark_seen {
+            // Find the agent by sid for fire_mark_seen.
+            if let Some(agent) = agents.iter().find(|a| &a.session_id == sid) {
+                self.fire_mark_seen(agent, *at_ms);
+            }
+        }
+
+        // Pass 3: render.
+        render_agents(
+            agents,
+            &flags,
+            &mut self.cell_ranges,
+            self.last_click.as_ref(),
+            bg,
+            cols,
+        );
     }
 }
 
@@ -306,15 +428,14 @@ fn ellipsize(s: &str, max: usize) -> String {
     acc
 }
 
+/// Pure renderer — flags and mark-seen decisions come from the caller.
 fn render_agents(
     agents: &[Agent],
+    flags: &[AgentFlags],
     cell_ranges: &mut Vec<(usize, usize, String)>,
     last_click: Option<&ClickFeedback>,
-    seen_at: &mut HashMap<String, i64>,
     bg: PaletteColor,
     cols: usize,
-    current_session: &str,
-    here: &HashSet<u32>,
 ) {
     // Match compact-bar's leading inset so the first cell doesn't ride the
     // left border. Reserve room on the right for click feedback too.
@@ -323,21 +444,8 @@ fn render_agents(
     let feedback_width = feedback.as_ref().map(|(s, _)| s.width() + 1).unwrap_or(0);
     let cell_budget = cols.saturating_sub(LEFT_INSET).saturating_sub(feedback_width);
 
-    // Compute per-agent flags up front. `check_and_mark_attention` mutates
-    // `seen_at` for any agent currently in the active tab — the presence
-    // trigger.
-    let flags: Vec<AgentFlags> = agents
-        .iter()
-        .map(|a| {
-            let unrouted = a.zellij_pane_id.is_none();
-            let in_here = is_in_current_tab(a, current_session, here);
-            let needs_attention = check_and_mark_attention(a, in_here, seen_at);
-            AgentFlags { unrouted, in_current_tab: in_here, needs_attention }
-        })
-        .collect();
-
     let mut cells: Vec<Cell> = agents.iter().map(Cell::from).collect();
-    fit_to_width(&flags, &mut cells, cell_budget);
+    fit_to_width(flags, &mut cells, cell_budget);
 
     let mut out = String::new();
     out.push(' ');
@@ -487,29 +595,6 @@ struct AgentFlags {
     unrouted: bool,
     in_current_tab: bool,
     needs_attention: bool,
-}
-
-/// Decide whether this agent has an unseen attention event, and apply the
-/// presence-based "mark seen" rule: an agent currently in the active tab is
-/// considered seen, so its `seen_at` is bumped to the latest attention
-/// timestamp (or 0 if none) and the indicator never fires while it's here.
-///
-/// Swapping in a keybinding-driven trigger is one new event handler that
-/// also writes to `seen_at` — same data, different cause.
-fn check_and_mark_attention(
-    agent: &Agent,
-    in_current_tab: bool,
-    seen_at: &mut HashMap<String, i64>,
-) -> bool {
-    if in_current_tab {
-        seen_at.insert(agent.session_id.clone(), agent.attention_at_ms);
-        return false;
-    }
-    if agent.attention_at_ms == 0 {
-        return false;
-    }
-    let last_seen = seen_at.get(&agent.session_id).copied().unwrap_or(0);
-    agent.attention_at_ms > last_seen
 }
 
 fn same_result(a: Option<&ReadResult>, b: &ReadResult) -> bool {

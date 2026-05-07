@@ -69,13 +69,21 @@ struct State {
     // Keybinding cache
     cached_keybinds: KeybindsVec,
 
-    // Agent indicator (read from ~/.claude/readmodel/agents.json via /host preopen)
+    // Agent indicator — reads custom-state/agent-readmodel.json
     agent_snapshot_host_path: Option<PathBuf>,
+    /// Read+write target for agent-seen-events. Daemon does not consume; this
+    /// dir holds the durable per-sid seen state.
+    agent_seen_events_dir: Option<PathBuf>,
     pane_manifest: PaneManifest,
     pane_agents: HashMap<u32, PaneAgent>,
     tab_flags: HashMap<usize, TabFlag>,
-    /// claude_id → highest attention_at_ms the user was shown. In-memory only.
-    seen_at: HashMap<String, i64>,
+    /// Latest disk scan of agent-seen-events/, refreshed on Timer + on
+    /// permission grant. Cross-instance updates flow through here.
+    seen_disk: HashMap<String, i64>,
+    /// Optimistic mark-seen overlay. After firing the event we patch this so
+    /// the next render sees the agent as seen before the disk scan picks
+    /// it up. Effective seen = max(seen_disk, seen_overlay).
+    seen_overlay: HashMap<String, i64>,
 }
 
 struct TabRenderData {
@@ -176,8 +184,10 @@ impl State {
     }
 
     fn setup_subscriptions(&self) {
-        set_selectable(false);
-
+        // Start selectable so the permission prompt is mouse-focusable.
+        // Switched to set_selectable(false) in handle_permission_grant once
+        // the user has answered. Bug ref:
+        // https://github.com/zellij-org/zellij/issues/4749
         let events = if self.is_tooltip {
             vec![
                 EventType::ModeUpdate,
@@ -318,10 +328,15 @@ impl State {
         if self.is_tooltip || self.agent_snapshot_host_path.is_some() {
             return false;
         }
+        // Permission settled — drop out of the navigable focus rotation.
+        set_selectable(false);
         let env = get_session_environment_variables();
         if let Some(loc) = agents::locate_snapshot(&env) {
             change_host_folder(loc.host_root);
             self.agent_snapshot_host_path = Some(loc.wasi_path);
+            let seen_dir = PathBuf::from("/host/.claude/custom-state/agent-seen-events");
+            self.seen_disk = agents::read_seen_events(&seen_dir);
+            self.agent_seen_events_dir = Some(seen_dir);
         }
         set_timeout(AGENT_POLL_SECS);
         false
@@ -334,35 +349,80 @@ impl State {
             let new_pane_agents = agents::project_for_session(path, session);
             if new_pane_agents != self.pane_agents {
                 self.pane_agents = new_pane_agents;
-                should_render = self.recompute_tab_flags();
-            } else {
-                // Even with no snapshot change, attention may have ticked or
-                // the active tab may have changed since last recompute.
-                should_render = self.recompute_tab_flags();
             }
         }
+        if let Some(dir) = &self.agent_seen_events_dir {
+            let new = agents::read_seen_events(dir);
+            if new != self.seen_disk {
+                self.seen_disk = new;
+            }
+        }
+        // Recompute every tick — pane_agents, seen_disk, or active tab may
+        // have shifted since last render.
+        should_render |= self.recompute_tab_flags();
         set_timeout(AGENT_POLL_SECS);
         should_render
     }
 
     fn recompute_tab_flags(&mut self) -> bool {
-        // Bound seen_at to live agents.
-        let live: std::collections::HashSet<&str> =
-            self.pane_agents.values().map(|a| a.claude_id.as_str()).collect();
-        self.seen_at.retain(|k, _| live.contains(k.as_str()));
+        // Prune overlay: drop entries for dead agents or whose disk-side
+        // seen has caught up with the optimistic patch.
+        self.seen_overlay.retain(|sid, overlay_seen| {
+            let alive = self.pane_agents.values().any(|a| &a.claude_id == sid);
+            if !alive {
+                return false;
+            }
+            let disk = self.seen_disk.get(sid).copied().unwrap_or(0);
+            *overlay_seen > disk
+        });
+
+        // Effective seen per claude_id = max(disk, overlay).
+        let mut effective: HashMap<String, i64> = self.seen_disk.clone();
+        for (sid, &v) in &self.seen_overlay {
+            let entry = effective.entry(sid.clone()).or_insert(0);
+            if v > *entry {
+                *entry = v;
+            }
+        }
 
         let active_tab_position = self.active_tab_idx.checked_sub(1);
-        let new_tab_flags = agents::compute_tab_flags(
+        let (new_tab_flags, to_mark_seen) = agents::compute_tab_flags(
             &self.pane_agents,
             &self.pane_manifest,
             active_tab_position,
-            &mut self.seen_at,
+            &effective,
         );
+
+        // Dispatch mark-seen events for any in-active-tab unseen agent.
+        for (claude_id, attention_at_ms) in to_mark_seen {
+            self.fire_mark_seen(&claude_id, attention_at_ms);
+        }
+
         if new_tab_flags != self.tab_flags {
             self.tab_flags = new_tab_flags;
             true
         } else {
             false
+        }
+    }
+
+    fn fire_mark_seen(&mut self, claude_id: &str, at_ms: i64) {
+        // Optimistic patch first.
+        let entry = self.seen_overlay.entry(claude_id.to_string()).or_insert(0);
+        if at_ms > *entry {
+            *entry = at_ms;
+        }
+        let Some(dir) = &self.agent_seen_events_dir else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let event = serde_json::json!({
+            "session_id": claude_id,
+            "seen_at_ms": at_ms,
+        });
+        let Ok(json) = serde_json::to_vec(&event) else { return };
+        let target = dir.join(format!("{claude_id}.json"));
+        let tmp = dir.join(format!("{claude_id}.json.tmp"));
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &target);
         }
     }
 
