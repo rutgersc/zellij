@@ -1766,33 +1766,6 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                         .senders
                         .send_to_plugin(PluginInstruction::RemoveClient(client_id))
                         .unwrap();
-                    if !session_state.read().unwrap().active_clients_are_connected() {
-                        *session_data.write().unwrap() = None;
-                        let client_ids_to_cleanup: Vec<ClientId> = session_state
-                            .read()
-                            .unwrap()
-                            .clients
-                            .keys()
-                            .copied()
-                            .collect();
-                        // these are just the pipes
-                        for client_id in client_ids_to_cleanup {
-                            remove_client!(client_id, os_input, session_state);
-                        }
-
-                        let watcher_client_ids: Vec<ClientId> =
-                            session_state.read().unwrap().watcher_client_ids();
-                        for watcher_id in watcher_client_ids {
-                            let _ = os_input.send_to_client(
-                                watcher_id,
-                                ServerToClientMsg::Exit {
-                                    exit_reason: ExitReason::Normal,
-                                },
-                            );
-                        }
-
-                        break;
-                    }
                 }
             },
             ServerInstruction::AssociatePipeWithClient { pipe_id, client_id } => {
