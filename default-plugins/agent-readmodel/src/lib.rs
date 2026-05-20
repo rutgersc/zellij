@@ -37,6 +37,10 @@ pub struct Agent {
     pub zellij_session: Option<String>,
     #[serde(default)]
     pub zellij_pane_id: Option<u32>,
+    /// Wall-clock millis of session creation. Stable sort key — agents
+    /// appear in creation order regardless of activity. Default 0.
+    #[serde(default)]
+    pub started_at_ms: i64,
     /// Wall-clock millis of the latest attention-worthy event. 0 = none.
     /// `seen_at_ms` is **not** in the readmodel — it's read separately from
     /// `agent-seen-events/` since seen-state is plugin-owned.

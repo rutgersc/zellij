@@ -69,21 +69,19 @@ struct State {
     // Keybinding cache
     cached_keybinds: KeybindsVec,
 
-    // Agent indicator — reads custom-state/agent-readmodel.json
+    // Agent indicator — reads custom-state/agent-readmodel.json (attention)
+    // and custom-state/agent-seen-events/ (acknowledgements written by
+    // agent-bar). compact-bar is purely a consumer here — it never writes
+    // mark-seen events itself; the agent-bar click/Enter path is the only
+    // acknowledgement entrypoint.
     agent_snapshot_host_path: Option<PathBuf>,
-    /// Read+write target for agent-seen-events. Daemon does not consume; this
-    /// dir holds the durable per-sid seen state.
     agent_seen_events_dir: Option<PathBuf>,
     pane_manifest: PaneManifest,
     pane_agents: HashMap<u32, PaneAgent>,
     tab_flags: HashMap<usize, TabFlag>,
     /// Latest disk scan of agent-seen-events/, refreshed on Timer + on
-    /// permission grant. Cross-instance updates flow through here.
+    /// permission grant.
     seen_disk: HashMap<String, i64>,
-    /// Optimistic mark-seen overlay. After firing the event we patch this so
-    /// the next render sees the agent as seen before the disk scan picks
-    /// it up. Effective seen = max(seen_disk, seen_overlay).
-    seen_overlay: HashMap<String, i64>,
 }
 
 struct TabRenderData {
@@ -365,64 +363,18 @@ impl State {
     }
 
     fn recompute_tab_flags(&mut self) -> bool {
-        // Prune overlay: drop entries for dead agents or whose disk-side
-        // seen has caught up with the optimistic patch.
-        self.seen_overlay.retain(|sid, overlay_seen| {
-            let alive = self.pane_agents.values().any(|a| &a.claude_id == sid);
-            if !alive {
-                return false;
-            }
-            let disk = self.seen_disk.get(sid).copied().unwrap_or(0);
-            *overlay_seen > disk
-        });
-
-        // Effective seen per claude_id = max(disk, overlay).
-        let mut effective: HashMap<String, i64> = self.seen_disk.clone();
-        for (sid, &v) in &self.seen_overlay {
-            let entry = effective.entry(sid.clone()).or_insert(0);
-            if v > *entry {
-                *entry = v;
-            }
-        }
-
         let active_tab_position = self.active_tab_idx.checked_sub(1);
-        let (new_tab_flags, to_mark_seen) = agents::compute_tab_flags(
+        let new_tab_flags = agents::compute_tab_flags(
             &self.pane_agents,
             &self.pane_manifest,
             active_tab_position,
-            &effective,
+            &self.seen_disk,
         );
-
-        // Dispatch mark-seen events for any in-active-tab unseen agent.
-        for (claude_id, attention_at_ms) in to_mark_seen {
-            self.fire_mark_seen(&claude_id, attention_at_ms);
-        }
-
         if new_tab_flags != self.tab_flags {
             self.tab_flags = new_tab_flags;
             true
         } else {
             false
-        }
-    }
-
-    fn fire_mark_seen(&mut self, claude_id: &str, at_ms: i64) {
-        // Optimistic patch first.
-        let entry = self.seen_overlay.entry(claude_id.to_string()).or_insert(0);
-        if at_ms > *entry {
-            *entry = at_ms;
-        }
-        let Some(dir) = &self.agent_seen_events_dir else { return };
-        let _ = std::fs::create_dir_all(dir);
-        let event = serde_json::json!({
-            "session_id": claude_id,
-            "seen_at_ms": at_ms,
-        });
-        let Ok(json) = serde_json::to_vec(&event) else { return };
-        let target = dir.join(format!("{claude_id}.json"));
-        let tmp = dir.join(format!("{claude_id}.json.tmp"));
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, &target);
         }
     }
 

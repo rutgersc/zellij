@@ -69,37 +69,34 @@ pub fn project_for_session(
     out
 }
 
-/// Compute per-tab tint flags AND collect (claude_id, attention_at_ms)
-/// tuples for every agent in the active tab whose attention is unseen —
-/// the caller fires `agent-seen-events` writes for these. The caller
-/// passes `effective_seen` already merged from disk + optimistic overlay.
+/// Compute per-tab tint flags. compact-bar is a read-only consumer of
+/// `agent-seen-events/` — mark-seen events are written only by
+/// agent-bar's click/Enter paths. So we simply project: if any pane on a
+/// tab hosts an agent whose `attention_at_ms > seen_at_ms`, the tab is
+/// flagged Attention. Busy is the fallback when no attention is unseen.
+/// Active-tab rendering ignores the flag (uses the theme's selected
+/// ribbon style), so we don't try to suppress flags for the active tab.
 pub fn compute_tab_flags(
     pane_agents: &HashMap<u32, PaneAgent>,
     pane_manifest: &PaneManifest,
-    active_tab_idx: Option<usize>,
-    effective_seen: &HashMap<String, i64>,
-) -> (HashMap<usize, TabFlag>, Vec<(String, i64)>) {
+    _active_tab_idx: Option<usize>,
+    seen: &HashMap<String, i64>,
+) -> HashMap<usize, TabFlag> {
     let mut out: HashMap<usize, TabFlag> = HashMap::new();
-    let mut to_mark_seen: Vec<(String, i64)> = Vec::new();
     for (tab_idx, panes) in &pane_manifest.panes {
-        let in_active = active_tab_idx == Some(*tab_idx);
         for pane in panes {
             if pane.is_plugin {
                 continue;
             }
             let Some(pa) = pane_agents.get(&pane.id) else { continue };
-            let seen = effective_seen.get(&pa.claude_id).copied().unwrap_or(0);
-            let unseen = pa.attention_at_ms > 0 && pa.attention_at_ms > seen;
-            if in_active && unseen {
-                to_mark_seen.push((pa.claude_id.clone(), pa.attention_at_ms));
-            }
-            let needs_attention = !in_active && unseen;
-            let flag = if needs_attention {
+            let seen_at = seen.get(&pa.claude_id).copied().unwrap_or(0);
+            let unseen = pa.attention_at_ms > 0 && pa.attention_at_ms > seen_at;
+            let flag = if unseen {
                 TabFlag::Attention
             } else if pa.status == AgentStatus::Busy {
                 TabFlag::Busy
             } else {
-                continue; // idle without unseen attention contributes nothing
+                continue;
             };
             let entry = out.entry(*tab_idx).or_insert(flag);
             if flag == TabFlag::Attention {
@@ -107,5 +104,5 @@ pub fn compute_tab_flags(
             }
         }
     }
-    (out, to_mark_seen)
+    out
 }
