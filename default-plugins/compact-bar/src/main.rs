@@ -363,6 +363,13 @@ impl State {
     }
 
     fn recompute_tab_flags(&mut self) -> bool {
+        // Always re-read seen state from disk before recomputing. Without
+        // this, a session you've just switched into would tint a tab
+        // orange briefly using stale `seen_disk` until its next Timer
+        // tick caught up — see the equivalent comment in agent-bar.
+        if let Some(dir) = &self.agent_seen_events_dir {
+            self.seen_disk = agents::read_seen_events(dir);
+        }
         let active_tab_position = self.active_tab_idx.checked_sub(1);
         let new_tab_flags = agents::compute_tab_flags(
             &self.pane_agents,

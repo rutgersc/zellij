@@ -148,9 +148,20 @@ impl ZellijPlugin for State {
                                 "/host/.claude/custom-state/agent-seen-events",
                             ));
                             self.refresh_seen_disk();
+                            // Synchronous initial read so the first render
+                            // already has agents. zellij creates a fresh
+                            // plugin instance *per client* on every attach
+                            // — see zellij-server/src/plugins/wasm_bridge.rs
+                            // `add_client` (which `mux focus-agent` triggers
+                            // via switch-session → detach + attach). Every
+                            // session switch lands on a freshly-loaded
+                            // instance; without this read, that instance
+                            // would render the "reading…" diagnostic until
+                            // its first Timer fires ~1.5s later.
+                            let initial = agents::read(&loc.wasi_path);
                             LoadState::Polling {
                                 path: loc.wasi_path,
-                                last: None,
+                                last: Some(initial),
                             }
                         },
                         None => LoadState::NoHomeInEnv,
@@ -495,7 +506,15 @@ impl State {
             agents.len().checked_sub(1).map(|max| i.min(max))
         });
 
-        let session = self.mode_info.session_name.as_deref().unwrap_or("");
+        // Refresh seen state from disk before each render. Each zellij
+        // session has its own plugin instance with its own `seen_disk`
+        // cache; without this, a session you've just switched to via
+        // `mux focus-agent` would render with whatever its last Timer
+        // tick saw (up to 1.5s stale) and briefly show the orange before
+        // catching up. Directory scan is a few file reads, cheap on each
+        // render.
+        self.refresh_seen_disk();
+        let session = self.mode_info.session_name.as_deref().unwrap_or("").to_string();
         let here = active_tab_pane_ids(&self.pane_manifest, self.active_tab_idx);
 
         // Pure flag computation — no auto mark-seen. User must click a cell
@@ -504,7 +523,7 @@ impl State {
         let mut flags: Vec<AgentFlags> = Vec::with_capacity(agents.len());
         for agent in agents {
             let unrouted = agent.zellij_pane_id.is_none();
-            let in_current_tab = is_in_current_tab(agent, session, &here);
+            let in_current_tab = is_in_current_tab(agent, &session, &here);
             let unseen = agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
             flags.push(AgentFlags { unrouted, in_current_tab, needs_attention: unseen });
