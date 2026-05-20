@@ -10,7 +10,7 @@ use crate::{
 use anyhow;
 use humantime::format_duration;
 use kdl::{KdlDocument, KdlNode, KdlValue};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use std::{fs, io, process};
@@ -772,11 +772,14 @@ fn assert_socket(name: &str) -> bool {
 
 /// Display category for `print_sessions`. Beyond live/exited, distinguishes
 /// `Stuck` so the user can see when a session is registered but its server
-/// is unresponsive (and `attach` would refuse it).
+/// is unresponsive (and `attach` would refuse it). `Dead` surfaces stale
+/// `running` registry entries whose server process is gone — useful for
+/// debugging registry leaks without hiding them from `ls`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDisplayStatus {
     Alive,
     Stuck,
+    Dead,
     Resurrectable,
 }
 
@@ -813,6 +816,10 @@ pub fn print_sessions(
                             "(STUCK - server not responding, run `zellij delete-session` to clear)"
                                 .to_string()
                         },
+                        SessionDisplayStatus::Dead => {
+                            "(DEAD - stale registry entry, run `zellij delete-session` to clear)"
+                                .to_string()
+                        },
                         SessionDisplayStatus::Resurrectable => {
                             "(EXITED - attach to resurrect)".to_string()
                         },
@@ -825,6 +832,11 @@ pub fn print_sessions(
                     SessionDisplayStatus::Alive => String::new(),
                     SessionDisplayStatus::Stuck => {
                         "(\u{1b}[33;1mSTUCK\u{1b}[m - server not responding, run \
+                         `zellij delete-session` to clear)"
+                            .to_string()
+                    },
+                    SessionDisplayStatus::Dead => {
+                        "(\u{1b}[31;1mDEAD\u{1b}[m - stale registry entry, run \
                          `zellij delete-session` to clear)"
                             .to_string()
                     },
@@ -959,52 +971,56 @@ pub fn delete_session(name: &str, force: bool) {
 }
 
 pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
-    // Iterate the registry directly so we can show stuck sessions too —
-    // `get_sessions()` filters them out via `assert_socket` because attach
-    // paths can't safely use them.
+    // Iterate the registry directly so every entry is visible — including Dead
+    // ones (stale "running" entries whose server process is gone) and Stuck
+    // ones (server registered but unresponsive). `get_sessions()` filters both
+    // because attach paths can't use them, but `ls` exists to *show* state so
+    // the user can spot and clear registry leaks.
     let registry = ensure_registry();
-    let mut all_sessions: HashMap<String, (Duration, SessionDisplayStatus)> =
-        get_resurrectable_sessions()
-            .into_iter()
-            .map(|(name, timestamp)| (name, (timestamp, SessionDisplayStatus::Resurrectable)))
-            .collect();
+    let mut output: Vec<(String, Duration, SessionDisplayStatus)> = Vec::new();
+    let mut running_names: HashSet<String> = HashSet::new();
     for entry in registry.running_sessions() {
+        running_names.insert(entry.display_name.clone());
+        let status = match check_session_state(&entry.id) {
+            SessionLiveness::Alive => SessionDisplayStatus::Alive,
+            SessionLiveness::Stuck => SessionDisplayStatus::Stuck,
+            SessionLiveness::Dead => SessionDisplayStatus::Dead,
+        };
+        // Prefer the socket's ctime/mtime (reflects when the server actually
+        // started). For Dead entries the socket may already be gone — fall
+        // back to the registry's `created_at` so the age column stays useful
+        // for spotting old stale entries.
         let sock_path = ZELLIJ_SOCK_DIR.join(&entry.id);
-        let ctime = std::fs::metadata(&sock_path)
+        let elapsed = std::fs::metadata(&sock_path)
             .ok()
             .and_then(|f| f.created().ok().or_else(|| f.modified().ok()))
             .and_then(|d| d.elapsed().ok())
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(&entry.created_at)
+                    .ok()
+                    .and_then(|dt| {
+                        SystemTime::now()
+                            .duration_since(SystemTime::from(dt))
+                            .ok()
+                    })
+            })
             .unwrap_or_default();
-        let duration = Duration::from_secs(ctime.as_secs());
-        match check_session_state(&entry.id) {
-            SessionLiveness::Alive => {
-                all_sessions.insert(
-                    entry.display_name.clone(),
-                    (duration, SessionDisplayStatus::Alive),
-                );
-            },
-            SessionLiveness::Stuck => {
-                all_sessions.insert(
-                    entry.display_name.clone(),
-                    (duration, SessionDisplayStatus::Stuck),
-                );
-            },
-            SessionLiveness::Dead => {},
+        let duration = Duration::from_secs(elapsed.as_secs());
+        output.push((entry.display_name.clone(), duration, status));
+    }
+    // Resurrectable entries (exited-session layout caches) are surfaced only
+    // for names without any running registry entry — a name with a live (or
+    // even Dead) running entry already represents that session in the list.
+    for (name, duration) in get_resurrectable_sessions() {
+        if !running_names.contains(&name) {
+            output.push((name, duration, SessionDisplayStatus::Resurrectable));
         }
     }
-    let exit_code = if all_sessions.is_empty() {
+    let exit_code = if output.is_empty() {
         eprintln!("No active zellij sessions found.");
         1
     } else {
-        print_sessions(
-            all_sessions
-                .into_iter()
-                .map(|(name, (timestamp, status))| (name, timestamp, status))
-                .collect(),
-            no_formatting,
-            short,
-            reverse,
-        );
+        print_sessions(output, no_formatting, short, reverse);
         0
     };
     process::exit(exit_code);
