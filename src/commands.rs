@@ -965,27 +965,36 @@ pub(crate) fn start_client(opts: CliArgs) {
                         if current_session.as_deref() == Some(name.as_str()) {
                             return None;
                         }
-                        // Check the registry directly so a stuck session for
-                        // this name surfaces a clear error instead of being
-                        // silently filtered (and then re-created with a suffix).
+                        // The registry can carry several entries with the same
+                        // `display_name` — leftover "running" rows whose server
+                        // crashed before exit are not reaped. Walk them all and
+                        // pick the first Alive match; only surface the Stuck
+                        // error if no Alive candidate exists, so a single stale
+                        // Dead/Stuck row can't shadow the real session.
                         let registry = zellij_utils::sessions::ensure_registry();
-                        let entry = registry
+                        let matches: Vec<_> = registry
                             .running_sessions()
                             .into_iter()
-                            .find(|s| s.display_name == name)?;
-                        match check_session_state(&entry.id) {
-                            SessionLiveness::Alive => Some(name),
-                            SessionLiveness::Dead => None,
-                            SessionLiveness::Stuck => {
-                                eprintln!(
-                                    "Session '{name}' exists but its server is not responding \
-                                     (stuck).\n\
-                                     Run `zellij delete-session {name}` to clear it, or kill \
-                                     the server process, then try again."
-                                );
-                                process::exit(1);
-                            },
+                            .filter(|s| s.display_name == name)
+                            .collect();
+                        let mut saw_stuck = false;
+                        for entry in &matches {
+                            match check_session_state(&entry.id) {
+                                SessionLiveness::Alive => return Some(name),
+                                SessionLiveness::Stuck => saw_stuck = true,
+                                SessionLiveness::Dead => {},
+                            }
                         }
+                        if saw_stuck {
+                            eprintln!(
+                                "Session '{name}' exists but its server is not responding \
+                                 (stuck).\n\
+                                 Run `zellij delete-session {name}` to clear it, or kill \
+                                 the server process, then try again."
+                            );
+                            process::exit(1);
+                        }
+                        None
                     })
                 } else {
                     None
