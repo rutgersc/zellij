@@ -63,6 +63,58 @@ impl PluginMap {
         }
         removed
     }
+    /// Drop every plugin instance whose key matches the given `client_id`. Returns the removed
+    /// assets so the caller can run per-instance teardown (worker exits, intercept clears, dropping
+    /// the WASM store on the plugin's pinned thread, removing the per-client data dir).
+    pub fn remove_client_instances(
+        &mut self,
+        client_id: ClientId,
+    ) -> HashMap<
+        (PluginId, ClientId),
+        (
+            Arc<Mutex<RunningPlugin>>,
+            Arc<Mutex<Subscriptions>>,
+            HashMap<String, UnboundedSender<MessageToWorker>>,
+        ),
+    > {
+        let keys: Vec<(PluginId, ClientId)> = self
+            .plugin_assets
+            .keys()
+            .filter(|(_, cid)| *cid == client_id)
+            .copied()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.plugin_assets.remove(&key).map(|asset| (key, asset)))
+            .collect()
+    }
+    /// Quiesce in place: stop workers (send `Exit`) and clear subscriptions on every entry
+    /// keyed by `client_id`, but leave the entries in `plugin_assets`. Used when the last
+    /// client detaches — the entries become a metadata-only carcass so reattach can still
+    /// rediscover the plugins via `plugin_ids()` / `*_of_plugin_id`.
+    ///
+    /// Returns `(any_subscribed_to_ansi, any_intercepting_key_presses)` so the caller can
+    /// renotify screen-side state that mirrored those subscriptions.
+    pub fn quiesce_client_instances(&mut self, client_id: ClientId) -> (bool, bool) {
+        let mut any_ansi = false;
+        let mut any_intercepting = false;
+        for ((_, cid), (running_plugin, subs, workers)) in self.plugin_assets.iter() {
+            if *cid != client_id {
+                continue;
+            }
+            if running_plugin.lock().unwrap().intercepting_key_presses() {
+                any_intercepting = true;
+            }
+            let mut subs_guard = subs.lock().unwrap();
+            if subs_guard.contains(&EventType::PaneRenderReportWithAnsi) {
+                any_ansi = true;
+            }
+            subs_guard.clear();
+            for (_name, sender) in workers.iter() {
+                let _ = sender.send(MessageToWorker::Exit);
+            }
+        }
+        (any_ansi, any_intercepting)
+    }
     pub fn plugin_ids(&self) -> Vec<PluginId> {
         let mut unique_plugins: HashSet<PluginId> = self
             .plugin_assets
