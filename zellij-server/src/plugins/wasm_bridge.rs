@@ -1,3 +1,6 @@
+#[path = "client_detach_cleanup.rs"]
+mod client_detach_cleanup;
+
 use super::{PinnedExecutor, PluginId, PluginInstruction};
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::plugins::pipes::{
@@ -817,6 +820,7 @@ impl WasmBridge {
                 },
             )
         }
+        self.sweep_orphan_carcasses(client_id);
         self.connected_clients.lock().unwrap().push(client_id);
         Ok(())
     }
@@ -1149,6 +1153,13 @@ impl WasmBridge {
         shutdown_sender: Sender<()>,
         mut notification_end: Option<NotificationEnd>,
     ) -> Result<()> {
+        let connected_for_filter: HashSet<ClientId> = self
+            .connected_clients
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
         let plugins_to_update: Vec<(
             PluginId,
             ClientId,
@@ -1161,10 +1172,11 @@ impl WasmBridge {
             .running_plugins_and_subscriptions()
             .iter()
             .cloned()
-            .filter(|(plugin_id, _client_id, _running_plugin, _subscriptions)| {
+            .filter(|(plugin_id, client_id, _running_plugin, _subscriptions)| {
                 !&self
                     .cached_events_for_pending_plugins
                     .contains_key(&plugin_id)
+                    && connected_for_filter.contains(client_id)
             })
             .collect();
 
@@ -1301,6 +1313,8 @@ impl WasmBridge {
         if let Some(ref mut prev_report) = self.previous_pane_render_report {
             prev_report.all_pane_contents.remove(&client_id);
         }
+
+        self.tear_down_client_instances(client_id);
     }
 
     fn get_changed_panes_per_client(
