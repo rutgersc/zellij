@@ -57,10 +57,28 @@ try {
 }
 
 # --- 4. Sideload ConPTY pair next to zellij.exe ---
-Copy-Item $openConsole $cargoBin -Force
-Copy-Item $conpty      $cargoBin -Force
-$ocVer = (Get-Item (Join-Path $cargoBin 'OpenConsole.exe')).VersionInfo.FileVersion
-$cpVer = (Get-Item (Join-Path $cargoBin 'conpty.dll')).VersionInfo.FileVersion
-Write-Host "  installed OpenConsole.exe $ocVer -> $cargoBin"
-Write-Host "  installed conpty.dll      $cpVer -> $cargoBin"
+#
+# If a running wezterm-gui has already LoadLibrary'd these from $cargoBin,
+# the file is held open and Copy-Item -Force will fail. Skip the copy when
+# the destination is already at the wanted version — that's the common
+# steady-state case after a fresh wezterm install.
+function Sync-ConPtyFile {
+    param([string]$Src, [string]$DstDir)
+    $name    = Split-Path $Src -Leaf
+    $dst     = Join-Path $DstDir $name
+    $srcVer  = (Get-Item $Src).VersionInfo.FileVersion
+    $dstVer  = if (Test-Path $dst) { (Get-Item $dst).VersionInfo.FileVersion } else { $null }
+    if ($dstVer -eq $srcVer) {
+        Write-Host "  $name $dstVer already in $DstDir (skip)"
+        return
+    }
+    try {
+        Copy-Item $Src $dst -Force -ErrorAction Stop
+        Write-Host "  installed $name $srcVer -> $DstDir (was $dstVer)"
+    } catch {
+        Write-Warning "could not overwrite $dst (likely held by a running process). Close any wezterm/zellij and re-run, or accept current $dstVer."
+    }
+}
+Sync-ConPtyFile -Src $openConsole -DstDir $cargoBin
+Sync-ConPtyFile -Src $conpty      -DstDir $cargoBin
 Write-Host "done." -ForegroundColor Green
