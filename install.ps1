@@ -10,7 +10,17 @@
 # zellij so the .exe is unlocked, runs `cargo install`, and drops the
 # ConPTY pair next to the freshly installed zellij.exe.
 #
+# `-CopyOnly` skips the `cargo install` step and just re-runs the
+# sideload — use this to retry the file copy after closing a running
+# wezterm/zellij that was holding the destination locked, without
+# rebuilding from scratch.
+#
 # Idempotent. Re-run after any pull or to refresh the install.
+
+[CmdletBinding()]
+param(
+    [switch]$CopyOnly
+)
 
 $ErrorActionPreference = 'Stop'
 $repo     = $PSScriptRoot
@@ -25,10 +35,12 @@ $env:PATH = "C:\Strawberry\perl\bin;$env:PATH"
 $conptyVer = '1.24.260512001'
 $nupkgUrl  = "https://github.com/microsoft/terminal/releases/download/v1.24.11321.0/Microsoft.Windows.Console.ConPTY.$conptyVer.nupkg"
 
-# --- 1. Ensure ConPTY pair is cached on disk ---
 $conpty      = Join-Path $cache 'conpty.dll'
 $openConsole = Join-Path $cache 'OpenConsole.exe'
-if (-not (Test-Path $conpty) -or -not (Test-Path $openConsole)) {
+
+# --- 1. Ensure ConPTY pair is cached on disk ---
+$cacheVer = if (Test-Path $conpty) { (Get-Item $conpty).VersionInfo.FileVersion } else { $null }
+if (-not (Test-Path $conpty) -or -not (Test-Path $openConsole) -or $cacheVer -ne $conptyVer) {
     Write-Host "fetching ConPTY pair v$conptyVer ..."
     New-Item -ItemType Directory -Force -Path $cache | Out-Null
     $nupkg = Join-Path $cache 'conpty.nupkg'
@@ -40,21 +52,23 @@ if (-not (Test-Path $conpty) -or -not (Test-Path $openConsole)) {
     Copy-Item (Join-Path $ext 'runtimes\win-x64\native\conpty.dll')        $conpty      -Force
 }
 
-# --- 2. Stop running zellij so the .exe is unlocked ---
-$running = @(Get-Process zellij -ErrorAction SilentlyContinue)
-if ($running.Count -gt 0) {
-    Write-Host "stopping $($running.Count) running zellij process(es) ..."
-    $running | Stop-Process -Force
-    Start-Sleep -Milliseconds 300
-}
+if (-not $CopyOnly) {
+    # --- 2. Stop running zellij so the .exe is unlocked ---
+    $running = @(Get-Process zellij -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        Write-Host "stopping $($running.Count) running zellij process(es) ..."
+        $running | Stop-Process -Force
+        Start-Sleep -Milliseconds 300
+    }
 
-# --- 3. cargo install ---
-Push-Location $repo
-try {
-    cargo install --path . --no-default-features --features web_server_capability --force
-    if ($LASTEXITCODE -ne 0) { throw "cargo install failed (exit $LASTEXITCODE)" }
-} finally {
-    Pop-Location
+    # --- 3. cargo install ---
+    Push-Location $repo
+    try {
+        cargo install --path . --no-default-features --features web_server_capability --force
+        if ($LASTEXITCODE -ne 0) { throw "cargo install failed (exit $LASTEXITCODE)" }
+    } finally {
+        Pop-Location
+    }
 }
 
 # --- 4. Sideload ConPTY pair next to zellij.exe ---
@@ -77,7 +91,7 @@ function Sync-ConPtyFile {
         Copy-Item $Src $dst -Force -ErrorAction Stop
         Write-Host "  installed $name $srcVer -> $DstDir (was $dstVer)"
     } catch {
-        Write-Warning "could not overwrite $dst (likely held by a running process). Close any wezterm/zellij and re-run, or accept current $dstVer."
+        Write-Warning "could not overwrite $dst (likely held by a running process). Close any wezterm/zellij and re-run with -CopyOnly, or accept current $dstVer."
     }
 }
 Sync-ConPtyFile -Src $openConsole -DstDir $cargoBin
