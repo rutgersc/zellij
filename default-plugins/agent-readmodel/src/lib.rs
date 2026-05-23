@@ -19,7 +19,11 @@ use serde::Deserialize;
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Busy,
+    /// Claude is between turns, ready for the next user prompt.
     Idle,
+    /// Claude is blocked on the user (permission, AskUserQuestion,
+    /// ExitPlanMode). Distinct from Idle so the bar can surface it.
+    Waiting,
 }
 
 /// One entry in the readmodel. The plugin only needs the fields it renders;

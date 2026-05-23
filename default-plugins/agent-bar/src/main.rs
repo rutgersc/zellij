@@ -30,6 +30,7 @@ const MAX_NAME_WIDTH: usize = 18;
 // location (in the current tab or not). Two orthogonal channels.
 const BUSY_FG: PaletteColor = PaletteColor::EightBit(46); // bright green
 const IDLE_FG: PaletteColor = PaletteColor::EightBit(231); // near-white
+const WAITING_FG: PaletteColor = PaletteColor::EightBit(220); // amber — blocked on user
 const UNROUTED_FG: PaletteColor = PaletteColor::EightBit(196); // bright red
 const ATTENTION_BG: PaletteColor = PaletteColor::EightBit(130); // dark orange — needs attention
 const SELECTED_BG: PaletteColor = PaletteColor::EightBit(24); // dark blue — keyboard cursor
@@ -739,6 +740,7 @@ fn render_cell(
     let fg = match agent.status {
         AgentStatus::Busy => BUSY_FG,
         AgentStatus::Idle => IDLE_FG,
+        AgentStatus::Waiting => WAITING_FG,
     };
     // Selection wins over attention so the keyboard cursor is always
     // unambiguous; the `!` prefix still carries the attention signal.
