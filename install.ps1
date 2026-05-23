@@ -21,8 +21,9 @@ $cache    = Join-Path $env:LOCALAPPDATA 'zellij-conpty'
 $env:PATH = "C:\Strawberry\perl\bin;$env:PATH"
 
 # Pinned ConPTY release. Bump these when bumping the bundled version.
-$conptyVer = '1.24.260402001'
-$nupkgUrl  = "https://github.com/microsoft/terminal/releases/download/v1.24.10921.0/Microsoft.Windows.Console.ConPTY.$conptyVer.nupkg"
+# Matches WT-stable 1.24.11321.0's OpenConsole.exe.
+$conptyVer = '1.24.260512001'
+$nupkgUrl  = "https://github.com/microsoft/terminal/releases/download/v1.24.11321.0/Microsoft.Windows.Console.ConPTY.$conptyVer.nupkg"
 
 # --- 1. Ensure ConPTY pair is cached on disk ---
 $conpty      = Join-Path $cache 'conpty.dll'
