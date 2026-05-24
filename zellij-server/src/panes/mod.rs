@@ -12,6 +12,8 @@ mod plugin_pane;
 mod search;
 pub mod terminal_pane;
 mod tiled_panes;
+#[cfg(windows)]
+pub mod win32_input_mode;
 
 pub use active_panes::*;
 pub use alacritty_functions::*;
