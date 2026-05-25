@@ -5,8 +5,12 @@ use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
 use zellij_tile_utils::style;
 
-const AGENT_BUSY_FG: PaletteColor = PaletteColor::EightBit(46); // bright green
-const AGENT_ATTENTION_FG: PaletteColor = PaletteColor::EightBit(130); // dark orange — same as agent-bar's attention bg
+// Agent-state palette — resolved from the theme palette, NOT hardcoded.
+// See memory:project_agent_state_palette for the vocabulary. Busy = green
+// fg only (reuses ribbon_selected.background, the same green the theme
+// paints active tabs with). Attention = yellow bg + on-colour fg, picked
+// from exit_code_error.emphasis_0 / ribbon_selected.base so a ChangeTheme
+// action repaints everything atomically.
 
 fn cursors<'a>(
     focused_clients: &'a [ClientId],
@@ -44,12 +48,11 @@ pub fn render_tab(
         palette.ribbon_selected.background
     } else if is_alternate_tab {
         alternate_tab_color
+    } else if matches!(tab_flag, Some(TabFlag::Attention)) {
+        palette.exit_code_error.emphasis_0
     } else {
         palette.ribbon_unselected.background
     };
-    // Tint inactive tabs by their flag so the bar reads at a glance. The
-    // active tab keeps its standard highlight colour — its bg is already
-    // distinct, and a status tint there would fight the highlight.
     let foreground_color = if tab.is_flashing_bell {
         if tab.active {
             palette.ribbon_selected.emphasis_3
@@ -60,8 +63,8 @@ pub fn render_tab(
         palette.ribbon_selected.base
     } else {
         match tab_flag {
-            Some(TabFlag::Attention) => AGENT_ATTENTION_FG,
-            Some(TabFlag::Busy) => AGENT_BUSY_FG,
+            Some(TabFlag::Attention) => palette.ribbon_selected.base,
+            Some(TabFlag::Busy) => palette.ribbon_selected.background,
             None => palette.ribbon_unselected.base,
         }
     };

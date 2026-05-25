@@ -1,15 +1,24 @@
-//! Persistent strip showing every running Claude agent across every zellij
-//! session. Polls `~/.claude/readmodel/agents.json` every `POLL_SECS`.
+//! Vertical agent panel — one column on the side of a tab, showing every
+//! running Claude agent across every zellij session. Polls
+//! `~/.claude/readmodel/agents.json` every `POLL_SECS`.
 //!
-//! Layout: `folder: name  folder: name  folder: name ✗  ...`
-//!   text fg carries status — green=busy, amber=idle.
-//!   ✗ suffix = unrouted (no zellij_pane_id).
-//!   Cells render in the order the snapshot lists them.
-//! Click → `mux focus-agent <session_id>`.
+//! Layout: each agent's `name` is word-wrapped to the pane width (1..=4
+//! rows). Agents are grouped under the zellij session they belong to;
+//! groups (and agents within them) are ordered by `started_at_ms` desc, so
+//! the newest activity stays at the top. Agents without a `zellij_session`
+//! collect in a "sessionless" group pinned to the bottom.
 //!
-//! Every distinguishable state — awaiting permission, no $HOME in env, file
-//! missing/unreadable/unparseable, empty snapshot, populated snapshot — has
-//! its own visible rendering. The bar is also the diagnostics surface.
+//! Status carries through text fg (green=busy, white=idle, amber=waiting).
+//! `needs_attention` paints the agent's rows orange-bg. `✗` after the
+//! session header marks agents missing a `zellij_pane_id`.
+//!
+//! Click any row of an agent → `mux focus-agent <session_id>`. Up/Down
+//! moves the keyboard cursor across agents, Enter activates, Esc returns
+//! focus to the previous pane.
+//!
+//! Every distinguishable load state — awaiting permission, no $HOME in
+//! env, file missing/unreadable/unparseable, empty snapshot — has its own
+//! visible rendering. The panel is also the diagnostics surface.
 
 mod agents;
 
@@ -23,22 +32,94 @@ use zellij_tile_utils::style;
 use crate::agents::{Agent, AgentStatus, ReadResult};
 
 const POLL_SECS: f64 = 1.5;
-/// Hard cap on rendered name width — favours fitting more agents over
-/// reading any one in full. The full name is on the snapshot anyway.
-const MAX_NAME_WIDTH: usize = 18;
-// Color carries activity (green=busy, white=idle), underline carries
-// location (in the current tab or not). Two orthogonal channels.
-const BUSY_FG: PaletteColor = PaletteColor::EightBit(46); // bright green
-const IDLE_FG: PaletteColor = PaletteColor::EightBit(231); // near-white
-const WAITING_FG: PaletteColor = PaletteColor::EightBit(220); // amber — blocked on user
-const UNROUTED_FG: PaletteColor = PaletteColor::EightBit(196); // bright red
-const ATTENTION_BG: PaletteColor = PaletteColor::EightBit(130); // dark orange — needs attention
-const SELECTED_BG: PaletteColor = PaletteColor::EightBit(24); // dark blue — keyboard cursor
-const DIM_COLOR: PaletteColor = PaletteColor::EightBit(8); // dim grey
-const ERROR_COLOR: PaletteColor = PaletteColor::EightBit(9); // bright red
+/// Hard cap on rows used to render a single agent's name. Past this we
+/// truncate with `…` — the full name is still on the snapshot.
+const MAX_NAME_LINES: usize = 4;
+/// Every row is prefixed by [focus_col(1), left_pad(1)]. Focus col becomes
+/// an accent block `▌` when the panel is focused, a blank otherwise — it
+/// is the "this panel is active" signal.
+const OUTER_PAD: usize = 2;
+/// Within an agent row, after `OUTER_PAD`, two more cols for [unrouted
+/// marker, space] before the wrapped name.
+const AGENT_INDENT: usize = 2;
+const SESSIONLESS_LABEL: &str = "sessionless";
+
+// Agent-state palette — shared vocabulary across agent-bar, compact-bar's
+// tab tints, and (eventually) the mux session picker:
+//   busy        → green fg, no bg              (working, no user action needed)
+//   waiting     → yellow bg + on-colour fg     (blocked on user)
+//   attention   → yellow bg + on-colour fg     (unseen attention event)
+//   active-pane → green bg + on-colour fg      (THIS agent owns the zellij
+//                                               pane the user is currently in)
+//   idle/seen   → text fg, no bg               (neutral)
+// Active-pane mirrors the active-tab pattern (green bg + on-colour fg) so the
+// agent you're "inside" reads as the visual peer of your active tab.
+//
+// All status colours are resolved from `mode_info.style.colors` so a
+// ChangeTheme action updates everything together — green/yellow/on-colour
+// come straight from `ribbon_selected` and `exit_code_error` so they match
+// what the theme uses for its own active-tab and error styles. Only the
+// red unrouted marker and the structural glyphs are hardcoded.
 const UNROUTED: &str = "\u{2717}";
-const SEPARATOR: &str = "  \u{00B7}  "; // "  ·  "
-const SEPARATOR_WIDTH: usize = 5;
+const FOCUS_BLOCK: &str = "\u{258C}"; // ▌
+
+/// Theme-driven colours for every agent state. Built once per render from
+/// `mode_info.style.colors` so a ChangeTheme keystroke updates the whole
+/// panel atomically.
+#[derive(Copy, Clone)]
+struct AgentColors {
+    /// The "green" — bg for active-pane, fg for busy.
+    green: PaletteColor,
+    /// The "yellow" — bg for waiting / needs-attention.
+    yellow: PaletteColor,
+    /// Foreground to use on top of `green` or `yellow`. Comes from the
+    /// theme's ribbon_selected.base so it matches whatever fg the user's
+    /// theme already uses on its active-tab green.
+    on_color: PaletteColor,
+    /// Neutral text colour, for idle agents and headers.
+    text: PaletteColor,
+    /// Bar background — the colour of un-tinted rows.
+    bar_bg: PaletteColor,
+    /// Header background — distinct shade so groups visually separate.
+    header_bg: PaletteColor,
+    /// Panel-active indicator (the leftmost `▌` block).
+    accent: PaletteColor,
+    /// Selection cursor pair, picked based on inferred theme hue.
+    selected_bg: PaletteColor,
+    selected_fg: PaletteColor,
+    /// Theme's red — used for the unrouted `✗` marker and for fatal
+    /// diagnostic text (missing snapshot, parse error, etc).
+    error: PaletteColor,
+}
+
+impl AgentColors {
+    fn from_palette(p: &Styling) -> Self {
+        Self {
+            green: p.ribbon_selected.background,
+            yellow: p.exit_code_error.emphasis_0,
+            on_color: p.ribbon_selected.base,
+            text: p.text_unselected.base,
+            bar_bg: p.text_unselected.background,
+            // text_selected.background is a distinct shade in most themes
+            // (e.g. Dracula's #44475A vs the panel's #282A36) — gives us a
+            // header strip without hardcoding a grey.
+            header_bg: p.text_selected.background,
+            accent: p.frame_selected.base,
+            // The canonical "highlighted list item" pair. Adapts per
+            // theme — ayu-light gives strong blue, dracula-custom gives a
+            // subtle lifted-grey, catppuccin-latte gives soft grey, etc.
+            // Edge case: upstream zellij:dracula sets this equal to the
+            // bar bg (selection invisible). That's a theme defect; using a
+            // different theme is the fix.
+            selected_bg: p.list_selected.background,
+            selected_fg: p.list_selected.base,
+            // The theme's "error red". Used for unrouted (✗) and for fatal
+            // diagnostic states. Every theme defines this — it's how zellij
+            // paints exit-code-nonzero indicators elsewhere.
+            error: p.exit_code_error.base,
+        }
+    }
+}
 
 #[derive(Default)]
 enum LoadState {
@@ -51,67 +132,36 @@ enum LoadState {
     },
 }
 
-/// Feedback for the most recent click. Persists until the next click so the
-/// user can see what happened (was it received? did the spawn succeed? what
-/// did the command print?).
-enum ClickFeedback {
-    /// Click hit-tested but no cell — nothing was dispatched.
-    Missed { col: usize },
-    Pending { label: String },
-    Done {
-        label: String,
-        exit: Option<i32>,
-        stderr: String,
-    },
-}
-
 #[derive(Default)]
 struct State {
     load: LoadState,
     mode_info: ModeInfo,
-    /// Click hit-test ranges, rebuilt every render: (col_start, col_end, session_id).
-    cell_ranges: Vec<(usize, usize, String)>,
-    last_click: Option<ClickFeedback>,
-    /// PaneManifest + active tab index let us decide which agents are "here".
+    /// Click hit-test: rendered_row → session_id. Rebuilt every render.
+    row_ranges: Vec<(usize, String)>,
+    /// PaneManifest + active tab let us decide which agents are "here".
     pane_manifest: PaneManifest,
     active_tab_idx: Option<usize>,
-    /// Latest scan of `agent-seen-events/` keyed by claude_id. Refreshed
-    /// each Timer tick alongside the readmodel.
+    /// Latest scan of `agent-seen-events/` keyed by claude_id.
     seen_disk: HashMap<String, i64>,
-    /// Optimistic mark-seen overlay. After firing
-    /// `agent-seen-events/<sid>.json` we patch this map so the next render
-    /// sees the agent as "seen" before the file write propagates to the
-    /// next disk scan. `effective_seen = max(seen_disk, overlay)`.
+    /// Optimistic mark-seen overlay; effective = max(disk, overlay).
     seen_overlay: HashMap<String, i64>,
-    /// Where the seen-event files live, set after permission grant when the
-    /// WASI host root is known. Same dir is read for `seen_disk` and
-    /// written for mark-seen.
     seen_events_dir: Option<PathBuf>,
-    /// Keyboard cursor over the rendered cells. Clamped to the agent count
-    /// on every render. `None` = no cursor visible. Auto-set on focus gain
-    /// (PaneUpdate), cleared on focus loss, acted on by Enter.
+    /// Keyboard cursor — agent index in display order (groups → agents).
     selected_idx: Option<usize>,
-    /// Captured in `load()` so we can identify ourselves in PaneManifest.
     own_plugin_id: Option<u32>,
-    /// True when our pane was the focused one in the last PaneUpdate.
-    /// Edge-triggered: transitions drive selected_idx changes.
     was_focused: bool,
-    /// Most recent non-plugin focused pane in the active tab — the "came
-    /// from" target. Used to (a) auto-position the keyboard cursor on focus
-    /// gain and (b) jump back on Esc.
     last_external_focused_pane: Option<u32>,
+    /// Row scroll offset into the rendered line list.
+    scroll_offset: usize,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        // Stay selectable for two reasons:
-        //   1. zellij #4749 — non-selectable plugins can't receive the y/n
-        //      permission prompt grant.
-        //   2. Selectable panes receive Key events, which we use for
-        //      keyboard activation (Left/Right to move cursor, Enter to
-        //      focus the agent's session).
+        // Stay selectable: zellij #4749 — non-selectable plugins can't
+        // receive the y/n permission prompt grant. Also lets the panel
+        // join the keyboard pane cycle for Up/Down/Enter navigation.
         subscribe(&[
             EventType::ModeUpdate,
             EventType::TabUpdate,
@@ -135,30 +185,16 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(_) => {
                 if matches!(self.load, LoadState::AwaitingPermission) {
-                    // Stay selectable after the grant — see `load()`. The
-                    // bar joining the pane navigation cycle is the cost we
-                    // pay for keyboard-driven agent switching.
                     let env = get_session_environment_variables();
                     self.load = match agents::locate_snapshot(&env) {
                         Some(loc) => {
                             change_host_folder(loc.host_root);
-                            // agent-seen-events is plugin-owned: we both
-                            // read this dir to overlay seen state and write
-                            // here on mark-seen. Daemon does not consume.
                             self.seen_events_dir = Some(PathBuf::from(
                                 "/host/.claude/custom-state/agent-seen-events",
                             ));
                             self.refresh_seen_disk();
-                            // Synchronous initial read so the first render
-                            // already has agents. zellij creates a fresh
-                            // plugin instance *per client* on every attach
-                            // — see zellij-server/src/plugins/wasm_bridge.rs
-                            // `add_client` (which `mux focus-agent` triggers
-                            // via switch-session → detach + attach). Every
-                            // session switch lands on a freshly-loaded
-                            // instance; without this read, that instance
-                            // would render the "reading…" diagnostic until
-                            // its first Timer fires ~1.5s later.
+                            // Synchronous initial read — first render
+                            // already has agents instead of "reading…".
                             let initial = agents::read(&loc.wasi_path);
                             LoadState::Polling {
                                 path: loc.wasi_path,
@@ -218,42 +254,45 @@ impl ZellijPlugin for State {
                 set_timeout(POLL_SECS);
                 changed
             },
-            Event::Mouse(Mouse::LeftClick(_, col)) => {
-                let col = col as usize;
+            Event::Mouse(Mouse::LeftClick(line, _col)) => {
+                let row = if line < 0 { return false } else { line as usize };
                 let hit = self
-                    .cell_ranges
+                    .row_ranges
                     .iter()
-                    .find(|(start, end, _)| col >= *start && col < *end)
-                    .map(|(_, _, sid)| sid.clone());
-                self.last_click = Some(match hit {
-                    Some(sid) => {
-                        self.acknowledge_agent(&sid);
-                        let label = self.dispatch_focus_agent(&sid);
-                        ClickFeedback::Pending { label }
-                    },
-                    None => ClickFeedback::Missed { col },
-                });
-                true
+                    .find(|(r, _)| *r == row)
+                    .map(|(_, sid)| sid.clone());
+                if let Some(sid) = hit {
+                    self.acknowledge_agent(&sid);
+                    let _ = self.dispatch_focus_agent(&sid);
+                    if let Some(idx) = self
+                        .display_order()
+                        .iter()
+                        .position(|a| a.session_id == sid)
+                    {
+                        self.selected_idx = Some(idx);
+                    }
+                    return true;
+                }
+                false
             },
             Event::Key(key) => {
-                let len = self.current_agents().len();
+                let agents = self.display_order();
+                let len = agents.len();
                 let no_mods = key.has_no_modifiers();
-                // j/k are vertical in vim but the bar is 1D — alias them as
-                // next/prev (j = forward = right, k = back = left).
-                let go_left = matches!(key.bare_key, BareKey::Left | BareKey::Char('h' | 'k')) && no_mods;
-                let go_right = matches!(key.bare_key, BareKey::Right | BareKey::Char('l' | 'j')) && no_mods;
-                let go_first = matches!(key.bare_key, BareKey::Home | BareKey::Char('0' | '^')) && no_mods;
-                let go_last = matches!(key.bare_key, BareKey::End | BareKey::Char('$' | 'G')) && no_mods;
+                let go_up = matches!(key.bare_key, BareKey::Up | BareKey::Char('k')) && no_mods;
+                let go_down = matches!(key.bare_key, BareKey::Down | BareKey::Char('j')) && no_mods;
+                let go_first = matches!(key.bare_key, BareKey::Home | BareKey::Char('g')) && no_mods;
+                let go_last = matches!(key.bare_key, BareKey::End | BareKey::Char('G')) && no_mods;
                 let activate = matches!(key.bare_key, BareKey::Enter) && no_mods;
                 let cancel = matches!(key.bare_key, BareKey::Esc | BareKey::Char('q')) && no_mods;
-                if go_left && len > 0 {
+                if go_up && len > 0 {
                     self.selected_idx = Some(match self.selected_idx {
                         Some(i) if i > 0 => i - 1,
                         _ => 0,
                     });
                     return true;
                 }
-                if go_right && len > 0 {
+                if go_down && len > 0 {
                     self.selected_idx = Some(match self.selected_idx {
                         Some(i) => (i + 1).min(len - 1),
                         None => 0,
@@ -271,19 +310,16 @@ impl ZellijPlugin for State {
                 if activate {
                     if let Some(sid) = self
                         .selected_idx
-                        .and_then(|i| self.current_agents().get(i))
+                        .and_then(|i| agents.get(i))
                         .map(|a| a.session_id.clone())
                     {
                         self.acknowledge_agent(&sid);
-                        let label = self.dispatch_focus_agent(&sid);
-                        self.last_click = Some(ClickFeedback::Pending { label });
+                        let _ = self.dispatch_focus_agent(&sid);
                         return true;
                     }
                     return false;
                 }
                 if cancel {
-                    // Send focus back to where we came from. If that pane
-                    // is gone, fall back to spatially-above.
                     let still_alive = self.last_external_focused_pane.filter(|pid| {
                         self.pane_manifest
                             .panes
@@ -294,89 +330,65 @@ impl ZellijPlugin for State {
                     if let Some(pid) = still_alive {
                         focus_terminal_pane(pid, false, false);
                     } else {
-                        move_focus(Direction::Up);
+                        move_focus(Direction::Right);
                     }
                     return true;
                 }
                 false
             },
-            Event::RunCommandResult(exit, _stdout, stderr, ctx) => {
-                if let Some(label) = ctx.get("click_label") {
-                    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-                    self.last_click = Some(ClickFeedback::Done {
-                        label: label.clone(),
-                        exit,
-                        stderr,
-                    });
-                    return true;
-                }
-                false
-            },
+            Event::RunCommandResult(_, _, _, _) => false,
             _ => false,
         }
     }
 
-    fn render(&mut self, _rows: usize, cols: usize) {
-        self.cell_ranges.clear();
-        let bg = self.mode_info.style.colors.text_unselected.background;
-        // Decide what to do under the immutable borrow, then either print
-        // a diagnostic immediately or fall through to a method call that
-        // wants &mut self. Clone the agents Vec out so the &self.load
-        // borrow can drop before the cell render begins.
+    fn render(&mut self, rows: usize, cols: usize) {
+        self.row_ranges.clear();
+        let colors = AgentColors::from_palette(&self.mode_info.style.colors);
+
         enum Action {
             Diag(PaletteColor, String),
-            // Loud, bold, bright bg — for user-action-required states that
-            // must not blend into the bar on dim themes.
             Attention(String),
-            Cells(Vec<Agent>),
+            Cells,
         }
         let action = match &self.load {
             LoadState::AwaitingPermission => Action::Attention(
-                "agent-bar needs permissions — focus this pane and press y \
-                 (fullscreen with Ctrl+Shift+; if the prompt is cropped)"
+                "agent-bar needs permissions — press y \
+                 (fullscreen with Ctrl+Shift+; if cropped)"
                     .to_string(),
             ),
             LoadState::NoHomeInEnv => Action::Diag(
-                ERROR_COLOR,
+                colors.error,
                 "$HOME / $USERPROFILE not in session env".to_string(),
             ),
             LoadState::Polling { path, last } => match last {
-                None => Action::Diag(DIM_COLOR, format!("reading {}", path.display())),
+                None => Action::Diag(colors.text, format!("reading {}", path.display())),
                 Some(ReadResult::Missing) => {
-                    Action::Diag(ERROR_COLOR, format!("missing: {}", path.display()))
+                    Action::Diag(colors.error, format!("missing: {}", path.display()))
                 },
                 Some(ReadResult::Unreadable(e)) => {
-                    Action::Diag(ERROR_COLOR, format!("unreadable {}: {e}", path.display()))
+                    Action::Diag(colors.error, format!("unreadable {}: {e}", path.display()))
                 },
                 Some(ReadResult::ParseError(e)) => {
-                    Action::Diag(ERROR_COLOR, format!("parse error: {e}"))
+                    Action::Diag(colors.error, format!("parse error: {e}"))
                 },
                 Some(ReadResult::Ok(agents)) if agents.is_empty() => {
-                    Action::Diag(DIM_COLOR, format!("no agents @ {}", path.display()))
+                    Action::Diag(colors.text, "no agents".to_string())
                 },
-                Some(ReadResult::Ok(agents)) => Action::Cells(agents.clone()),
+                Some(ReadResult::Ok(_)) => Action::Cells,
             },
         };
-        // Column 0 is the focus indicator — a theme-accent block (▌) when
-        // our pane is focused, otherwise just a space. Same width either
-        // way so col positions stay stable. Attention state skips it; the
-        // orange bg already screams "look here".
-        let accent = self.mode_info.style.colors.frame_selected.base;
-        let lead = focus_lead(self.was_focused, accent, bg);
-        match action {
-            Action::Diag(fg, msg) => {
-                print!("{lead}");
-                let s = style!(fg, bg).paint(msg);
-                print!("{s}\u{1b}[0K");
-            },
-            Action::Attention(msg) => {
-                let s = style!(IDLE_FG, ATTENTION_BG)
-                    .bold()
-                    .paint(format!(" {msg} "));
-                print!("{s}\u{1b}[0K");
-            },
-            Action::Cells(agents) => self.render_agent_cells(&agents, bg, cols, &lead),
+
+        if rows == 0 || cols == 0 {
+            return;
         }
+
+        let frame: Vec<String> = match action {
+            Action::Diag(fg, msg) => diag_frame(&msg, fg, colors.bar_bg, rows, cols),
+            Action::Attention(msg) => attention_frame(&msg, colors, rows, cols),
+            Action::Cells => self.cells_frame(rows, cols, &colors),
+        };
+
+        emit_frame(&frame, rows);
     }
 }
 
@@ -386,6 +398,13 @@ impl State {
             LoadState::Polling { last: Some(ReadResult::Ok(a)), .. } => a,
             _ => &[],
         }
+    }
+
+    fn display_order(&self) -> Vec<Agent> {
+        group_by_session(self.current_agents())
+            .into_iter()
+            .flat_map(|g| g.agents)
+            .collect()
     }
 
     fn am_focused(&self) -> bool {
@@ -410,9 +429,9 @@ impl State {
     }
 
     /// Map `last_external_focused_pane` to an agent index, falling back to
-    /// the first agent. `None` only when there are no agents at all.
+    /// the first agent. `None` only when there are no agents.
     fn initial_selection(&self) -> Option<usize> {
-        let agents = self.current_agents();
+        let agents = self.display_order();
         if agents.is_empty() {
             return None;
         }
@@ -424,9 +443,7 @@ impl State {
         Some(0)
     }
 
-    /// Common dispatch for mouse click and Enter key. Fires
-    /// `mux focus-agent <sid>` and returns the truncated label so the
-    /// caller can stash it on `last_click` for the run feedback.
+    /// Common dispatch for mouse click and Enter key.
     fn dispatch_focus_agent(&self, sid: &str) -> String {
         let label = sid.get(..8).unwrap_or(sid).to_string();
         let mut ctx = BTreeMap::new();
@@ -435,19 +452,12 @@ impl State {
         label
     }
 
-    /// Effective seen timestamp = max(latest disk scan, optimistic overlay).
-    /// The disk scan reflects mark-seen events from any plugin instance or
-    /// the `sessions ingest_agent_seen` CLI; the overlay covers the gap
-    /// between firing a mark-seen and the next disk scan picking it up.
     fn effective_seen_at(&self, agent: &Agent) -> i64 {
         let disk = self.seen_disk.get(&agent.session_id).copied().unwrap_or(0);
         let overlay = self.seen_overlay.get(&agent.session_id).copied().unwrap_or(0);
         disk.max(overlay)
     }
 
-    /// Acknowledge any unseen attention for `session_id`. Called from the
-    /// click and Enter handlers — never auto-fired. Idempotent: if the
-    /// agent has no unseen attention, this is a no-op.
     fn acknowledge_agent(&mut self, session_id: &str) {
         let Some(agent) = self.current_agents().iter().find(|a| a.session_id == session_id)
         else { return };
@@ -455,7 +465,6 @@ impl State {
             return;
         }
         let at_ms = agent.attention_at_ms;
-        // Optimistic patch first — covers the gap until the next disk scan.
         let entry = self.seen_overlay.entry(session_id.to_string()).or_insert(0);
         if at_ms > *entry {
             *entry = at_ms;
@@ -474,8 +483,6 @@ impl State {
         }
     }
 
-    /// Drop overlay entries for dead agents or whose disk-side `seen_at_ms`
-    /// already covers our optimistic patch.
     fn prune_overlay(&mut self, agents: &[Agent]) {
         let live: HashSet<&str> = agents.iter().map(|a| a.session_id.as_str()).collect();
         self.seen_overlay.retain(|sid, overlay_seen| {
@@ -487,9 +494,6 @@ impl State {
         });
     }
 
-    /// Refresh `seen_disk` from `agent-seen-events/` and return whether
-    /// anything changed. Called on each Timer tick so cross-instance
-    /// mark-seen propagates.
     fn refresh_seen_disk(&mut self) -> bool {
         let Some(dir) = &self.seen_events_dir else { return false };
         let new = agents::read_seen_events(dir);
@@ -500,306 +504,570 @@ impl State {
         true
     }
 
-    fn render_agent_cells(&mut self, agents: &[Agent], bg: PaletteColor, cols: usize, lead: &str) {
-        self.prune_overlay(agents);
-        // Clamp the keyboard cursor — agents come and go between ticks.
-        self.selected_idx = self.selected_idx.and_then(|i| {
-            agents.len().checked_sub(1).map(|max| i.min(max))
-        });
-
-        // Refresh seen state from disk before each render. Each zellij
-        // session has its own plugin instance with its own `seen_disk`
-        // cache; without this, a session you've just switched to via
-        // `mux focus-agent` would render with whatever its last Timer
-        // tick saw (up to 1.5s stale) and briefly show the orange before
-        // catching up. Directory scan is a few file reads, cheap on each
-        // render.
+    fn cells_frame(&mut self, rows: usize, cols: usize, colors: &AgentColors) -> Vec<String> {
+        let raw_agents = self.current_agents().to_vec();
+        self.prune_overlay(&raw_agents);
         self.refresh_seen_disk();
-        let session = self.mode_info.session_name.as_deref().unwrap_or("").to_string();
-        let here = active_tab_pane_ids(&self.pane_manifest, self.active_tab_idx);
 
-        // Pure flag computation — no auto mark-seen. User must click a cell
-        // or press Enter on a selected cell to acknowledge. See
-        // `acknowledge_agent`.
-        let mut flags: Vec<AgentFlags> = Vec::with_capacity(agents.len());
-        for agent in agents {
+        let session = self.mode_info.session_name.as_deref().unwrap_or("").to_string();
+        let active_pane_id = self.focused_external_pane_id();
+
+        // Compute flags first; pass into rendering.
+        let mut flags: HashMap<String, Flags> = HashMap::new();
+        for agent in &raw_agents {
             let unrouted = agent.zellij_pane_id.is_none();
-            let in_current_tab = is_in_current_tab(agent, &session, &here);
             let unseen = agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
-            flags.push(AgentFlags { unrouted, in_current_tab, needs_attention: unseen });
+            // Active pane = the ONE pane the user is currently typing in.
+            // Requires same zellij session AND same pane id. When the
+            // panel itself is focused, focused_external_pane_id is None
+            // and no agent gets this flag — green-bg is reserved for the
+            // moment when the agent's own pane has the cursor.
+            let is_active_pane = active_pane_id.is_some()
+                && agent.zellij_session.as_deref() == Some(session.as_str())
+                && agent.zellij_pane_id == active_pane_id;
+            flags.insert(
+                agent.session_id.clone(),
+                Flags { unrouted, needs_attention: unseen, is_active_pane },
+            );
         }
 
-        // Render.
-        render_agents(
-            agents,
-            &flags,
-            self.selected_idx,
-            &mut self.cell_ranges,
-            self.last_click.as_ref(),
-            bg,
-            cols,
-            lead,
-        );
-    }
-}
+        let groups = group_by_session(&raw_agents);
+        let display: Vec<Agent> = groups.iter().flat_map(|g| g.agents.clone()).collect();
 
-/// Folder is identity (kept intact); name is detail (truncated aggressively).
-struct Cell {
-    folder: String,
-    name: String,
-}
+        // Clamp selected_idx in case agents went away between ticks.
+        self.selected_idx = self.selected_idx.and_then(|i| {
+            display.len().checked_sub(1).map(|max| i.min(max))
+        });
 
-impl Cell {
-    fn from(agent: &Agent) -> Self {
-        // `agent.cwd` arrives with whichever separator the host wrote (Windows
-        // backslashes, POSIX forward slashes). The WASI build of Path treats
-        // `\` as a regular char, so we split on both ourselves.
-        let folder = agent
-            .cwd
-            .rsplit(|c| c == '/' || c == '\\')
-            .find(|s| !s.is_empty())
-            .unwrap_or("")
-            .to_string();
-        let raw_name = if agent.name.trim().is_empty() {
-            agent.session_id.get(..8).unwrap_or(&agent.session_id).to_string()
-        } else {
-            agent.name.trim().to_string()
-        };
-        Cell { folder, name: ellipsize(&raw_name, MAX_NAME_WIDTH) }
-    }
+        // Names wrap inside `cols - OUTER_PAD - AGENT_INDENT`. Headers use
+        // `cols - OUTER_PAD` (header bg fills out to that edge).
+        let name_wrap_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
+        let (lines, agent_row_starts) = build_lines(&groups, &flags, name_wrap_w);
 
-    /// `folder:name` (routed) or `folder✗name` (unrouted) — colon and cross
-    /// are mutually exclusive separators, no whitespace around either. When
-    /// folder is empty: `name` or `✗name`. Attention prepends `!` to the name.
-    fn width(&self, unrouted: bool, needs_attention: bool) -> usize {
-        let folder_w = self.folder.width();
-        let folder_present = !self.folder.is_empty();
-        let mid = match (folder_present, unrouted) {
-            (true, true) => UNROUTED.width(),
-            (true, false) => 1, // ":"
-            (false, true) => UNROUTED.width(),
-            (false, false) => 0,
-        };
-        let attn = if needs_attention { 1 } else { 0 };
-        folder_w + mid + attn + self.name.width()
-    }
+        // Scroll so selected agent's first line is visible.
+        self.adjust_scroll(&agent_row_starts, &lines, rows);
 
-    /// Drop one char from the name (with `…` suffix on first truncation).
-    /// Returns false if name is already empty.
-    fn shrink(&mut self) -> bool {
-        if self.name.is_empty() {
-            return false;
-        }
-        self.name = ellipsize(&self.name, self.name.width().saturating_sub(1));
-        true
-    }
-}
+        let mut frame: Vec<String> = Vec::with_capacity(rows);
+        // Compute focus live from the manifest, NOT `was_focused` — the
+        // cached `was_focused` flips only on PaneUpdate transitions, which
+        // can lag a click-away by one event cycle. We don't want the accent
+        // stripe lingering after focus has moved.
+        let focused = self.am_focused();
+        let selected_sid = self
+            .selected_idx
+            .and_then(|i| display.get(i))
+            .map(|a| a.session_id.clone());
 
-/// Cap `s` to `max` display columns, appending `…` if truncated.
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let mut acc = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = c.to_string().width();
-        if w + cw + 1 > max {
-            break;
-        }
-        acc.push(c);
-        w += cw;
-    }
-    acc.push('…');
-    acc
-}
-
-/// Pure renderer — flags and mark-seen decisions come from the caller.
-fn render_agents(
-    agents: &[Agent],
-    flags: &[AgentFlags],
-    selected_idx: Option<usize>,
-    cell_ranges: &mut Vec<(usize, usize, String)>,
-    last_click: Option<&ClickFeedback>,
-    bg: PaletteColor,
-    cols: usize,
-    lead: &str,
-) {
-    // Match compact-bar's leading inset so the first cell doesn't ride the
-    // left border. Reserve room on the right for click feedback too.
-    const LEFT_INSET: usize = 1;
-    let feedback = last_click.map(format_feedback);
-    let feedback_width = feedback.as_ref().map(|(s, _)| s.width() + 1).unwrap_or(0);
-    let cell_budget = cols.saturating_sub(LEFT_INSET).saturating_sub(feedback_width);
-
-    let mut cells: Vec<Cell> = agents.iter().map(Cell::from).collect();
-    fit_to_width(flags, &mut cells, cell_budget);
-
-    let mut out = String::new();
-    out.push_str(lead);
-    let mut col = LEFT_INSET;
-    let cell_limit = LEFT_INSET + cell_budget;
-    for (i, ((agent, cell), flag)) in agents.iter().zip(cells.iter()).zip(flags.iter()).enumerate() {
-        let width = cell.width(flag.unrouted, flag.needs_attention);
-        if col + width > cell_limit {
-            break;
-        }
-        if i > 0 {
-            out.push_str(&style!(DIM_COLOR, bg).paint(SEPARATOR).to_string());
-            col += SEPARATOR_WIDTH;
-        }
-        let selected = selected_idx == Some(i);
-        out.push_str(&render_cell(agent, cell, flag, selected, bg));
-        cell_ranges.push((col, col + width, agent.session_id.clone()));
-        col += width;
-    }
-    if let Some((text, fg)) = feedback {
-        let pad = cols.saturating_sub(col).saturating_sub(text.width());
-        for _ in 0..pad {
-            out.push(' ');
-        }
-        out.push_str(&style!(fg, bg).paint(text).to_string());
-    }
-    out.push_str("\u{1b}[0K");
-    print!("{out}");
-}
-
-fn format_feedback(fb: &ClickFeedback) -> (String, PaletteColor) {
-    match fb {
-        ClickFeedback::Missed { col } => {
-            (format!("click at col {col}: no cell"), DIM_COLOR)
-        },
-        ClickFeedback::Pending { label } => {
-            (format!("running mux focus-agent {label}…"), DIM_COLOR)
-        },
-        ClickFeedback::Done { label, exit, stderr } => {
-            let summary = match exit {
-                Some(0) => format!("ok: mux focus-agent {label}"),
-                Some(code) => {
-                    let first = stderr.lines().next().unwrap_or("").trim();
-                    if first.is_empty() {
-                        format!("exit {code}: mux focus-agent {label}")
-                    } else {
-                        format!("exit {code} ({first}): {label}")
-                    }
+        let end = (self.scroll_offset + rows).min(lines.len());
+        for (visible_row, abs_idx) in (self.scroll_offset..end).enumerate() {
+            let line = &lines[abs_idx];
+            let rendered = match line {
+                Line::Padding => render_padding(focused, colors, cols),
+                Line::Header { label, unrouted_in_group } => {
+                    render_header(label, *unrouted_in_group, focused, colors, cols)
                 },
-                None => {
-                    let first = stderr.lines().next().unwrap_or("spawn failed").trim();
-                    format!("spawn failed ({first}): {label}")
+                Line::AgentRow {
+                    sid,
+                    status,
+                    text,
+                    needs_attention,
+                    unrouted,
+                    is_active_pane,
+                    ..
+                } => {
+                    let selected = selected_sid.as_deref() == Some(sid.as_str());
+                    self.row_ranges.push((visible_row, sid.clone()));
+                    render_agent_line(
+                        text,
+                        *status,
+                        *needs_attention,
+                        *unrouted,
+                        *is_active_pane,
+                        selected,
+                        focused,
+                        colors,
+                        cols,
+                    )
                 },
             };
-            let color = if matches!(exit, Some(0)) { DIM_COLOR } else { ERROR_COLOR };
-            (summary, color)
-        },
-    }
-}
-
-fn focus_lead(focused: bool, accent: PaletteColor, bg: PaletteColor) -> String {
-    if focused {
-        style!(accent, bg).paint("\u{258C}").to_string() // ▌
-    } else {
-        " ".to_string()
-    }
-}
-
-/// Round-robin shrink: while total cell+separator width overshoots `cols`,
-/// shave the longest *name* by one char. Folders, unrouted mark, and
-/// attention prefix are all preserved.
-fn fit_to_width(flags: &[AgentFlags], cells: &mut [Cell], cols: usize) {
-    let separator_total = cells.len().saturating_sub(1) * SEPARATOR_WIDTH;
-    loop {
-        let total: usize = flags
-            .iter()
-            .zip(cells.iter())
-            .map(|(f, c)| c.width(f.unrouted, f.needs_attention))
-            .sum::<usize>()
-            + separator_total;
-        if total <= cols {
-            return;
+            frame.push(rendered);
         }
-        let Some((idx, _)) = cells.iter().enumerate().max_by_key(|(_, c)| c.name.width()) else {
+
+        // Scroll indicators in the rightmost col if content exceeds viewport.
+        let has_more_above = self.scroll_offset > 0;
+        let has_more_below = end < lines.len();
+        if has_more_above && !frame.is_empty() {
+            let row = &mut frame[0];
+            row.push_str(
+                &style!(colors.accent, colors.bar_bg)
+                    .paint("\u{2191}".to_string())
+                    .to_string(),
+            );
+        }
+        if has_more_below && !frame.is_empty() {
+            let last = frame.len() - 1;
+            let row = &mut frame[last];
+            row.push_str(
+                &style!(colors.accent, colors.bar_bg)
+                    .paint("\u{2193}".to_string())
+                    .to_string(),
+            );
+        }
+
+        frame
+    }
+
+    fn adjust_scroll(
+        &mut self,
+        agent_row_starts: &[(usize, usize)],
+        lines: &[Line],
+        rows: usize,
+    ) {
+        let Some(sel) = self.selected_idx else {
+            self.scroll_offset = 0;
             return;
         };
-        if !cells[idx].shrink() {
+        let Some(&(start, end_exclusive)) = agent_row_starts.get(sel) else {
             return;
+        };
+        let total = lines.len();
+        let max_scroll = total.saturating_sub(rows);
+        if start < self.scroll_offset {
+            self.scroll_offset = start.saturating_sub(1); // keep header in view if possible
+        } else if end_exclusive > self.scroll_offset + rows {
+            self.scroll_offset = end_exclusive.saturating_sub(rows);
+        }
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
         }
     }
 }
 
-fn render_cell(
-    agent: &Agent,
-    cell: &Cell,
-    flag: &AgentFlags,
-    selected: bool,
-    bar_bg: PaletteColor,
-) -> String {
-    let fg = match agent.status {
-        AgentStatus::Busy => BUSY_FG,
-        AgentStatus::Idle => IDLE_FG,
-        AgentStatus::Waiting => WAITING_FG,
-    };
-    // Selection wins over attention so the keyboard cursor is always
-    // unambiguous; the `!` prefix still carries the attention signal.
-    let cell_bg = if selected {
-        SELECTED_BG
-    } else if flag.needs_attention {
-        ATTENTION_BG
-    } else {
-        bar_bg
-    };
-    let paint = |fg: PaletteColor, text: &str, bold: bool| -> String {
-        let mut s = style!(fg, cell_bg);
-        if bold {
-            s = s.bold();
+/// One zellij-session's worth of agents.
+struct Group {
+    label: GroupLabel,
+    agents: Vec<Agent>,
+    max_started_ms: i64,
+    any_unrouted: bool,
+}
+
+#[derive(Clone)]
+enum GroupLabel {
+    Session(String),
+    Sessionless,
+}
+
+impl GroupLabel {
+    fn as_str(&self) -> &str {
+        match self {
+            GroupLabel::Session(s) => s.as_str(),
+            GroupLabel::Sessionless => SESSIONLESS_LABEL,
         }
-        if flag.in_current_tab {
-            s = s.underline();
-        }
-        s.paint(text.to_string()).to_string()
-    };
-    let mut body = String::new();
-    if !cell.folder.is_empty() {
-        body.push_str(&paint(fg, &cell.folder, true));
-        if flag.unrouted {
-            body.push_str(&paint(UNROUTED_FG, UNROUTED, true));
-        } else {
-            body.push_str(&paint(fg, ":", false));
-        }
-    } else if flag.unrouted {
-        body.push_str(&paint(UNROUTED_FG, UNROUTED, true));
     }
-    if flag.needs_attention {
-        body.push_str(&paint(fg, "!", true));
-    }
-    body.push_str(&paint(fg, &cell.name, false));
-    body
 }
 
-fn active_tab_pane_ids(manifest: &PaneManifest, active_tab_idx: Option<usize>) -> HashSet<u32> {
-    let Some(idx) = active_tab_idx else { return HashSet::new() };
-    manifest
-        .panes
-        .get(&idx)
-        .into_iter()
-        .flatten()
-        .filter(|p| !p.is_plugin)
-        .map(|p| p.id)
-        .collect()
-}
-
-fn is_in_current_tab(agent: &Agent, current_session: &str, here: &HashSet<u32>) -> bool {
-    agent.zellij_session.as_deref() == Some(current_session)
-        && matches!(agent.zellij_pane_id, Some(id) if here.contains(&id))
-}
-
-struct AgentFlags {
+#[derive(Clone, Copy)]
+struct Flags {
     unrouted: bool,
-    in_current_tab: bool,
     needs_attention: bool,
+    is_active_pane: bool,
+}
+
+enum Line {
+    /// Blank breathing room above non-first groups.
+    Padding,
+    Header {
+        label: String,
+        unrouted_in_group: bool,
+    },
+    AgentRow {
+        sid: String,
+        status: AgentStatus,
+        text: String,
+        needs_attention: bool,
+        unrouted: bool,
+        is_active_pane: bool,
+    },
+}
+
+fn group_by_session(agents: &[Agent]) -> Vec<Group> {
+    let mut by_key: BTreeMap<Option<String>, Group> = BTreeMap::new();
+    for a in agents {
+        let key = a.zellij_session.clone();
+        let label = match &key {
+            Some(s) => GroupLabel::Session(s.clone()),
+            None => GroupLabel::Sessionless,
+        };
+        let entry = by_key.entry(key).or_insert(Group {
+            label,
+            agents: Vec::new(),
+            max_started_ms: i64::MIN,
+            any_unrouted: false,
+        });
+        if a.started_at_ms > entry.max_started_ms {
+            entry.max_started_ms = a.started_at_ms;
+        }
+        if a.zellij_pane_id.is_none() {
+            entry.any_unrouted = true;
+        }
+        entry.agents.push(a.clone());
+    }
+    let mut groups: Vec<Group> = by_key.into_values().collect();
+    for g in &mut groups {
+        // Newest agent first within the group.
+        g.agents.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
+    }
+    groups.sort_by(|a, b| match (&a.label, &b.label) {
+        (GroupLabel::Sessionless, GroupLabel::Sessionless) => std::cmp::Ordering::Equal,
+        (GroupLabel::Sessionless, _) => std::cmp::Ordering::Greater,
+        (_, GroupLabel::Sessionless) => std::cmp::Ordering::Less,
+        _ => b.max_started_ms.cmp(&a.max_started_ms),
+    });
+    groups
+}
+
+/// Flatten groups → lines and record (start, end_exclusive) row ranges per
+/// agent in display order. Used by scroll logic to keep the selection in
+/// the viewport.
+fn build_lines(
+    groups: &[Group],
+    flags: &HashMap<String, Flags>,
+    content_w: usize,
+) -> (Vec<Line>, Vec<(usize, usize)>) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut agent_rows: Vec<(usize, usize)> = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        if gi > 0 {
+            lines.push(Line::Padding);
+        }
+        lines.push(Line::Header {
+            label: g.label.as_str().to_string(),
+            unrouted_in_group: g.any_unrouted,
+        });
+        for a in &g.agents {
+            let f = flags.get(&a.session_id).copied().unwrap_or(Flags {
+                unrouted: false,
+                needs_attention: false,
+                is_active_pane: false,
+            });
+            let text = if a.name.trim().is_empty() {
+                a.session_id.get(..8).unwrap_or(&a.session_id).to_string()
+            } else {
+                a.name.trim().to_string()
+            };
+            let wrapped = wrap_text(&text, content_w, MAX_NAME_LINES);
+            let start = lines.len();
+            for w in wrapped {
+                lines.push(Line::AgentRow {
+                    sid: a.session_id.clone(),
+                    status: a.status,
+                    text: w,
+                    needs_attention: f.needs_attention,
+                    unrouted: f.unrouted,
+                    is_active_pane: f.is_active_pane,
+                });
+            }
+            let end_exclusive = lines.len();
+            agent_rows.push((start, end_exclusive));
+        }
+    }
+    (lines, agent_rows)
+}
+
+/// Soft-break on '-', '_', '/', '.', ' '. Greedy line-fill. Hard-split a
+/// token wider than `width`. Truncate past `max_lines` with `…`.
+fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let separators = ['-', '_', '/', '.', ' '];
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        current.push(c);
+        if separators.contains(&c) {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut truncated = false;
+    'outer: for tok in &tokens {
+        let tok_w = tok.width();
+        if cur.width() + tok_w <= width {
+            cur.push_str(tok);
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+            if lines.len() >= max_lines {
+                truncated = true;
+                break 'outer;
+            }
+        }
+        if tok_w > width {
+            for chunk in hard_split(tok, width) {
+                if lines.len() >= max_lines {
+                    truncated = true;
+                    break 'outer;
+                }
+                if cur.width() + chunk.width() <= width {
+                    cur.push_str(&chunk);
+                } else {
+                    if !cur.is_empty() {
+                        lines.push(std::mem::take(&mut cur));
+                        if lines.len() >= max_lines {
+                            truncated = true;
+                            break 'outer;
+                        }
+                    }
+                    cur.push_str(&chunk);
+                }
+            }
+        } else {
+            cur.push_str(tok);
+        }
+    }
+    if !cur.is_empty() && lines.len() < max_lines {
+        lines.push(cur);
+    } else if !cur.is_empty() {
+        truncated = true;
+    }
+
+    // If we didn't consume the whole input, ellipsize the last line.
+    let consumed: usize = lines.iter().map(|l| l.chars().count()).sum();
+    let total_chars = text.chars().count();
+    if truncated || consumed < total_chars {
+        if let Some(last) = lines.last_mut() {
+            while last.width() + 1 > width && !last.is_empty() {
+                last.pop();
+            }
+            last.push('\u{2026}');
+        }
+    }
+    lines
+}
+
+fn hard_split(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        let cw = c.to_string().width();
+        if cur.width() + cw > width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn focus_prefix(focused: bool, colors: &AgentColors) -> String {
+    if focused {
+        style!(colors.accent, colors.bar_bg).paint(FOCUS_BLOCK.to_string()).to_string()
+    } else {
+        style!(colors.accent, colors.bar_bg).paint(" ".to_string()).to_string()
+    }
+}
+
+fn render_padding(focused: bool, colors: &AgentColors, cols: usize) -> String {
+    let prefix = focus_prefix(focused, colors);
+    let pad: String = std::iter::repeat(' ').take(cols.saturating_sub(1)).collect();
+    format!("{prefix}{}", style!(colors.text, colors.bar_bg).paint(pad))
+}
+
+fn render_header(
+    label: &str,
+    unrouted_in_group: bool,
+    focused: bool,
+    colors: &AgentColors,
+    cols: usize,
+) -> String {
+    let prefix = focus_prefix(focused, colors);
+    // Header body fills width `cols - OUTER_PAD` with header_bg + theme text
+    // fg. The leading space (between focus col and label) and the trailing
+    // padding are also header_bg so the strip reads as a single block.
+    let body_w = cols.saturating_sub(OUTER_PAD);
+    let mut text = String::new();
+    text.push(' '); // left padding inside header bg
+    let mut text_budget = body_w.saturating_sub(1);
+    let mut trimmed = String::new();
+    for c in label.chars() {
+        let cw = c.to_string().width();
+        if trimmed.width() + cw > text_budget {
+            break;
+        }
+        trimmed.push(c);
+    }
+    if trimmed.width() < label.width() {
+        while trimmed.width() + 1 > text_budget && !trimmed.is_empty() {
+            trimmed.pop();
+        }
+        trimmed.push('\u{2026}');
+    }
+    text_budget = text_budget.saturating_sub(trimmed.width());
+    let unrouted_suffix = if unrouted_in_group && text_budget >= 2 {
+        text_budget = text_budget.saturating_sub(2);
+        true
+    } else {
+        false
+    };
+    // Label uses the theme's neutral text fg on the header bg — not the
+    // theme accent (accent is green in Dracula and would collide with
+    // busy semantics). The focus column (▌) stays the only accent-coloured
+    // element so it remains an unambiguous "panel is active" signal.
+    let h_fg = colors.text;
+    let h_bg = colors.header_bg;
+    let mut body = String::new();
+    body.push_str(&style!(h_fg, h_bg).bold().paint(text).to_string());
+    body.push_str(&style!(h_fg, h_bg).bold().paint(trimmed).to_string());
+    if unrouted_suffix {
+        body.push_str(
+            &style!(colors.error, h_bg)
+                .bold()
+                .paint(format!(" {UNROUTED}"))
+                .to_string(),
+        );
+    }
+    let trailing: String = std::iter::repeat(' ').take(text_budget).collect();
+    body.push_str(&style!(h_fg, h_bg).paint(trailing).to_string());
+    let outer = style!(colors.accent, colors.bar_bg).paint(" ".to_string()).to_string();
+    format!("{prefix}{outer}{body}")
+}
+
+fn render_agent_line(
+    text: &str,
+    status: AgentStatus,
+    needs_attention: bool,
+    unrouted: bool,
+    is_active_pane: bool,
+    selected: bool,
+    focused: bool,
+    colors: &AgentColors,
+    cols: usize,
+) -> String {
+    // Resolve (bg, fg) by priority — selection wins (keyboard cursor),
+    // then user-attention states (yellow), then active-pane (green,
+    // mirroring active-tab), then status text on neutral bg.
+    let (cell_bg, fg, colored_bg, bold) = if selected {
+        (colors.selected_bg, colors.selected_fg, true, true)
+    } else if needs_attention || matches!(status, AgentStatus::Waiting) {
+        (colors.yellow, colors.on_color, true, true)
+    } else if is_active_pane {
+        (colors.green, colors.on_color, true, true)
+    } else {
+        // No bg tint — fg by status. Waiting is handled above so this
+        // arm only ever sees Busy or Idle.
+        let fg = match status {
+            AgentStatus::Busy => colors.green,
+            AgentStatus::Idle => colors.text,
+            AgentStatus::Waiting => colors.text, // unreachable
+        };
+        (colors.bar_bg, fg, false, false)
+    };
+    let prefix = focus_prefix(focused, colors);
+    // The 1-col outer pad sits between the focus column and the agent body.
+    // Selection/attention bg starts from the agent body, not from the focus
+    // stripe — that keeps the panel-focus signal visually separate from
+    // per-agent state.
+    let outer_pad = style!(fg, colors.bar_bg).paint(" ".to_string()).to_string();
+
+    let body_w = cols.saturating_sub(OUTER_PAD);
+    let mut out = String::new();
+    // Unrouted marker stays theme-error-red on neutral bg, switches to the
+    // on-colour fg (theme's "on green/yellow" colour) on a tinted bg so it
+    // doesn't disappear into the tint.
+    let unrouted_color = if colored_bg { colors.on_color } else { colors.error };
+    let gutter_first = if unrouted {
+        style!(unrouted_color, cell_bg)
+            .bold()
+            .paint(UNROUTED.to_string())
+            .to_string()
+    } else {
+        style!(fg, cell_bg).paint(" ".to_string()).to_string()
+    };
+    out.push_str(&gutter_first);
+    out.push_str(&style!(fg, cell_bg).paint(" ".to_string()).to_string());
+
+    let content_w = body_w.saturating_sub(AGENT_INDENT);
+    let mut visible = String::new();
+    let mut w = 0;
+    for c in text.chars() {
+        let cw = c.to_string().width();
+        if w + cw > content_w {
+            break;
+        }
+        visible.push(c);
+        w += cw;
+    }
+    let mut painted = style!(fg, cell_bg);
+    if bold {
+        painted = painted.bold();
+    }
+    out.push_str(&painted.paint(visible).to_string());
+
+    let used = AGENT_INDENT + w;
+    if used < body_w {
+        let pad = body_w - used;
+        let pad_str: String = std::iter::repeat(' ').take(pad).collect();
+        out.push_str(&style!(fg, cell_bg).paint(pad_str).to_string());
+    }
+    format!("{prefix}{outer_pad}{out}")
+}
+
+fn diag_frame(
+    msg: &str,
+    fg: PaletteColor,
+    bg: PaletteColor,
+    rows: usize,
+    cols: usize,
+) -> Vec<String> {
+    let mut frame = Vec::with_capacity(rows);
+    let wrapped = wrap_text(msg, cols.saturating_sub(1), rows);
+    for line in wrapped {
+        frame.push(style!(fg, bg).paint(line).to_string());
+    }
+    frame
+}
+
+fn attention_frame(msg: &str, colors: AgentColors, rows: usize, cols: usize) -> Vec<String> {
+    let mut frame = Vec::with_capacity(rows);
+    let wrapped = wrap_text(msg, cols.saturating_sub(2), rows);
+    for line in wrapped {
+        let padded = format!(" {line} ");
+        frame.push(
+            style!(colors.on_color, colors.yellow)
+                .bold()
+                .paint(padded)
+                .to_string(),
+        );
+    }
+    frame
+}
+
+fn emit_frame(frame: &[String], rows: usize) {
+    let mut out = String::new();
+    // Cursor home before drawing — plugins are repainted into the same
+    // origin each frame, so anchor explicitly to avoid drift after partial
+    // ANSI sequences in the previous frame.
+    out.push_str("\u{1b}[H");
+    for r in 0..rows {
+        if r > 0 {
+            out.push_str("\r\n");
+        }
+        if let Some(line) = frame.get(r) {
+            out.push_str(line);
+        }
+        out.push_str("\u{1b}[0K");
+    }
+    print!("{out}");
 }
 
 fn same_result(a: Option<&ReadResult>, b: &ReadResult) -> bool {
@@ -818,7 +1086,9 @@ fn same_agents(a: &[Agent], b: &[Agent]) -> bool {
             x.session_id == y.session_id
                 && x.status == y.status
                 && x.zellij_pane_id == y.zellij_pane_id
+                && x.zellij_session == y.zellij_session
                 && x.name == y.name
-                && x.cwd == y.cwd
+                && x.started_at_ms == y.started_at_ms
+                && x.attention_at_ms == y.attention_at_ms
         })
 }
