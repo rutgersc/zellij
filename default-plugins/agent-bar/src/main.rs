@@ -35,12 +35,12 @@ const POLL_SECS: f64 = 1.5;
 /// Hard cap on rows used to render a single agent's name. Past this we
 /// truncate with `…` — the full name is still on the snapshot.
 const MAX_NAME_LINES: usize = 4;
-/// Every row is prefixed by [focus_col(1), left_pad(1)]. Focus col becomes
-/// an accent block `▌` when the panel is focused, a blank otherwise — it
-/// is the "this panel is active" signal.
-const OUTER_PAD: usize = 2;
-/// Within an agent row, after `OUTER_PAD`, two more cols for [unrouted
-/// marker, space] before the wrapped name.
+/// Single-col left margin from the pane border. Panel-focus is now signaled
+/// by zellij's own pane border highlight (the layout uses bordered panes
+/// for resize affordance), so the in-content focus stripe was removed.
+const OUTER_PAD: usize = 1;
+/// Within an agent row, after `OUTER_PAD`, two more cols for [`>` row
+/// marker (or `✗` if unrouted), space] before the wrapped name.
 const AGENT_INDENT: usize = 2;
 const SESSIONLESS_LABEL: &str = "sessionless";
 
@@ -61,7 +61,6 @@ const SESSIONLESS_LABEL: &str = "sessionless";
 // what the theme uses for its own active-tab and error styles. Only the
 // red unrouted marker and the structural glyphs are hardcoded.
 const UNROUTED: &str = "\u{2717}";
-const FOCUS_BLOCK: &str = "\u{258C}"; // ▌
 
 /// Theme-driven colours for every agent state. Built once per render from
 /// `mode_info.style.colors` so a ChangeTheme keystroke updates the whole
@@ -320,18 +319,14 @@ impl ZellijPlugin for State {
                     return false;
                 }
                 if cancel {
-                    let still_alive = self.last_external_focused_pane.filter(|pid| {
-                        self.pane_manifest
-                            .panes
-                            .values()
-                            .flatten()
-                            .any(|p| !p.is_plugin && p.id == *pid)
-                    });
-                    if let Some(pid) = still_alive {
-                        focus_terminal_pane(pid, false, false);
-                    } else {
-                        move_focus(Direction::Right);
-                    }
+                    // Layout invariant: agent-bar is the leftmost pane in
+                    // every tab, with the shell directly to its right
+                    // (default_tab_template in foam/layouts/default.kdl).
+                    // Always move-right is the simplest path that doesn't
+                    // depend on `focus_terminal_pane` (which has been
+                    // observed to silently fail when called from a plugin
+                    // pane handler).
+                    move_focus(Direction::Right);
                     return true;
                 }
                 false
@@ -549,11 +544,6 @@ impl State {
         self.adjust_scroll(&agent_row_starts, &lines, rows);
 
         let mut frame: Vec<String> = Vec::with_capacity(rows);
-        // Compute focus live from the manifest, NOT `was_focused` — the
-        // cached `was_focused` flips only on PaneUpdate transitions, which
-        // can lag a click-away by one event cycle. We don't want the accent
-        // stripe lingering after focus has moved.
-        let focused = self.am_focused();
         let selected_sid = self
             .selected_idx
             .and_then(|i| display.get(i))
@@ -563,9 +553,9 @@ impl State {
         for (visible_row, abs_idx) in (self.scroll_offset..end).enumerate() {
             let line = &lines[abs_idx];
             let rendered = match line {
-                Line::Padding => render_padding(focused, colors, cols),
+                Line::Padding => render_padding(colors, cols),
                 Line::Header { label, unrouted_in_group } => {
-                    render_header(label, *unrouted_in_group, focused, colors, cols)
+                    render_header(label, *unrouted_in_group, colors, cols)
                 },
                 Line::AgentRow {
                     sid,
@@ -574,6 +564,7 @@ impl State {
                     needs_attention,
                     unrouted,
                     is_active_pane,
+                    is_first_wrap_line,
                     ..
                 } => {
                     let selected = selected_sid.as_deref() == Some(sid.as_str());
@@ -584,8 +575,8 @@ impl State {
                         *needs_attention,
                         *unrouted,
                         *is_active_pane,
+                        *is_first_wrap_line,
                         selected,
-                        focused,
                         colors,
                         cols,
                     )
@@ -688,6 +679,10 @@ enum Line {
         needs_attention: bool,
         unrouted: bool,
         is_active_pane: bool,
+        /// True on the first wrap-line of an agent — the `>` (or `✗` if
+        /// unrouted) row marker shows only on this line so adjacent agents
+        /// with the same bg tint stay visually distinct.
+        is_first_wrap_line: bool,
     },
 }
 
@@ -758,7 +753,7 @@ fn build_lines(
             };
             let wrapped = wrap_text(&text, content_w, MAX_NAME_LINES);
             let start = lines.len();
-            for w in wrapped {
+            for (i, w) in wrapped.into_iter().enumerate() {
                 lines.push(Line::AgentRow {
                     sid: a.session_id.clone(),
                     status: a.status,
@@ -766,6 +761,7 @@ fn build_lines(
                     needs_attention: f.needs_attention,
                     unrouted: f.unrouted,
                     is_active_pane: f.is_active_pane,
+                    is_first_wrap_line: i == 0,
                 });
             }
             let end_exclusive = lines.len();
@@ -869,35 +865,23 @@ fn hard_split(s: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn focus_prefix(focused: bool, colors: &AgentColors) -> String {
-    if focused {
-        style!(colors.accent, colors.bar_bg).paint(FOCUS_BLOCK.to_string()).to_string()
-    } else {
-        style!(colors.accent, colors.bar_bg).paint(" ".to_string()).to_string()
-    }
-}
-
-fn render_padding(focused: bool, colors: &AgentColors, cols: usize) -> String {
-    let prefix = focus_prefix(focused, colors);
-    let pad: String = std::iter::repeat(' ').take(cols.saturating_sub(1)).collect();
-    format!("{prefix}{}", style!(colors.text, colors.bar_bg).paint(pad))
+fn render_padding(colors: &AgentColors, cols: usize) -> String {
+    let pad: String = std::iter::repeat(' ').take(cols).collect();
+    style!(colors.text, colors.bar_bg).paint(pad).to_string()
 }
 
 fn render_header(
     label: &str,
     unrouted_in_group: bool,
-    focused: bool,
     colors: &AgentColors,
     cols: usize,
 ) -> String {
-    let prefix = focus_prefix(focused, colors);
-    // Header body fills width `cols - OUTER_PAD` with header_bg + theme text
-    // fg. The leading space (between focus col and label) and the trailing
-    // padding are also header_bg so the strip reads as a single block.
+    // After OUTER_PAD the header strip fills the rest of the row with
+    // header_bg + theme text fg. Label starts immediately at the strip's
+    // first col so it visually aligns with the `>` row marker on agent
+    // rows (both sit at col OUTER_PAD).
     let body_w = cols.saturating_sub(OUTER_PAD);
-    let mut text = String::new();
-    text.push(' '); // left padding inside header bg
-    let mut text_budget = body_w.saturating_sub(1);
+    let mut text_budget = body_w;
     let mut trimmed = String::new();
     for c in label.chars() {
         let cw = c.to_string().width();
@@ -919,14 +903,9 @@ fn render_header(
     } else {
         false
     };
-    // Label uses the theme's neutral text fg on the header bg — not the
-    // theme accent (accent is green in Dracula and would collide with
-    // busy semantics). The focus column (▌) stays the only accent-coloured
-    // element so it remains an unambiguous "panel is active" signal.
     let h_fg = colors.text;
     let h_bg = colors.header_bg;
     let mut body = String::new();
-    body.push_str(&style!(h_fg, h_bg).bold().paint(text).to_string());
     body.push_str(&style!(h_fg, h_bg).bold().paint(trimmed).to_string());
     if unrouted_suffix {
         body.push_str(
@@ -938,8 +917,8 @@ fn render_header(
     }
     let trailing: String = std::iter::repeat(' ').take(text_budget).collect();
     body.push_str(&style!(h_fg, h_bg).paint(trailing).to_string());
-    let outer = style!(colors.accent, colors.bar_bg).paint(" ".to_string()).to_string();
-    format!("{prefix}{outer}{body}")
+    let outer = style!(h_fg, colors.bar_bg).paint(" ".to_string()).to_string();
+    format!("{outer}{body}")
 }
 
 fn render_agent_line(
@@ -948,8 +927,8 @@ fn render_agent_line(
     needs_attention: bool,
     unrouted: bool,
     is_active_pane: bool,
+    is_first_wrap_line: bool,
     selected: bool,
-    focused: bool,
     colors: &AgentColors,
     cols: usize,
 ) -> String {
@@ -972,11 +951,10 @@ fn render_agent_line(
         };
         (colors.bar_bg, fg, false, false)
     };
-    let prefix = focus_prefix(focused, colors);
-    // The 1-col outer pad sits between the focus column and the agent body.
-    // Selection/attention bg starts from the agent body, not from the focus
-    // stripe — that keeps the panel-focus signal visually separate from
-    // per-agent state.
+    // 1-col outer pad on bar_bg sits to the left of every agent row, giving
+    // breathing room from the pane border. Selection/attention bg starts
+    // from the agent body, not from this pad, so the row's left edge
+    // visually separates from the border line.
     let outer_pad = style!(fg, colors.bar_bg).paint(" ".to_string()).to_string();
 
     let body_w = cols.saturating_sub(OUTER_PAD);
@@ -985,16 +963,26 @@ fn render_agent_line(
     // on-colour fg (theme's "on green/yellow" colour) on a tinted bg so it
     // doesn't disappear into the tint.
     let unrouted_color = if colored_bg { colors.on_color } else { colors.error };
-    let gutter_first = if unrouted {
-        style!(unrouted_color, cell_bg)
-            .bold()
-            .paint(UNROUTED.to_string())
-            .to_string()
-    } else {
-        style!(fg, cell_bg).paint(" ".to_string()).to_string()
+    let style_for = |fg_color: PaletteColor| {
+        let mut s = style!(fg_color, cell_bg);
+        if bold {
+            s = s.bold();
+        }
+        s
     };
-    out.push_str(&gutter_first);
-    out.push_str(&style!(fg, cell_bg).paint(" ".to_string()).to_string());
+
+    // Row marker — shows only on the first wrap-line of an agent so adjacent
+    // agents with the same bg tint stay visually distinct. Unrouted agents
+    // get `✗` (red), all others get `>` (same fg as the row text).
+    let (marker_char, marker_color) = if !is_first_wrap_line {
+        (' ', fg)
+    } else if unrouted {
+        ('\u{2717}', unrouted_color) // ✗
+    } else {
+        ('>', fg)
+    };
+    out.push_str(&style_for(marker_color).paint(marker_char.to_string()).to_string());
+    out.push_str(&style_for(fg).paint(" ".to_string()).to_string());
 
     let content_w = body_w.saturating_sub(AGENT_INDENT);
     let mut visible = String::new();
@@ -1007,19 +995,15 @@ fn render_agent_line(
         visible.push(c);
         w += cw;
     }
-    let mut painted = style!(fg, cell_bg);
-    if bold {
-        painted = painted.bold();
-    }
-    out.push_str(&painted.paint(visible).to_string());
+    out.push_str(&style_for(fg).paint(visible).to_string());
 
     let used = AGENT_INDENT + w;
     if used < body_w {
         let pad = body_w - used;
         let pad_str: String = std::iter::repeat(' ').take(pad).collect();
-        out.push_str(&style!(fg, cell_bg).paint(pad_str).to_string());
+        out.push_str(&style_for(fg).paint(pad_str).to_string());
     }
-    format!("{prefix}{outer_pad}{out}")
+    format!("{outer_pad}{out}")
 }
 
 fn diag_frame(
