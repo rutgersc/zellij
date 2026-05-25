@@ -133,27 +133,47 @@ fn anchor_pane(panes: &[PaneInfo]) -> Option<&PaneInfo> {
 }
 
 fn derive_name(pane: &PaneInfo) -> Option<String> {
-    let from_cmd = pane.terminal_command.as_deref().and_then(extract_name);
-    if from_cmd.is_some() {
-        return from_cmd;
+    if let Some(cmd) = pane.terminal_command.as_deref() {
+        if let Some(name) = first_token_name(cmd) {
+            return Some(name);
+        }
     }
-    extract_name(&pane.title)
+    title_name(&pane.title)
 }
 
-fn extract_name(raw: &str) -> Option<String> {
+fn first_token_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let candidate = first_token(trimmed);
+    let candidate = trimmed.split_whitespace().next().unwrap_or("");
     if is_boring(candidate) {
         return None;
     }
     Some(candidate.to_string())
 }
 
-fn first_token(s: &str) -> &str {
-    s.split_whitespace().next().unwrap_or("")
+const MAX_NAME_LEN: usize = 24;
+
+fn title_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_boring(trimmed) {
+        return None;
+    }
+    Some(truncate(trimmed))
+}
+
+fn truncate(s: &str) -> String {
+    if s.chars().count() <= MAX_NAME_LEN {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(MAX_NAME_LEN - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn is_boring(s: &str) -> bool {
@@ -253,11 +273,42 @@ mod tests {
     }
 
     #[test]
-    fn extract_first_token() {
-        assert_eq!(extract_name("nvim file.rs"), Some("nvim".into()));
-        assert_eq!(extract_name("  claude --task foo"), Some("claude".into()));
-        assert_eq!(extract_name(""), None);
-        assert_eq!(extract_name("/usr/bin/foo"), None);
+    fn title_passes_through_verbatim() {
+        assert_eq!(
+            title_name("* zellij-auto-name-tab"),
+            Some("* zellij-auto-name-tab".into())
+        );
+        assert_eq!(title_name("✳ my-task"), Some("✳ my-task".into()));
+        assert_eq!(title_name("file.rs - NVIM"), Some("file.rs - NVIM".into()));
+        assert_eq!(title_name("lazygit"), Some("lazygit".into()));
+        assert_eq!(title_name("  spaces trimmed  "), Some("spaces trimmed".into()));
+    }
+
+    #[test]
+    fn long_titles_get_truncated_with_ellipsis() {
+        let long = "a".repeat(40);
+        let result = title_name(&long).unwrap();
+        assert_eq!(result.chars().count(), MAX_NAME_LEN);
+        assert!(result.ends_with('…'));
+        // exactly-at-limit titles are unchanged
+        let exact = "b".repeat(MAX_NAME_LEN);
+        assert_eq!(title_name(&exact), Some(exact));
+    }
+
+    #[test]
+    fn title_rejects_boring() {
+        assert_eq!(title_name(""), None);
+        assert_eq!(title_name("/usr/bin/foo"), None);
+        assert_eq!(title_name("Tab #1"), None);
+        assert_eq!(title_name("pwsh"), None);
+    }
+
+    #[test]
+    fn command_panes_use_first_token() {
+        assert_eq!(first_token_name("nvim file.rs"), Some("nvim".into()));
+        assert_eq!(first_token_name("  claude --task foo"), Some("claude".into()));
+        assert_eq!(first_token_name(""), None);
+        assert_eq!(first_token_name("/usr/bin/foo"), None);
     }
 
     #[test]
