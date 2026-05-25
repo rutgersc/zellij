@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Block commits where default-plugins/<X>/ source is staged but the baked
+# zellij-utils/assets/plugins/<X>.wasm is not. The asset is include_bytes!'d
+# into zellij — forgetting to re-bake ships a binary that disagrees with the
+# committed source.
+
+set -euo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR | tr '\\' '/')
+
+if [[ -z "$staged" ]]; then
+    exit 0
+fi
+
+# Which plugins under default-plugins/ have *any* staged source change?
+changed_plugins=$(echo "$staged" \
+    | grep -oE '^default-plugins/[^/]+' \
+    | sort -u \
+    | sed 's|^default-plugins/||' || true)
+
+if [[ -z "$changed_plugins" ]]; then
+    exit 0
+fi
+
+errors=()
+require_staged() {
+    local wasm="zellij-utils/assets/plugins/$1.wasm"
+    if [[ ! -f "$wasm" ]]; then
+        return 0  # lib-only crate (e.g. agent-readmodel), nothing to bake
+    fi
+    if ! echo "$staged" | grep -qx "$wasm"; then
+        errors+=("$1: source changed but $wasm not staged")
+    fi
+}
+
+for plugin in $changed_plugins; do
+    require_staged "$plugin"
+    # Reverse-deps. Extend when a new shared crate appears.
+    case "$plugin" in
+        agent-readmodel)
+            require_staged agent-bar
+            require_staged compact-bar
+            ;;
+    esac
+done
+
+if (( ${#errors[@]} > 0 )); then
+    {
+        echo "pre-commit: plugin wasm bake is stale."
+        for e in "${errors[@]}"; do echo "  - $e"; done
+        echo
+        echo "Bake: cargo bake          # builds all plugins, copies into assets/"
+        echo "      git add zellij-utils/assets/plugins/<plugin>.wasm"
+        echo "Or bypass with --no-verify if the source change is a no-op."
+    } >&2
+    exit 1
+fi
