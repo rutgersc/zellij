@@ -180,6 +180,7 @@ impl ZellijPlugin for State {
             PermissionType::FullHdAccess,
             PermissionType::ReadSessionEnvironmentVariables,
             PermissionType::RunCommands,
+            PermissionType::WriteToClipboard,
         ]);
     }
 
@@ -286,6 +287,7 @@ impl ZellijPlugin for State {
                 let go_first = matches!(key.bare_key, BareKey::Home | BareKey::Char('g')) && no_mods;
                 let go_last = matches!(key.bare_key, BareKey::End | BareKey::Char('G')) && no_mods;
                 let activate = matches!(key.bare_key, BareKey::Enter) && no_mods;
+                let yank = matches!(key.bare_key, BareKey::Char('y')) && no_mods;
                 let cancel = matches!(key.bare_key, BareKey::Esc | BareKey::Char('q')) && no_mods;
                 if go_up && len > 0 {
                     self.selected_idx = Some(match self.selected_idx {
@@ -317,6 +319,17 @@ impl ZellijPlugin for State {
                     {
                         self.acknowledge_agent(&sid);
                         let _ = self.dispatch_focus_agent(&sid);
+                        return true;
+                    }
+                    return false;
+                }
+                if yank {
+                    if let Some(sid) = self
+                        .selected_idx
+                        .and_then(|i| agents.get(i))
+                        .map(|a| a.session_id.clone())
+                    {
+                        copy_to_clipboard(sid);
                         return true;
                     }
                     return false;
