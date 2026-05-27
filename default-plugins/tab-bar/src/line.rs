@@ -177,23 +177,16 @@ fn right_more_message(
 }
 
 fn tab_line_prefix(session_name: Option<&str>, palette: Styling, cols: usize) -> Vec<LinePart> {
-    let prefix_text = " Zellij ".to_string();
-
-    let running_text_len = prefix_text.chars().count();
-    let text_color = palette.text_unselected.base;
-    let bg_color = palette.text_unselected.background;
-    let prefix_styled_text = style!(text_color, bg_color).bold().paint(prefix_text);
-    let mut parts = vec![LinePart {
-        part: prefix_styled_text.to_string(),
-        len: running_text_len,
-        tab_index: None,
-    }];
+    // No " Zellij " brand prefix — the session name alone identifies the bar.
+    // Name renders as " name " (no parens) since it no longer follows a label.
+    let mut parts = Vec::new();
     if let Some(name) = session_name {
-        let name_part = format!("({}) ", name);
+        let name_part = format!(" {} ", name);
         let name_part_len = name_part.width();
         let text_color = palette.text_unselected.base;
+        let bg_color = palette.text_unselected.background;
         let name_part_styled_text = style!(text_color, bg_color).bold().paint(name_part);
-        if cols.saturating_sub(running_text_len) >= name_part_len {
+        if cols >= name_part_len {
             parts.push(LinePart {
                 part: name_part_styled_text.to_string(),
                 len: name_part_len,
