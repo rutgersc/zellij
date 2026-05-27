@@ -876,10 +876,10 @@ fn render_header(
     colors: &AgentColors,
     cols: usize,
 ) -> String {
-    // After OUTER_PAD the header strip fills the rest of the row with
-    // header_bg + theme text fg. Label starts immediately at the strip's
-    // first col so it visually aligns with the `>` row marker on agent
-    // rows (both sit at col OUTER_PAD).
+    // The header strip spans the full row width in header_bg — unlike agent
+    // rows it has no bar_bg margin, so it extends past OUTER_PAD to the left
+    // edge. The leading col is a header_bg space, giving the title a 1-col
+    // lead instead of butting against the edge.
     let body_w = cols.saturating_sub(OUTER_PAD);
     let mut text_budget = body_w;
     let mut trimmed = String::new();
@@ -917,7 +917,7 @@ fn render_header(
     }
     let trailing: String = std::iter::repeat(' ').take(text_budget).collect();
     body.push_str(&style!(h_fg, h_bg).paint(trailing).to_string());
-    let outer = style!(h_fg, colors.bar_bg).paint(" ".to_string()).to_string();
+    let outer = style!(h_fg, h_bg).paint(" ".to_string()).to_string();
     format!("{outer}{body}")
 }
 
