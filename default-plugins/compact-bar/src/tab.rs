@@ -1,16 +1,8 @@
-use crate::agents::TabFlag;
 use crate::{line::tab_separator, LinePart};
 use ansi_term::{ANSIString, ANSIStrings};
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
 use zellij_tile_utils::style;
-
-// Agent-state palette — resolved from the theme palette, NOT hardcoded.
-// See memory:project_agent_state_palette for the vocabulary. Busy = green
-// fg only (reuses ribbon_selected.background, the same green the theme
-// paints active tabs with). Attention = yellow bg + on-colour fg, picked
-// from exit_code_error.emphasis_0 / ribbon_selected.base so a ChangeTheme
-// action repaints everything atomically.
 
 fn cursors<'a>(
     focused_clients: &'a [ClientId],
@@ -35,7 +27,6 @@ pub fn render_tab(
     is_alternate_tab: bool,
     palette: Styling,
     separator: &str,
-    tab_flag: Option<TabFlag>,
 ) -> LinePart {
     let focused_clients = tab.other_focused_clients.as_slice();
     let separator_width = separator.width();
@@ -48,8 +39,6 @@ pub fn render_tab(
         palette.ribbon_selected.background
     } else if is_alternate_tab {
         alternate_tab_color
-    } else if matches!(tab_flag, Some(TabFlag::Attention)) {
-        palette.exit_code_error.emphasis_0
     } else {
         palette.ribbon_unselected.background
     };
@@ -62,11 +51,7 @@ pub fn render_tab(
     } else if tab.active {
         palette.ribbon_selected.base
     } else {
-        match tab_flag {
-            Some(TabFlag::Attention) => palette.ribbon_selected.base,
-            Some(TabFlag::Busy) => palette.ribbon_selected.background,
-            None => palette.ribbon_unselected.base,
-        }
+        palette.ribbon_unselected.base
     };
     let separator_fill_color = palette.text_unselected.background;
     let left_separator = style!(separator_fill_color, background_color).paint(separator);
@@ -115,7 +100,6 @@ pub fn tab_style(
     mut is_alternate_tab: bool,
     palette: Styling,
     capabilities: PluginCapabilities,
-    tab_flag: Option<TabFlag>,
 ) -> LinePart {
     let separator = tab_separator(capabilities);
 
@@ -139,7 +123,7 @@ pub fn tab_style(
         is_alternate_tab = false;
     }
 
-    render_tab(tabname, tab, is_alternate_tab, palette, separator, tab_flag)
+    render_tab(tabname, tab, is_alternate_tab, palette, separator)
 }
 
 pub(crate) fn get_tab_to_focus(

@@ -1,5 +1,4 @@
 mod action_types;
-mod agents;
 mod clipboard_utils;
 mod keybind_utils;
 mod line;
@@ -7,20 +6,16 @@ mod tab;
 mod tooltip;
 
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::path::PathBuf;
 
 use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
-use crate::agents::{PaneAgent, TabFlag};
 use crate::clipboard_utils::{system_clipboard_error, text_copied_hint};
 use crate::line::tab_line;
 use crate::tab::tab_style;
 use crate::tooltip::TooltipRenderer;
-
-const AGENT_POLL_SECS: f64 = 1.5;
 
 static ARROW_SEPARATOR: &str = "";
 
@@ -68,20 +63,6 @@ struct State {
 
     // Keybinding cache
     cached_keybinds: KeybindsVec,
-
-    // Agent indicator — reads custom-state/agent-readmodel.json (attention)
-    // and custom-state/agent-seen-events/ (acknowledgements written by
-    // agent-bar). compact-bar is purely a consumer here — it never writes
-    // mark-seen events itself; the agent-bar click/Enter path is the only
-    // acknowledgement entrypoint.
-    agent_snapshot_host_path: Option<PathBuf>,
-    agent_seen_events_dir: Option<PathBuf>,
-    pane_manifest: PaneManifest,
-    pane_agents: HashMap<u32, PaneAgent>,
-    tab_flags: HashMap<usize, TabFlag>,
-    /// Latest disk scan of agent-seen-events/, refreshed on Timer + on
-    /// permission grant.
-    seen_disk: HashMap<String, i64>,
 }
 
 struct TabRenderData {
@@ -101,7 +82,6 @@ impl ZellijPlugin for State {
         self.initialize_configuration(configuration);
         self.setup_subscriptions();
         self.configure_keybinds();
-        self.setup_agent_indicator();
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -125,8 +105,6 @@ impl ZellijPlugin for State {
             },
             Event::TabUpdate(tabs) => self.handle_tab_update(tabs),
             Event::PaneUpdate(pane_manifest) => self.handle_pane_update(pane_manifest),
-            Event::Timer(_) => self.handle_agent_timer(),
-            Event::PermissionRequestResult(_) => self.handle_permission_grant(),
             Event::Mouse(mouse_event) => {
                 self.handle_mouse_event(mouse_event);
                 false
@@ -182,10 +160,8 @@ impl State {
     }
 
     fn setup_subscriptions(&self) {
-        // Start selectable so the permission prompt is mouse-focusable.
-        // Switched to set_selectable(false) in handle_permission_grant once
-        // the user has answered. Bug ref:
-        // https://github.com/zellij-org/zellij/issues/4749
+        set_selectable(false);
+
         let events = if self.is_tooltip {
             vec![
                 EventType::ModeUpdate,
@@ -202,8 +178,6 @@ impl State {
                 EventType::InputReceived,
                 EventType::SystemClipboardFailure,
                 EventType::InitialKeybinds,
-                EventType::Timer,
-                EventType::PermissionRequestResult,
             ]
         };
 
@@ -273,8 +247,7 @@ impl State {
 
         if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
             let active_tab_idx = active_tab_index + 1; // Convert to 1-based indexing
-            let mut should_render = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
-            let active_tab_changed = self.active_tab_idx != active_tab_idx;
+            let should_render = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
 
             if self.is_tooltip && self.active_tab_idx != active_tab_idx {
                 self.move_tooltip_to_new_tab(active_tab_idx);
@@ -282,11 +255,6 @@ impl State {
 
             self.active_tab_idx = active_tab_idx;
             self.tabs = tabs;
-            // Active tab change resets mark-seen state for the new tab's
-            // agents — recompute so the orange tint clears immediately.
-            if active_tab_changed && !self.is_tooltip {
-                should_render |= self.recompute_tab_flags();
-            }
             should_render
         } else {
             false
@@ -294,92 +262,11 @@ impl State {
     }
 
     fn handle_pane_update(&mut self, pane_manifest: PaneManifest) -> bool {
-        let mut should_render = false;
         if self.toggle_tooltip_key.is_some() {
             let previous_tooltip_state = self.tooltip_is_active;
             self.tooltip_is_active = self.detect_tooltip_presence(&pane_manifest);
             self.own_tab_index = self.find_own_tab_index(&pane_manifest);
-            should_render = previous_tooltip_state != self.tooltip_is_active;
-        }
-        if !self.is_tooltip && self.pane_manifest != pane_manifest {
-            self.pane_manifest = pane_manifest;
-            should_render |= self.recompute_tab_flags();
-        }
-        should_render
-    }
-
-    fn setup_agent_indicator(&mut self) {
-        if self.is_tooltip {
-            return;
-        }
-        // Builtin plugins auto-grant via is_builtin(); a file:// load needs
-        // explicit grants. PermissionRequestResult fires either way, which is
-        // where we kick off the snapshot polling.
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::FullHdAccess,
-            PermissionType::ReadSessionEnvironmentVariables,
-        ]);
-    }
-
-    fn handle_permission_grant(&mut self) -> bool {
-        if self.is_tooltip || self.agent_snapshot_host_path.is_some() {
-            return false;
-        }
-        // Permission settled — drop out of the navigable focus rotation.
-        set_selectable(false);
-        let env = get_session_environment_variables();
-        if let Some(loc) = agents::locate_snapshot(&env) {
-            change_host_folder(loc.host_root);
-            self.agent_snapshot_host_path = Some(loc.wasi_path);
-            let seen_dir = PathBuf::from("/host/.claude/custom-state/agent-seen-events");
-            self.seen_disk = agents::read_seen_events(&seen_dir);
-            self.agent_seen_events_dir = Some(seen_dir);
-        }
-        set_timeout(AGENT_POLL_SECS);
-        false
-    }
-
-    fn handle_agent_timer(&mut self) -> bool {
-        let mut should_render = false;
-        if let Some(path) = &self.agent_snapshot_host_path {
-            let session = self.mode_info.session_name.as_deref().unwrap_or_default();
-            let new_pane_agents = agents::project_for_session(path, session);
-            if new_pane_agents != self.pane_agents {
-                self.pane_agents = new_pane_agents;
-            }
-        }
-        if let Some(dir) = &self.agent_seen_events_dir {
-            let new = agents::read_seen_events(dir);
-            if new != self.seen_disk {
-                self.seen_disk = new;
-            }
-        }
-        // Recompute every tick — pane_agents, seen_disk, or active tab may
-        // have shifted since last render.
-        should_render |= self.recompute_tab_flags();
-        set_timeout(AGENT_POLL_SECS);
-        should_render
-    }
-
-    fn recompute_tab_flags(&mut self) -> bool {
-        // Always re-read seen state from disk before recomputing. Without
-        // this, a session you've just switched into would tint a tab
-        // orange briefly using stale `seen_disk` until its next Timer
-        // tick caught up — see the equivalent comment in agent-bar.
-        if let Some(dir) = &self.agent_seen_events_dir {
-            self.seen_disk = agents::read_seen_events(dir);
-        }
-        let active_tab_position = self.active_tab_idx.checked_sub(1);
-        let new_tab_flags = agents::compute_tab_flags(
-            &self.pane_agents,
-            &self.pane_manifest,
-            active_tab_position,
-            &self.seen_disk,
-        );
-        if new_tab_flags != self.tab_flags {
-            self.tab_flags = new_tab_flags;
-            true
+            previous_tooltip_state != self.tooltip_is_active
         } else {
             false
         }
@@ -662,14 +549,12 @@ impl State {
                 }
             }
 
-            let tab_flag = self.tab_flags.get(&tab.position).copied();
             let styled_tab = tab_style(
                 tab_name,
                 tab,
                 is_alternate_tab,
                 self.mode_info.style.colors,
                 self.mode_info.capabilities,
-                tab_flag,
             );
 
             is_alternate_tab = !is_alternate_tab;

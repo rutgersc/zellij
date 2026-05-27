@@ -598,11 +598,8 @@ checksum = "4dfdf9179d546b55ff3f88c9d93ecfaa3e9760163da5a1080af5243230dbbb70"
 name = "compact-bar"
 version = "0.1.0"
 dependencies = [
- "agent-readmodel",
  "ansi_term",
  "colored",
- "serde",
- "serde_json",
  "unicode-width 0.1.10",
  "zellij-tile",
  "zellij-tile-utils",
