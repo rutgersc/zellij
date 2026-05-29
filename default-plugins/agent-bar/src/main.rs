@@ -4,9 +4,12 @@
 //!
 //! Layout: each agent's `name` is word-wrapped to the pane width (1..=4
 //! rows). Agents are grouped under the zellij session they belong to;
-//! groups (and agents within them) are ordered by `started_at_ms` desc, so
-//! the newest activity stays at the top. Agents without a `zellij_session`
-//! collect in a "sessionless" group pinned to the bottom.
+//! groups (and agents within them) are ordered by `started_at_ms` asc, so
+//! the oldest sessions stay at the top and newly created ones append at the
+//! bottom. A session's slot is pinned by its earliest agent's creation
+//! time, so it doesn't jump around as later agents come and go. Agents
+//! without a `zellij_session` collect in a "sessionless" group pinned to
+//! the very bottom.
 //!
 //! Status carries through text fg (green=busy, white=idle, amber=waiting).
 //! `needs_attention` paints the agent's rows orange-bg. `✗` after the
@@ -571,7 +574,7 @@ impl State {
                     self.row_ranges.push((visible_row, sid.clone()));
                     render_agent_line(
                         text,
-                        *status,
+                        status.clone(),
                         *needs_attention,
                         *unrouted,
                         *is_active_pane,
@@ -639,7 +642,10 @@ impl State {
 struct Group {
     label: GroupLabel,
     agents: Vec<Agent>,
-    max_started_ms: i64,
+    /// Earliest agent `started_at_ms` in the group — the session's creation
+    /// time. Used as the group's sort key so its slot stays put as later
+    /// agents come and go.
+    created_ms: i64,
     any_unrouted: bool,
 }
 
@@ -697,11 +703,11 @@ fn group_by_session(agents: &[Agent]) -> Vec<Group> {
         let entry = by_key.entry(key).or_insert(Group {
             label,
             agents: Vec::new(),
-            max_started_ms: i64::MIN,
+            created_ms: i64::MAX,
             any_unrouted: false,
         });
-        if a.started_at_ms > entry.max_started_ms {
-            entry.max_started_ms = a.started_at_ms;
+        if a.started_at_ms < entry.created_ms {
+            entry.created_ms = a.started_at_ms;
         }
         if a.zellij_pane_id.is_none() {
             entry.any_unrouted = true;
@@ -710,14 +716,14 @@ fn group_by_session(agents: &[Agent]) -> Vec<Group> {
     }
     let mut groups: Vec<Group> = by_key.into_values().collect();
     for g in &mut groups {
-        // Newest agent first within the group.
-        g.agents.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
+        // Oldest agent first within the group (creation order).
+        g.agents.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
     }
     groups.sort_by(|a, b| match (&a.label, &b.label) {
         (GroupLabel::Sessionless, GroupLabel::Sessionless) => std::cmp::Ordering::Equal,
         (GroupLabel::Sessionless, _) => std::cmp::Ordering::Greater,
         (_, GroupLabel::Sessionless) => std::cmp::Ordering::Less,
-        _ => b.max_started_ms.cmp(&a.max_started_ms),
+        _ => a.created_ms.cmp(&b.created_ms),
     });
     groups
 }
@@ -756,7 +762,7 @@ fn build_lines(
             for (i, w) in wrapped.into_iter().enumerate() {
                 lines.push(Line::AgentRow {
                     sid: a.session_id.clone(),
-                    status: a.status,
+                    status: a.status.clone(),
                     text: w,
                     needs_attention: f.needs_attention,
                     unrouted: f.unrouted,
@@ -934,20 +940,26 @@ fn render_agent_line(
 ) -> String {
     // Resolve (bg, fg) by priority — selection wins (keyboard cursor),
     // then user-attention states (yellow), then active-pane (green,
-    // mirroring active-tab), then status text on neutral bg.
+    // mirroring active-tab), then status text on neutral bg. Unknown
+    // (a status Claude introduced that we don't know about yet) routes
+    // through the attention path with an error fg so it's loudly visible
+    // without crashing the whole bar.
+    let is_unknown = matches!(status, AgentStatus::Unknown(_));
     let (cell_bg, fg, colored_bg, bold) = if selected {
         (colors.selected_bg, colors.selected_fg, true, true)
+    } else if is_unknown {
+        (colors.yellow, colors.error, true, true)
     } else if needs_attention || matches!(status, AgentStatus::Waiting) {
         (colors.yellow, colors.on_color, true, true)
     } else if is_active_pane {
         (colors.green, colors.on_color, true, true)
     } else {
-        // No bg tint — fg by status. Waiting is handled above so this
-        // arm only ever sees Busy or Idle.
+        // No bg tint — fg by status. Waiting/Unknown handled above so
+        // this arm only ever sees Busy or Idle.
         let fg = match status {
             AgentStatus::Busy => colors.green,
             AgentStatus::Idle => colors.text,
-            AgentStatus::Waiting => colors.text, // unreachable
+            AgentStatus::Waiting | AgentStatus::Unknown(_) => colors.text, // unreachable
         };
         (colors.bar_bg, fg, false, false)
     };

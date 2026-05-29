@@ -13,10 +13,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
     Busy,
     /// Claude is between turns, ready for the next user prompt.
@@ -24,6 +23,23 @@ pub enum AgentStatus {
     /// Claude is blocked on the user (permission, AskUserQuestion,
     /// ExitPlanMode). Distinct from Idle so the bar can surface it.
     Waiting,
+    /// Anything Claude Code emits that isn't in the set above. New
+    /// variants (e.g. `shell`) land here so the readmodel parse keeps
+    /// succeeding — the plugin renders Unknown rows in attention/error
+    /// styling instead of crashing the whole bar.
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for AgentStatus {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "busy" => AgentStatus::Busy,
+            "idle" => AgentStatus::Idle,
+            "waiting" => AgentStatus::Waiting,
+            _ => AgentStatus::Unknown(s),
+        })
+    }
 }
 
 /// One entry in the readmodel. The plugin only needs the fields it renders;
