@@ -28,9 +28,17 @@ require_staged() {
     if [[ ! -f "$wasm" ]]; then
         return 0  # lib-only crate (e.g. agent-readmodel), nothing to bake
     fi
-    if ! echo "$staged" | grep -qx "$wasm"; then
-        errors+=("$1: source changed but $wasm not staged")
+    if echo "$staged" | grep -qx "$wasm"; then
+        return 0
     fi
+    # Rebake produced byte-identical bytes (the source change had no codegen
+    # impact on this dep)? Then HEAD's wasm is still correct; nothing to stage.
+    # Common when a reverse-dep crate adds a variant the dependent plugin
+    # never touches.
+    if git diff --quiet HEAD -- "$wasm" 2>/dev/null; then
+        return 0
+    fi
+    errors+=("$1: source changed but $wasm not staged")
 }
 
 for plugin in $changed_plugins; do
