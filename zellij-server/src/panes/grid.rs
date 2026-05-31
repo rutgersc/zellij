@@ -1523,10 +1523,25 @@ impl Grid {
         let (mut character_chunks, sixel_image_chunks) = self.read_changes(content_x, content_y);
 
         let plugin_highlight_selections = self.compute_plugin_highlight_selections();
+        let copy_mode_cursor = self.copy_mode_cursor_highlight(style);
 
         for character_chunk in character_chunks.iter_mut() {
             character_chunk.add_changed_colors(self.changed_colors);
             character_chunk.add_pane_defaults(self.pane_default_fg, self.pane_default_bg);
+            // Pushed before the selection so `.find()` resolves the cursor cell
+            // to the reverse-video highlight while the rest stays selection-coloured.
+            if let Some(cursor_highlight) = copy_mode_cursor {
+                if cursor_highlight
+                    .selection
+                    .contains_row(character_chunk.y.saturating_sub(content_y))
+                {
+                    character_chunk.add_selection_and_colors(
+                        cursor_highlight,
+                        content_x,
+                        content_y,
+                    );
+                }
+            }
             if self
                 .selection
                 .contains_row(character_chunk.y.saturating_sub(content_y))
@@ -5028,6 +5043,33 @@ impl Grid {
         }
         self.sync_selection_to_copy_cursor();
         self.mark_for_rerender();
+    }
+
+    /// A single-cell, reverse-video highlight marking the copy-mode cursor.
+    /// Rendered on top of (and pushed before) the selection highlight so the
+    /// cursor stays visible against both normal text and the selection block.
+    fn copy_mode_cursor_highlight(&self, style: &Style) -> Option<HighlightSelection> {
+        let state = self.copy_mode?;
+        let cursor = state.cursor;
+        let mut selection = Selection::default();
+        selection.set_start_and_end_positions(cursor, end_inclusive(cursor));
+        let to_ansi = |c: PaletteColor| -> AnsiCode {
+            match c {
+                PaletteColor::Rgb(rgb) => AnsiCode::RgbCode(rgb),
+                PaletteColor::EightBit(col) => AnsiCode::ColorIndex(col),
+            }
+        };
+        // Reverse video relative to normal text: the normal foreground becomes
+        // the cursor block, the normal background becomes the glyph on top.
+        Some(HighlightSelection {
+            selection,
+            bg: Some(to_ansi(style.colors.text_unselected.base)),
+            fg: Some(to_ansi(style.colors.text_unselected.background)),
+            bold: false,
+            italic: false,
+            underline: false,
+            layer: HighlightLayer::ActionFeedback,
+        })
     }
 
     fn sync_selection_to_copy_cursor(&mut self) {
