@@ -11,9 +11,12 @@
 //! without a `zellij_session` collect in a "sessionless" group pinned to
 //! the very bottom.
 //!
-//! Status carries through text fg (green=busy, white=idle, amber=waiting).
-//! `needs_attention` paints the agent's rows orange-bg. `✗` after the
-//! session header marks agents missing a `zellij_pane_id`.
+//! Status carries through the name fg (magenta=busy, white=idle/waiting,
+//! red=unknown). The row's first columns are a per-column priority stack:
+//! attention/waiting (yellow, red if unknown), in-view (green), and selection
+//! (grey) each claim columns by priority, so combinations layer rather than
+//! overwrite (see the palette block below). `✗` after the session header marks
+//! agents missing a `zellij_pane_id`.
 //!
 //! Click any row of an agent → `mux focus-agent <session_id>`. Up/Down
 //! moves the keyboard cursor across agents, Enter activates, Esc returns
@@ -38,31 +41,39 @@ const POLL_SECS: f64 = 1.5;
 /// Hard cap on rows used to render a single agent's name. Past this we
 /// truncate with `…` — the full name is still on the snapshot.
 const MAX_NAME_LINES: usize = 4;
-/// Single-col left margin from the pane border. Panel-focus is now signaled
-/// by zellij's own pane border highlight (the layout uses bordered panes
-/// for resize affordance), so the in-content focus stripe was removed.
+/// Width of col 0 — the leftmost cell of every agent row. Shows the selection
+/// grey when keyboard-selected, otherwise neutral. It's the innermost (least
+/// dominant) layer of the per-column state stack (see palette block below).
 const OUTER_PAD: usize = 1;
-/// Within an agent row, after `OUTER_PAD`, two more cols for [`>` row
-/// marker (or `✗` if unrouted), space] before the wrapped name.
+/// After col 0, two more cols before the wrapped name: col 1 = the `>` row
+/// marker (or `✗` if unrouted), col 2 = a single space. Both sit in the
+/// per-column state stack; the marker glyph rides on col 1's bg.
 const AGENT_INDENT: usize = 2;
 const SESSIONLESS_LABEL: &str = "sessionless";
 
-// Agent-state palette — shared vocabulary across agent-bar, compact-bar's
-// tab tints, and (eventually) the mux session picker:
-//   busy        → green fg, no bg              (working, no user action needed)
-//   waiting     → yellow bg + on-colour fg     (blocked on user)
-//   attention   → yellow bg + on-colour fg     (unseen attention event)
-//   active-pane → green bg + on-colour fg      (THIS agent owns the zellij
-//                                               pane the user is currently in)
-//   idle/seen   → text fg, no bg               (neutral)
-// Active-pane mirrors the active-tab pattern (green bg + on-colour fg) so the
-// agent you're "inside" reads as the visual peer of your active tab.
+// Agent-state palette — a shared colour vocabulary (agent-bar today, the mux
+// session picker later). Concurrent states are composited as a PER-COLUMN
+// priority stack across the row's first columns (a z-stack projected onto the
+// left edge — lower-priority states "peek out" to the left as the dominant one
+// takes the body). Columns: 0 | 1 (`>`) | 2 (space) | 3.. (name).
 //
-// All status colours are resolved from `mode_info.style.colors` so a
-// ChangeTheme action updates everything together — green/yellow/on-colour
-// come straight from `ribbon_selected` and `exit_code_error` so they match
-// what the theme uses for its own active-tab and error styles. Only the
-// red unrouted marker and the structural glyphs are hardcoded.
+//   col 0      → grey if selected, else neutral.
+//   col 1 & 2  → in-view green · else alert (yellow, or red if unknown) · else
+//                selected grey · else neutral.
+//   col 3 name → alert (yellow/red) · else in-view green · else selected grey
+//                · else neutral.   (in-view outranks alert on cols 1-2 but
+//                alert outranks in-view on the body — that's the "carve".)
+//
+// Name fg always encodes status, picking a hue that reads on its body bg:
+//   busy    → magenta (reads on neutral/grey/green/yellow alike).
+//   unknown → on-colour (its body is red).
+//   idle /  → text on a neutral body, selected-fg on grey, on-colour on a
+//   waiting    green/yellow body (colourless states carry no hue to lose).
+// The `>` marker takes on-colour over any tinted col 1, else the name fg.
+//
+// All colours resolve from `mode_info.style.colors` so a ChangeTheme repaints
+// everything at once — green/yellow/on-colour/magenta come from ribbon_selected,
+// exit_code_error and text_unselected. Only the structural glyphs are hardcoded.
 const UNROUTED: &str = "\u{2717}";
 
 /// Theme-driven colours for every agent state. Built once per render from
@@ -70,8 +81,12 @@ const UNROUTED: &str = "\u{2717}";
 /// panel atomically.
 #[derive(Copy, Clone)]
 struct AgentColors {
-    /// The "green" — bg for active-pane, fg for busy.
+    /// The "green" — bg for in-view.
     green: PaletteColor,
+    /// The "magenta/purple" — fg for busy. The theme's text emphasis-3 slot,
+    /// a foreground-legible hue distinct from green/yellow/red, so a busy
+    /// agent reads clearly on every body bg (neutral, grey, green, yellow).
+    magenta: PaletteColor,
     /// The "yellow" — bg for waiting / needs-attention.
     yellow: PaletteColor,
     /// Foreground to use on top of `green` or `yellow`. Comes from the
@@ -98,6 +113,10 @@ impl AgentColors {
     fn from_palette(p: &Styling) -> Self {
         Self {
             green: p.ribbon_selected.background,
+            // text_unselected.emphasis_3 is the theme's magenta slot (pink/
+            // purple family) — a text-emphasis colour, so it's tuned to be
+            // legible as a foreground.
+            magenta: p.text_unselected.emphasis_3,
             yellow: p.exit_code_error.emphasis_0,
             on_color: p.ribbon_selected.base,
             text: p.text_unselected.base,
@@ -521,7 +540,18 @@ impl State {
         self.refresh_seen_disk();
 
         let session = self.mode_info.session_name.as_deref().unwrap_or("").to_string();
-        let active_pane_id = self.focused_external_pane_id();
+        // Panes "in view" right now = the non-suppressed terminal panes of
+        // THIS session's active tab. An agent whose pane is among them is on
+        // screen (its tab is the active one) — that's what green now signals,
+        // regardless of whether the panel or a terminal currently has focus.
+        let in_view_pane_ids: HashSet<u32> = self
+            .active_tab_idx
+            .and_then(|idx| self.pane_manifest.panes.get(&idx))
+            .into_iter()
+            .flatten()
+            .filter(|p| !p.is_plugin && !p.is_suppressed)
+            .map(|p| p.id)
+            .collect();
 
         // Compute flags first; pass into rendering.
         let mut flags: HashMap<String, Flags> = HashMap::new();
@@ -529,17 +559,17 @@ impl State {
             let unrouted = agent.zellij_pane_id.is_none();
             let unseen = agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
-            // Active pane = the ONE pane the user is currently typing in.
-            // Requires same zellij session AND same pane id. When the
-            // panel itself is focused, focused_external_pane_id is None
-            // and no agent gets this flag — green-bg is reserved for the
-            // moment when the agent's own pane has the cursor.
-            let is_active_pane = active_pane_id.is_some()
-                && agent.zellij_session.as_deref() == Some(session.as_str())
-                && agent.zellij_pane_id == active_pane_id;
+            // In view = same zellij session AND the agent's pane sits in this
+            // session's active tab. The session guard is load-bearing: pane
+            // ids are unique only within a session, so without it a cross-
+            // session agent whose id collides with an in-view pane here would
+            // falsely light green. (A cross-session agent is on another
+            // screen anyway, so it's correctly never in-view.)
+            let is_in_view = agent.zellij_session.as_deref() == Some(session.as_str())
+                && matches!(agent.zellij_pane_id, Some(pid) if in_view_pane_ids.contains(&pid));
             flags.insert(
                 agent.session_id.clone(),
-                Flags { unrouted, needs_attention: unseen, is_active_pane },
+                Flags { unrouted, needs_attention: unseen, is_in_view },
             );
         }
 
@@ -551,8 +581,9 @@ impl State {
             display.len().checked_sub(1).map(|max| i.min(max))
         });
 
-        // Names wrap inside `cols - OUTER_PAD - AGENT_INDENT`. Headers use
-        // `cols - OUTER_PAD` (header bg fills out to that edge).
+        // Names wrap inside `cols - OUTER_PAD - AGENT_INDENT` (col 0 + the `>`
+        // marker + the space are reserved on the left). Headers use
+        // `cols - OUTER_PAD`.
         let name_wrap_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
         let (lines, agent_row_starts) = build_lines(&groups, &flags, name_wrap_w);
 
@@ -579,7 +610,7 @@ impl State {
                     text,
                     needs_attention,
                     unrouted,
-                    is_active_pane,
+                    is_in_view,
                     is_first_wrap_line,
                     ..
                 } => {
@@ -590,7 +621,7 @@ impl State {
                         status.clone(),
                         *needs_attention,
                         *unrouted,
-                        *is_active_pane,
+                        *is_in_view,
                         *is_first_wrap_line,
                         selected,
                         colors,
@@ -681,7 +712,7 @@ impl GroupLabel {
 struct Flags {
     unrouted: bool,
     needs_attention: bool,
-    is_active_pane: bool,
+    is_in_view: bool,
 }
 
 enum Line {
@@ -697,7 +728,7 @@ enum Line {
         text: String,
         needs_attention: bool,
         unrouted: bool,
-        is_active_pane: bool,
+        is_in_view: bool,
         /// True on the first wrap-line of an agent — the `>` (or `✗` if
         /// unrouted) row marker shows only on this line so adjacent agents
         /// with the same bg tint stay visually distinct.
@@ -763,7 +794,7 @@ fn build_lines(
             let f = flags.get(&a.session_id).copied().unwrap_or(Flags {
                 unrouted: false,
                 needs_attention: false,
-                is_active_pane: false,
+                is_in_view: false,
             });
             let text = if a.name.trim().is_empty() {
                 a.session_id.get(..8).unwrap_or(&a.session_id).to_string()
@@ -779,7 +810,7 @@ fn build_lines(
                     text: w,
                     needs_attention: f.needs_attention,
                     unrouted: f.unrouted,
-                    is_active_pane: f.is_active_pane,
+                    is_in_view: f.is_in_view,
                     is_first_wrap_line: i == 0,
                 });
             }
@@ -945,90 +976,110 @@ fn render_agent_line(
     status: AgentStatus,
     needs_attention: bool,
     unrouted: bool,
-    is_active_pane: bool,
+    is_in_view: bool,
     is_first_wrap_line: bool,
     selected: bool,
     colors: &AgentColors,
     cols: usize,
 ) -> String {
-    // Resolve (bg, fg) by priority — selection wins (keyboard cursor),
-    // then user-attention states (yellow), then active-pane (green,
-    // mirroring active-tab), then status text on neutral bg. Unknown
-    // (a status Claude introduced that we don't know about yet) routes
-    // through the attention path with an error fg so it's loudly visible
-    // without crashing the whole bar.
+    // Per-column priority stack (see the palette block at the top of this
+    // file). `alert` = needs-attention / waiting / unknown; it shows yellow,
+    // or red when the status itself is unknown.
     let is_unknown = matches!(status, AgentStatus::Unknown(_));
-    let (cell_bg, fg, colored_bg, bold) = if selected {
-        (colors.selected_bg, colors.selected_fg, true, true)
+    let alert = needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown;
+    let alert_color = if is_unknown { colors.error } else { colors.yellow };
+
+    // col 0   → selected grey, else neutral.
+    // col 1/2 → in-view green · alert · selected grey · neutral.
+    // col 3   → alert · in-view green · selected grey · neutral.  (in-view
+    //           outranks alert on cols 1-2; alert outranks in-view on col 3.)
+    let col0_bg = if selected { colors.selected_bg } else { colors.bar_bg };
+    let mid_bg = if is_in_view {
+        colors.green
+    } else if alert {
+        alert_color
+    } else if selected {
+        colors.selected_bg
+    } else {
+        colors.bar_bg
+    };
+    let body_bg = if alert {
+        alert_color
+    } else if is_in_view {
+        colors.green
+    } else if selected {
+        colors.selected_bg
+    } else {
+        colors.bar_bg
+    };
+
+    // Name fg encodes status, choosing a hue that reads on the body bg. Busy's
+    // magenta reads on every bg (and never lands on red, since unknown != busy).
+    // Idle/waiting carry no hue, so on a tinted body they take the legible
+    // on-colour rather than washing out.
+    let body_tinted = alert || is_in_view;
+    let name_fg = if matches!(status, AgentStatus::Busy) {
+        colors.magenta
     } else if is_unknown {
-        (colors.yellow, colors.error, true, true)
-    } else if needs_attention || matches!(status, AgentStatus::Waiting) {
-        (colors.yellow, colors.on_color, true, true)
-    } else if is_active_pane {
-        (colors.green, colors.on_color, true, true)
+        colors.on_color // body is red
+    } else if body_tinted {
+        colors.on_color // green / yellow body
+    } else if selected {
+        colors.selected_fg
     } else {
-        // No bg tint — fg by status. Waiting/Unknown handled above so
-        // this arm only ever sees Busy or Idle.
-        let fg = match status {
-            AgentStatus::Busy => colors.green,
-            AgentStatus::Idle => colors.text,
-            AgentStatus::Waiting | AgentStatus::Unknown(_) => colors.text, // unreachable
-        };
-        (colors.bar_bg, fg, false, false)
+        colors.text
     };
-    // 1-col outer pad on bar_bg sits to the left of every agent row, giving
-    // breathing room from the pane border. Selection/attention bg starts
-    // from the agent body, not from this pad, so the row's left edge
-    // visually separates from the border line.
-    let outer_pad = style!(fg, colors.bar_bg).paint(" ".to_string()).to_string();
 
-    let body_w = cols.saturating_sub(OUTER_PAD);
-    let mut out = String::new();
-    // Unrouted marker stays theme-error-red on neutral bg, switches to the
-    // on-colour fg (theme's "on green/yellow" colour) on a tinted bg so it
-    // doesn't disappear into the tint.
-    let unrouted_color = if colored_bg { colors.on_color } else { colors.error };
-    let style_for = |fg_color: PaletteColor| {
-        let mut s = style!(fg_color, cell_bg);
+    // Bold whenever the row carries any signal so it pops without a full bg.
+    let bold = selected || is_in_view || alert;
+    let paint = |fg: PaletteColor, bg: PaletteColor, s: String| {
+        let mut style = style!(fg, bg);
         if bold {
-            s = s.bold();
+            style = style.bold();
         }
-        s
+        style.paint(s).to_string()
     };
 
-    // Row marker — shows only on the first wrap-line of an agent so adjacent
-    // agents with the same bg tint stay visually distinct. Unrouted agents
-    // get `✗` (red), all others get `>` (same fg as the row text).
-    let (marker_char, marker_color) = if !is_first_wrap_line {
-        (' ', fg)
+    // Marker (col 1), first wrap-line only (blanked on continuations so stacked
+    // agents stay distinct). `>` simply follows the name fg — which is already
+    // chosen to read on the col 1 bg — so a busy+selected row keeps its magenta
+    // marker instead of washing out to on-colour. The unrouted `✗` stays the
+    // error red, swapping to on-colour only on an alert (yellow/red) col 1
+    // where red wouldn't read.
+    let marker_char = if !is_first_wrap_line {
+        ' '
     } else if unrouted {
-        ('\u{2717}', unrouted_color) // ✗
+        '\u{2717}' // ✗
     } else {
-        ('>', fg)
+        '>'
     };
-    out.push_str(&style_for(marker_color).paint(marker_char.to_string()).to_string());
-    out.push_str(&style_for(fg).paint(" ".to_string()).to_string());
+    let marker_fg = if unrouted {
+        if alert { colors.on_color } else { colors.error }
+    } else {
+        name_fg
+    };
 
-    let content_w = body_w.saturating_sub(AGENT_INDENT);
+    // Width budget: col 0 (1) + marker (1) + space (1) + name/pad = cols.
+    let name_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
     let mut visible = String::new();
     let mut w = 0;
     for c in text.chars() {
         let cw = c.to_string().width();
-        if w + cw > content_w {
+        if w + cw > name_w {
             break;
         }
         visible.push(c);
         w += cw;
     }
-    out.push_str(&style_for(fg).paint(visible).to_string());
+    let pad: String = std::iter::repeat(' ').take(name_w - w).collect();
 
-    let used = AGENT_INDENT + w;
-    if used < body_w {
-        let pad = body_w - used;
-        let pad_str: String = std::iter::repeat(' ').take(pad).collect();
-        out.push_str(&style_for(fg).paint(pad_str).to_string());
-    }
-    format!("{outer_pad}{out}")
+    let mut row = String::new();
+    row.push_str(&paint(name_fg, col0_bg, " ".to_string())); // col 0
+    row.push_str(&paint(marker_fg, mid_bg, marker_char.to_string())); // col 1: marker
+    row.push_str(&paint(name_fg, mid_bg, " ".to_string())); // col 2: space
+    row.push_str(&paint(name_fg, body_bg, visible)); // col 3: name
+    row.push_str(&paint(name_fg, body_bg, pad));
+    row
 }
 
 fn diag_frame(
