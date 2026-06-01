@@ -496,6 +496,34 @@ pub fn reap_stale_running_entries() -> io::Result<usize> {
     Ok(stale_ids.len())
 }
 
+/// Remove registry entries whose process is gone (Dead). Returns the
+/// removed entries' (id, name) pairs. Use this from `delete-all-sessions`
+/// — `reap_stale_running_entries` only marks them Exited, which leaves
+/// them as phantom resurrectable rows with no cache directory to restore.
+///
+/// Stuck entries (server unresponsive but socket exists) are *not* touched
+/// — removing them would orphan a possibly-still-running zellij server.
+/// The user clears those explicitly via `delete-session --force <name>`.
+pub fn reap_dead_registry_entries() -> io::Result<Vec<(String, String)>> {
+    let registry = ensure_registry();
+    let dead: Vec<(String, String)> = registry
+        .running_sessions()
+        .iter()
+        .filter(|s| matches!(check_session_state(&s.id), SessionLiveness::Dead))
+        .map(|s| (s.id.clone(), s.display_name.clone()))
+        .collect();
+    if dead.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<&str> = dead.iter().map(|(id, _)| id.as_str()).collect();
+    with_registry(|reg| {
+        for id in &ids {
+            reg.remove_by_id(id);
+        }
+    })?;
+    Ok(dead)
+}
+
 /// Ensure the sock dir exists so the lock/registry files can be created in it.
 fn ensure_sock_dir() -> io::Result<()> {
     fs::create_dir_all(&*ZELLIJ_SOCK_DIR)

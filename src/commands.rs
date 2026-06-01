@@ -84,6 +84,7 @@ pub(crate) fn kill_all_sessions(yes: bool) {
 pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
     use std::collections::BTreeMap;
     use zellij_server::background_jobs::scan_session_list_default_dirs;
+    use zellij_utils::sessions::reap_dead_registry_entries;
 
     let active_sessions: Vec<String> = get_sessions()
         .unwrap_or_default()
@@ -122,6 +123,19 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
     }
     for session in &dead_sessions {
         delete_session_impl(&session.0, force);
+    }
+    // Resurrectable iteration only covers cache-dir entries. Dead registry
+    // rows (state=running but no process) have no cache and would persist
+    // forever otherwise — purge them here so `delete-all-sessions` actually
+    // means *all*.
+    match reap_dead_registry_entries() {
+        Ok(reaped) if !reaped.is_empty() => {
+            for (_, name) in &reaped {
+                println!("Registry: {:?} removed (stale entry).", name);
+            }
+        },
+        Err(e) => eprintln!("Failed to reap dead registry entries: {e}"),
+        _ => {},
     }
     process::exit(0);
 }
