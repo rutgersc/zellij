@@ -316,6 +316,7 @@ fn create_new_screen(
         false, // mouse_click_through
         web_server_ip,
         web_server_port,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     screen
 }
@@ -378,6 +379,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
                 )
                 .expect("TEST")
             })
@@ -464,6 +466,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
                 )
                 .expect("TEST")
             })
@@ -5379,6 +5382,7 @@ fn create_new_screen_with_message_capture(
         false, // mouse_click_through
         web_server_ip,
         web_server_port,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (screen, messages)
 }
