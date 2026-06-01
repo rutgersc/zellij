@@ -14,11 +14,12 @@ use zellij_client::{
 };
 
 use zellij_utils::sessions::{
-    assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
-    generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
-    get_sessions_sorted_by_mtime, kill_session as kill_session_impl, match_session_name,
-    print_sessions, print_sessions_with_index, resurrection_layout, session_exists,
-    validate_session_name, ActiveSession, SessionNameMatch,
+    assert_dead_session, assert_session, assert_session_ne, check_session_state,
+    delete_session as delete_session_impl, generate_unique_session_name, get_active_session,
+    get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
+    kill_session as kill_session_impl, match_session_name, print_sessions,
+    print_sessions_with_index, resurrection_layout, session_exists, validate_session_name,
+    ActiveSession, SessionDisplayStatus, SessionLiveness, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
@@ -644,7 +645,7 @@ fn attach_with_session_name(
                 print_sessions(
                     sessions
                         .iter()
-                        .map(|s| (s.clone(), Duration::default(), false))
+                        .map(|s| (s.clone(), Duration::default(), SessionDisplayStatus::Alive))
                         .collect(),
                     false,
                     false,
@@ -1033,7 +1034,7 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
                 print_sessions(
                     sessions
                         .iter()
-                        .map(|s| (s.clone(), Duration::default(), false))
+                        .map(|s| (s.clone(), Duration::default(), SessionDisplayStatus::Alive))
                         .collect(),
                     false,
                     false,
