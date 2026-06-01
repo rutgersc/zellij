@@ -975,9 +975,40 @@ pub(crate) fn start_client(opts: CliArgs) {
                 let use_cwd_name = config_options.session_name_from_cwd.unwrap_or(false);
                 let existing_cwd_session = if use_cwd_name {
                     let current_session = std::env::var(envs::SESSION_NAME_ENV_KEY).ok();
-                    session_name_from_cwd().filter(|name| {
-                        session_exists(name).unwrap_or(false)
-                            && current_session.as_deref() != Some(name.as_str())
+                    session_name_from_cwd().and_then(|name| {
+                        if current_session.as_deref() == Some(name.as_str()) {
+                            return None;
+                        }
+                        // The registry can carry several entries with the same
+                        // `display_name` — leftover "running" rows whose server
+                        // crashed before exit are not reaped. Walk them all and
+                        // pick the first Alive match; only surface the Stuck
+                        // error if no Alive candidate exists, so a single stale
+                        // Dead/Stuck row can't shadow the real session.
+                        let registry = zellij_utils::sessions::ensure_registry();
+                        let matches: Vec<_> = registry
+                            .running_sessions()
+                            .into_iter()
+                            .filter(|s| s.display_name == name)
+                            .collect();
+                        let mut saw_stuck = false;
+                        for entry in &matches {
+                            match check_session_state(&entry.id) {
+                                SessionLiveness::Alive => return Some(name),
+                                SessionLiveness::Stuck => saw_stuck = true,
+                                SessionLiveness::Dead => {},
+                            }
+                        }
+                        if saw_stuck {
+                            eprintln!(
+                                "Session '{name}' exists but its server is not responding \
+                                 (stuck).\n\
+                                 Run `zellij delete-session {name}` to clear it, or kill \
+                                 the server process, then try again."
+                            );
+                            process::exit(1);
+                        }
+                        None
                     })
                 } else {
                     None
