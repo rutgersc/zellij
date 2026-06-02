@@ -20,7 +20,10 @@
 //!
 //! Click any row of an agent → `mux focus-agent <session_id>`. Up/Down
 //! moves the keyboard cursor across agents, Enter activates, Esc returns
-//! focus to the previous pane.
+//! focus to the previous pane. While that `mux` command is in flight a
+//! braille spinner replaces the row's `>` marker (col 1), so a slow focus
+//! shows work happening right where you clicked; it clears on the matching
+//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS).
 //!
 //! Every distinguishable load state — awaiting permission, no $HOME in
 //! env, file missing/unreadable/unparseable, empty snapshot — has its own
@@ -38,6 +41,20 @@ use zellij_tile_utils::style;
 use crate::agents::{Agent, AgentStatus, ReadResult};
 
 const POLL_SECS: f64 = 1.5;
+/// Fast tick used only while a click's `mux focus-agent` is in flight, so the
+/// per-row spinner animates. We never stack timers — the single Timer handler
+/// re-arms at this rate while `in_flight` is non-empty and reverts to
+/// POLL_SECS once it drains — so the two cadences can't compound.
+const SPIN_SECS: f64 = 0.1;
+/// Spinner frames, one column wide each (braille reads cleanly in the marker
+/// cell). The in-flight row's age in fast ticks indexes this, mod its length.
+const SPIN_FRAMES: [char; 10] = [
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}',
+    '\u{2827}', '\u{2807}', '\u{280F}',
+];
+/// Safety cap: drop an in-flight row after this many fast ticks (~10s) even if
+/// its RunCommandResult never arrives, so a lost result can't spin forever.
+const MAX_SPIN_TICKS: u32 = 100;
 /// Hard cap on rows used to render a single agent's name. Past this we
 /// truncate with `…` — the full name is still on the snapshot.
 const MAX_NAME_LINES: usize = 4;
@@ -174,6 +191,15 @@ struct State {
     last_external_focused_pane: Option<u32>,
     /// Row scroll offset into the rendered line list.
     scroll_offset: usize,
+    /// session_ids whose `mux focus-agent` was dispatched but hasn't reported
+    /// back yet (cleared on RunCommandResult). The value is the row's age in
+    /// fast ticks — used both as the spinner frame index and the
+    /// MAX_SPIN_TICKS safety cap.
+    in_flight: HashMap<String, u32>,
+    /// Adaptive-timer accounting: the interval the currently-pending Timer was
+    /// armed at, and elapsed time accumulated toward the next readmodel poll.
+    cur_timeout: f64,
+    since_poll: f64,
 }
 
 register_plugin!(State);
@@ -225,6 +251,7 @@ impl ZellijPlugin for State {
                         },
                         None => LoadState::NoHomeInEnv,
                     };
+                    self.cur_timeout = POLL_SECS;
                     set_timeout(POLL_SECS);
                     return true;
                 }
@@ -262,18 +289,35 @@ impl ZellijPlugin for State {
                 changed
             },
             Event::Timer(_) => {
-                let mut changed = if let LoadState::Polling { path, last } = &mut self.load {
-                    let new = agents::read(path);
-                    let changed = !same_result(last.as_ref(), &new);
-                    *last = Some(new);
-                    changed
-                } else {
-                    false
-                };
-                if self.refresh_seen_disk() {
-                    changed = true;
+                // Advance any in-flight click spinners — this is what makes
+                // the marker glyph animate. Returns true (needs repaint) while
+                // anything is still spinning.
+                let mut changed = self.advance_spinners();
+
+                // Poll the readmodel at POLL_SECS regardless of how fast we're
+                // ticking for the spinner: accumulate the interval the pending
+                // timer was armed at and only re-read once a poll is due.
+                self.since_poll += self.cur_timeout;
+                if self.since_poll + 1e-9 >= POLL_SECS {
+                    self.since_poll = 0.0;
+                    if let LoadState::Polling { path, last } = &mut self.load {
+                        let new = agents::read(path);
+                        if !same_result(last.as_ref(), &new) {
+                            changed = true;
+                        }
+                        *last = Some(new);
+                    }
+                    if self.refresh_seen_disk() {
+                        changed = true;
+                    }
                 }
-                set_timeout(POLL_SECS);
+
+                // Re-arm: fast while a click is in flight (so the spinner
+                // spins), otherwise the normal poll cadence. This is the only
+                // set_timeout outside load, so exactly one timer is ever
+                // pending and the two rates can't stack.
+                self.cur_timeout = if self.in_flight.is_empty() { POLL_SECS } else { SPIN_SECS };
+                set_timeout(self.cur_timeout);
                 changed
             },
             Event::Mouse(Mouse::LeftClick(line, _col)) => {
@@ -285,6 +329,7 @@ impl ZellijPlugin for State {
                     .map(|(_, sid)| sid.clone());
                 if let Some(sid) = hit {
                     self.acknowledge_agent(&sid);
+                    self.in_flight.insert(sid.clone(), 0);
                     let _ = self.dispatch_focus_agent(&sid);
                     if let Some(idx) = self
                         .display_order()
@@ -337,6 +382,7 @@ impl ZellijPlugin for State {
                         .map(|a| a.session_id.clone())
                     {
                         self.acknowledge_agent(&sid);
+                        self.in_flight.insert(sid.clone(), 0);
                         let _ = self.dispatch_focus_agent(&sid);
                         return true;
                     }
@@ -366,7 +412,13 @@ impl ZellijPlugin for State {
                 }
                 false
             },
-            Event::RunCommandResult(_, _, _, _) => false,
+            Event::RunCommandResult(_, _, _, ctx) => {
+                // The dispatched `mux focus-agent` finished — stop its spinner.
+                match ctx.get("session_id") {
+                    Some(sid) => self.in_flight.remove(sid).is_some(),
+                    None => false,
+                }
+            },
             _ => false,
         }
     }
@@ -478,6 +530,8 @@ impl State {
         let label = sid.get(..8).unwrap_or(sid).to_string();
         let mut ctx = BTreeMap::new();
         ctx.insert("click_label".into(), label.clone());
+        // Echoed back on RunCommandResult so we can clear this row's spinner.
+        ctx.insert("session_id".into(), sid.to_string());
         run_command(&["mux", "focus-agent", sid], ctx);
         label
     }
@@ -522,6 +576,20 @@ impl State {
             let disk_seen = self.seen_disk.get(sid).copied().unwrap_or(0);
             *overlay_seen > disk_seen
         });
+    }
+
+    /// Tick every in-flight row's spinner age forward, dropping any that have
+    /// outlived MAX_SPIN_TICKS (the missing-RunCommandResult safety net).
+    /// Returns whether anything is still spinning — i.e. a repaint is due.
+    fn advance_spinners(&mut self) -> bool {
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        self.in_flight.retain(|_, age| {
+            *age += 1;
+            *age <= MAX_SPIN_TICKS
+        });
+        true
     }
 
     fn refresh_seen_disk(&mut self) -> bool {
@@ -616,6 +684,10 @@ impl State {
                 } => {
                     let selected = selected_sid.as_deref() == Some(sid.as_str());
                     self.row_ranges.push((visible_row, sid.clone()));
+                    let spinner = self
+                        .in_flight
+                        .get(sid)
+                        .map(|&age| SPIN_FRAMES[age as usize % SPIN_FRAMES.len()]);
                     render_agent_line(
                         text,
                         status.clone(),
@@ -624,6 +696,7 @@ impl State {
                         *is_in_view,
                         *is_first_wrap_line,
                         selected,
+                        spinner,
                         colors,
                         cols,
                     )
@@ -979,6 +1052,7 @@ fn render_agent_line(
     is_in_view: bool,
     is_first_wrap_line: bool,
     selected: bool,
+    spinner: Option<char>,
     colors: &AgentColors,
     cols: usize,
 ) -> String {
@@ -1046,14 +1120,20 @@ fn render_agent_line(
     // marker instead of washing out to on-colour. The unrouted `✗` stays the
     // error red, swapping to on-colour only on an alert (yellow/red) col 1
     // where red wouldn't read.
+    // An in-flight click spinner preempts the static marker on the first
+    // wrap-line, so the "working" feedback lands exactly on the row you
+    // clicked. It rides on the name fg, which is already chosen to read on
+    // col 1's bg.
     let marker_char = if !is_first_wrap_line {
         ' '
+    } else if let Some(spin) = spinner {
+        spin
     } else if unrouted {
         '\u{2717}' // ✗
     } else {
         '>'
     };
-    let marker_fg = if unrouted {
+    let marker_fg = if unrouted && spinner.is_none() {
         if alert { colors.on_color } else { colors.error }
     } else {
         name_fg
