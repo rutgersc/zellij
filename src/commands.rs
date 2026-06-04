@@ -641,10 +641,12 @@ fn attach_with_session_name(
 ) -> ClientInfo {
     match &session_name {
         Some(session) if create => {
-            if session_exists(session).unwrap() {
-                ClientInfo::Attach(session_name.unwrap(), config_options)
-            } else {
-                ClientInfo::New(session_name.unwrap(), None, None)
+            // Resolve case-insensitively to the canonical stored name so we
+            // attach to an existing `foo` even when the user typed `Foo`,
+            // rather than spawning a second case-variant session.
+            match match_session_name(session).unwrap() {
+                SessionNameMatch::Exact(s) => ClientInfo::Attach(s, config_options),
+                _ => ClientInfo::New(session_name.unwrap(), None, None),
             }
         },
         Some(prefix) => match match_session_name(prefix).unwrap() {

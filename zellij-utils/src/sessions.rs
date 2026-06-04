@@ -1065,14 +1065,27 @@ pub enum SessionNameMatch {
 pub fn match_session_name(prefix: &str) -> Result<SessionNameMatch, io::ErrorKind> {
     let sessions = get_sessions()?;
 
+    // A case-sensitive exact hit always wins — disambiguates any pre-existing
+    // `foo`/`Foo` pair created before case-overlap was enforced.
+    if let Some(s) = sessions.iter().find(|s| s.0 == prefix) {
+        return Ok(SessionNameMatch::Exact(s.0.clone()));
+    }
+    // Then a unique case-insensitive full-name match. Returns the *stored*
+    // name, never the user's input, so downstream socket/cache lookups (which
+    // stay case-sensitive) resolve correctly.
+    let ci_exact: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.0.eq_ignore_ascii_case(prefix))
+        .collect();
+    if let [s] = ci_exact[..] {
+        return Ok(SessionNameMatch::Exact(s.0.clone()));
+    }
+
+    let lower_prefix = prefix.to_lowercase();
     let filtered_sessions: Vec<_> = sessions
         .iter()
-        .filter(|s| s.0.starts_with(prefix))
+        .filter(|s| s.0.to_lowercase().starts_with(&lower_prefix))
         .collect();
-
-    if filtered_sessions.iter().any(|s| s.0 == prefix) {
-        return Ok(SessionNameMatch::Exact(prefix.to_string()));
-    }
 
     Ok({
         match &filtered_sessions[..] {
@@ -1177,6 +1190,12 @@ pub fn validate_session_name(name: &str) -> Result<(), String> {
             "Session name cannot be empty. Please provide a specific session name.".to_string(),
         );
     }
+    // ASCII-only keeps case-folding (eq_ignore_ascii_case, used to match and to
+    // reject case-overlapping names) provably correct — non-ASCII case folding
+    // is locale-dependent and would let near-duplicates slip through.
+    if !name.is_ascii() {
+        return Err("Session name must contain only ASCII characters.".to_string());
+    }
     if name == "." || name == ".." {
         return Err(format!("Invalid session name: \"{}\".", name));
     }
@@ -1195,7 +1214,7 @@ pub fn assert_session_ne(name: &str) {
     match session_exists(name) {
         Ok(result) if !result => {
             let resurrectable_sessions = get_resurrectable_session_names();
-            if resurrectable_sessions.iter().find(|s| s == &name).is_some() {
+            if resurrectable_sessions.iter().any(|s| s.eq_ignore_ascii_case(name)) {
                 println!("Session with name {:?} already exists, but is dead. Use the attach command to resurrect it or, the delete-session command to kill it or specify a different name.", name);
             } else {
                 return
@@ -1525,5 +1544,14 @@ mod tests {
             Some(SessionState::Exited)
         );
         assert_eq!(SessionState::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn validate_session_name_rejects_non_ascii() {
+        assert!(validate_session_name("café").is_err());
+        assert!(validate_session_name("日本語").is_err());
+        assert!(validate_session_name("emoji-🦀").is_err());
+        assert!(validate_session_name("normal-name_123").is_ok());
+        assert!(validate_session_name("Mixed_Case").is_ok());
     }
 }

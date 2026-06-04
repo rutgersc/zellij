@@ -8777,7 +8777,21 @@ pub(crate) fn screen_thread_main(
                 _completion_tx, // the action ends here, dropping this will release anything
                                 // waiting for it
             ) => {
-                if screen.peer_sessions_cache.contains_key(&name) {
+                if let Err(error_text) = zellij_utils::sessions::validate_session_name(&name) {
+                    log::error!("{}", error_text);
+                    if let Some(os_input) = &mut screen.bus.os_input {
+                        let _ = os_input.send_to_client(
+                            client_id,
+                            ServerToClientMsg::LogError {
+                                lines: vec![error_text],
+                            },
+                        );
+                    }
+                } else if screen
+                    .peer_sessions_cache
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(&name))
+                {
                     let error_text = "A session by this name already exists.";
                     log::error!("{}", error_text);
                     if let Some(os_input) = &mut screen.bus.os_input {
@@ -8788,7 +8802,11 @@ pub(crate) fn screen_thread_main(
                             },
                         );
                     }
-                } else if screen.resurrectable_sessions_cache.contains_key(&name) {
+                } else if screen
+                    .resurrectable_sessions_cache
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(&name))
+                {
                     let error_text =
                         "A resurrectable session by this name exists, cannot use this name.";
                     log::error!("{}", error_text);
