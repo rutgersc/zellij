@@ -173,6 +173,15 @@ keybinds {
         bind "$" { MoveCopyCursor "lineend"; }
         bind "g" { MoveCopyCursor "buffertop"; }
         bind "G" { MoveCopyCursor "bufferbottom"; }
+        bind "Ctrl u" { MoveCopyCursor "halfpageup"; }
+        bind "Ctrl d" { MoveCopyCursor "halfpagedown"; }
+        bind "Ctrl b" { MoveCopyCursor "pageup"; }
+        bind "Ctrl f" { MoveCopyCursor "pagedown"; }
+        bind "H" { MoveCopyCursor "screentop"; }
+        bind "M" { MoveCopyCursor "screenmiddle"; }
+        bind "L" { MoveCopyCursor "screenbottom"; }
+        bind "{" { MoveCopyCursor "paragraphbackward"; }
+        bind "}" { MoveCopyCursor "paragraphforward"; }
         bind "v" { ToggleCopyVisual; }
         bind "V" { ToggleCopyVisualLine; }
         bind "y" { CopyAndExitCopyMode; SwitchToMode "Normal"; }

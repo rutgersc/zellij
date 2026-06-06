@@ -112,6 +112,15 @@ pub enum CopyMotion {
     LineEnd,
     BufferTop,
     BufferBottom,
+    HalfPageUp,
+    HalfPageDown,
+    PageUp,
+    PageDown,
+    ScreenTop,
+    ScreenMiddle,
+    ScreenBottom,
+    ParagraphForward,
+    ParagraphBackward,
 }
 
 impl FromStr for CopyMotion {
@@ -130,6 +139,15 @@ impl FromStr for CopyMotion {
             "lineend" | "$" => Ok(CopyMotion::LineEnd),
             "buffertop" | "gg" | "top" => Ok(CopyMotion::BufferTop),
             "bufferbottom" | "G" | "bottom" => Ok(CopyMotion::BufferBottom),
+            "halfpageup" => Ok(CopyMotion::HalfPageUp),
+            "halfpagedown" => Ok(CopyMotion::HalfPageDown),
+            "pageup" => Ok(CopyMotion::PageUp),
+            "pagedown" => Ok(CopyMotion::PageDown),
+            "screentop" => Ok(CopyMotion::ScreenTop),
+            "screenmiddle" | "screenmid" => Ok(CopyMotion::ScreenMiddle),
+            "screenbottom" => Ok(CopyMotion::ScreenBottom),
+            "paragraphforward" | "}" => Ok(CopyMotion::ParagraphForward),
+            "paragraphbackward" | "{" => Ok(CopyMotion::ParagraphBackward),
             _ => Err(format!("Failed to parse CopyMotion. Unknown motion: {}", s)),
         }
     }

@@ -5138,6 +5138,14 @@ impl Grid {
                 .map(|r| r.columns.len())
                 .unwrap_or(0)
         };
+        // A row is "blank" (paragraph boundary) when empty or all-whitespace.
+        // Off-viewport indices count as blank so scans terminate at the edge.
+        let is_blank = |g: &Grid, l: isize| -> bool {
+            g.viewport
+                .get(l.max(0) as usize)
+                .map(|r| r.columns.iter().all(|c| c.character.is_whitespace()))
+                .unwrap_or(true)
+        };
 
         match motion {
             CopyMotion::Left => {
@@ -5214,6 +5222,88 @@ impl Grid {
                 let (nl, nc) = prev_word_start(&self.viewport, line, col);
                 line = nl;
                 col = nc;
+            },
+            // Multi-line vertical jumps. Walk one line at a time so the existing
+            // edge-scroll behaviour (scroll_up/down_one_line) carries the cursor
+            // past the viewport into scrollback, exactly like single-step j/k.
+            CopyMotion::HalfPageUp | CopyMotion::PageUp => {
+                let n = match motion {
+                    CopyMotion::HalfPageUp => (height / 2).max(1),
+                    _ => (height - 1).max(1),
+                };
+                for _ in 0..n {
+                    if line > 0 {
+                        line -= 1;
+                    } else {
+                        self.scroll_up_one_line();
+                    }
+                }
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::HalfPageDown | CopyMotion::PageDown => {
+                let n = match motion {
+                    CopyMotion::HalfPageDown => (height / 2).max(1),
+                    _ => (height - 1).max(1),
+                };
+                for _ in 0..n {
+                    if line < last_line {
+                        line += 1;
+                    } else {
+                        self.scroll_down_one_line();
+                    }
+                }
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            // Reposition within the visible viewport, no scroll (vim H/M/L).
+            CopyMotion::ScreenTop => {
+                line = 0;
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::ScreenMiddle => {
+                line = last_line / 2;
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::ScreenBottom => {
+                line = last_line;
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            // Step (scrolling at the edge) to the next/previous blank line. The
+            // first step always moves, so starting on a blank line skips it.
+            // `lines_above.len()` not advancing past a scroll means we hit the
+            // buffer edge with no blank found — stop there.
+            CopyMotion::ParagraphForward => {
+                loop {
+                    if line < last_line {
+                        line += 1;
+                    } else {
+                        let prev_above = self.lines_above.len();
+                        self.scroll_down_one_line();
+                        if self.lines_above.len() == prev_above {
+                            break;
+                        }
+                    }
+                    if is_blank(self, line) {
+                        break;
+                    }
+                }
+                col = 0;
+            },
+            CopyMotion::ParagraphBackward => {
+                loop {
+                    if line > 0 {
+                        line -= 1;
+                    } else {
+                        let prev_above = self.lines_above.len();
+                        self.scroll_up_one_line();
+                        if self.lines_above.len() == prev_above {
+                            break;
+                        }
+                    }
+                    if is_blank(self, line) {
+                        break;
+                    }
+                }
+                col = 0;
             },
         }
 
