@@ -173,6 +173,7 @@ keybinds {
         bind "g" { MoveCopyCursor "buffertop"; }
         bind "G" { MoveCopyCursor "bufferbottom"; }
         bind "v" { ToggleCopyVisual; }
+        bind "V" { ToggleCopyVisualLine; }
         bind "y" { CopyAndExitCopyMode; SwitchToMode "Normal"; }
     }
     tmux {

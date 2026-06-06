@@ -514,6 +514,14 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::ToggleCopyVisualLine => {
+            senders
+                .send_to_screen(ScreenInstruction::ToggleCopyVisualLine(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::CopyAndExitCopyMode => {
             senders
                 .send_to_screen(ScreenInstruction::CopyAndExitCopyMode(

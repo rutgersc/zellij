@@ -346,6 +346,7 @@ pub trait Pane {
     fn exit_copy_mode(&mut self, _client_id: ClientId) {}
     fn apply_copy_motion(&mut self, _motion: CopyMotion, _client_id: ClientId) {}
     fn toggle_copy_visual(&mut self, _client_id: ClientId) {}
+    fn toggle_copy_visual_line(&mut self, _client_id: ClientId) {}
     fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
         None
     }
@@ -4816,6 +4817,12 @@ impl Tab {
     pub fn toggle_copy_mode_visual(&mut self, client_id: ClientId) {
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             active_pane.toggle_copy_visual(client_id);
+        }
+    }
+
+    pub fn toggle_copy_mode_visual_line(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.toggle_copy_visual_line(client_id);
         }
     }
 

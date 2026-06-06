@@ -85,6 +85,7 @@ macro_rules! parse_kdl_action_arguments {
                 "NextSwapLayout" => Ok(Action::NextSwapLayout),
                 "Clear" => Ok(Action::ClearScreen),
                 "ToggleCopyVisual" => Ok(Action::ToggleCopyVisual),
+                "ToggleCopyVisualLine" => Ok(Action::ToggleCopyVisualLine),
                 "CopyAndExitCopyMode" => Ok(Action::CopyAndExitCopyMode),
                 _ => Err(ConfigError::new_kdl_error(
                     format!("Unsupported action: {:?}", $action_name),
@@ -1642,6 +1643,9 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
             "Copy" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
             "Clear" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
             "ToggleCopyVisual" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "ToggleCopyVisualLine" => {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
             },
             "CopyAndExitCopyMode" => {

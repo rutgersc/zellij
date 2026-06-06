@@ -410,6 +410,7 @@ pub enum ScreenInstruction {
     EditScrollback(ClientId, bool, Option<NotificationEnd>),
     MoveCopyCursor(ClientId, CopyMotion, Option<NotificationEnd>),
     ToggleCopyVisual(ClientId, Option<NotificationEnd>),
+    ToggleCopyVisualLine(ClientId, Option<NotificationEnd>),
     CopyAndExitCopyMode(ClientId, Option<NotificationEnd>),
     GetPaneScrollback {
         pane_id: PaneId,
@@ -951,6 +952,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::EditScrollback(..) => ScreenContext::EditScrollback,
             ScreenInstruction::MoveCopyCursor(..) => ScreenContext::MoveCopyCursor,
             ScreenInstruction::ToggleCopyVisual(..) => ScreenContext::ToggleCopyVisual,
+            ScreenInstruction::ToggleCopyVisualLine(..) => ScreenContext::ToggleCopyVisualLine,
             ScreenInstruction::CopyAndExitCopyMode(..) => ScreenContext::CopyAndExitCopyMode,
             ScreenInstruction::GetPaneScrollback { .. } => ScreenContext::GetPaneScrollback,
             ScreenInstruction::ScrollUp(..) => ScreenContext::ScrollUp,
@@ -6624,6 +6626,15 @@ pub(crate) fn screen_thread_main(
                     screen,
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| tab.toggle_copy_mode_visual(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::ToggleCopyVisualLine(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .toggle_copy_mode_visual_line(client_id)
                 );
                 screen.render(None)?;
             },

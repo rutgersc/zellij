@@ -726,6 +726,11 @@ impl Pane for TerminalPane {
         self.set_should_render(true);
     }
 
+    fn toggle_copy_visual_line(&mut self, _client_id: ClientId) {
+        self.grid.toggle_copy_visual_line();
+        self.set_should_render(true);
+    }
+
     fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
         let text = self.grid.copy_mode_yank_text();
         self.set_should_render(true);

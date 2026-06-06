@@ -1835,6 +1835,7 @@ impl From<crate::input::actions::Action>
             // Map to NoOp so plugin-API conversions don't error.
             crate::input::actions::Action::MoveCopyCursor { .. }
             | crate::input::actions::Action::ToggleCopyVisual
+            | crate::input::actions::Action::ToggleCopyVisualLine
             | crate::input::actions::Action::CopyAndExitCopyMode => {
                 ActionType::NoOp(NoOpAction {})
             },

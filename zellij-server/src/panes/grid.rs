@@ -5012,6 +5012,9 @@ fn is_selection_boundary_character(character: char) -> bool {
 pub struct CopyModeState {
     pub cursor: Position,
     pub anchor: Option<Position>,
+    /// When a visual selection is active (`anchor.is_some()`), whether it is
+    /// linewise (vim `V`) rather than charwise (vim `v`). Dormant otherwise.
+    pub linewise: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5040,6 +5043,7 @@ impl Grid {
         self.copy_mode = Some(CopyModeState {
             cursor,
             anchor: None,
+            linewise: false,
         });
         self.selection.reset();
         self.sync_selection_to_copy_cursor();
@@ -5055,12 +5059,35 @@ impl Grid {
         self.mark_for_rerender();
     }
 
+    /// Vim `v`: enter charwise visual, leave it if already charwise, or switch
+    /// down from linewise to charwise (keeping the anchor).
     pub fn toggle_copy_visual(&mut self) {
         if let Some(state) = self.copy_mode.as_mut() {
-            state.anchor = match state.anchor {
-                Some(_) => None,
-                None => Some(state.cursor),
-            };
+            match (state.anchor, state.linewise) {
+                (Some(_), true) => state.linewise = false,
+                (Some(_), false) => state.anchor = None,
+                (None, _) => {
+                    state.anchor = Some(state.cursor);
+                    state.linewise = false;
+                },
+            }
+            self.sync_selection_to_copy_cursor();
+            self.mark_for_rerender();
+        }
+    }
+
+    /// Vim `V`: enter linewise visual, leave it if already linewise, or switch
+    /// up from charwise to linewise (keeping the anchor).
+    pub fn toggle_copy_visual_line(&mut self) {
+        if let Some(state) = self.copy_mode.as_mut() {
+            match (state.anchor, state.linewise) {
+                (Some(_), false) => state.linewise = true,
+                (Some(_), true) => state.anchor = None,
+                (None, _) => {
+                    state.anchor = Some(state.cursor);
+                    state.linewise = true;
+                },
+            }
             self.sync_selection_to_copy_cursor();
             self.mark_for_rerender();
         }
@@ -5216,6 +5243,16 @@ impl Grid {
         };
         let cursor = state.cursor;
         match state.anchor {
+            Some(anchor) if state.linewise => {
+                // Whole-line span: from column 0 of the topmost line to one past
+                // the last column of the bottommost line. `get_selected_text` and
+                // the highlight both read an end column of `width` as "full row".
+                let top = anchor.line.0.min(cursor.line.0);
+                let bottom = anchor.line.0.max(cursor.line.0);
+                let start = Position::new(top as i32, 0);
+                let end = Position::new(bottom as i32, self.width as u16);
+                self.selection.set_start_and_end_positions(start, end);
+            },
             Some(anchor) => {
                 let (start, end) = if (anchor.line, anchor.column) <= (cursor.line, cursor.column) {
                     (anchor, end_inclusive(cursor))

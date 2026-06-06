@@ -230,8 +230,10 @@ pub enum Action {
     MoveCopyCursor {
         motion: CopyMotion,
     },
-    /// Toggle visual selection in the active pane's copy mode.
+    /// Toggle charwise (vim `v`) visual selection in the active pane's copy mode.
     ToggleCopyVisual,
+    /// Toggle linewise (vim `V`) visual selection in the active pane's copy mode.
+    ToggleCopyVisualLine,
     /// Yank the current copy-mode selection to the system clipboard and exit copy mode.
     CopyAndExitCopyMode,
     /// Scroll up in focus pane.
