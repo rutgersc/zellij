@@ -1836,6 +1836,7 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::MoveCopyCursor { .. }
             | crate::input::actions::Action::ToggleCopyVisual
             | crate::input::actions::Action::ToggleCopyVisualLine
+            | crate::input::actions::Action::CopyModeEscape
             | crate::input::actions::Action::CopyAndExitCopyMode => {
                 ActionType::NoOp(NoOpAction {})
             },

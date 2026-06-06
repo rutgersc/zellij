@@ -159,7 +159,8 @@ keybinds {
         }
     }
     copymode {
-        bind "Esc" "q" { SwitchToMode "Normal"; }
+        bind "Esc" { CopyModeEscape; }
+        bind "q" { SwitchToMode "Normal"; }
         bind "h" "Left" { MoveCopyCursor "left"; }
         bind "j" "Down" { MoveCopyCursor "down"; }
         bind "k" "Up" { MoveCopyCursor "up"; }

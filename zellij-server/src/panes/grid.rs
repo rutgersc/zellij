@@ -5093,6 +5093,22 @@ impl Grid {
         }
     }
 
+    /// Returns `true` if an active visual selection was cancelled (cursor stays
+    /// in copy mode), `false` if there was nothing to cancel — in which case the
+    /// caller should leave copy mode.
+    pub fn copy_mode_escape(&mut self) -> bool {
+        let has_visual = self.copy_mode.map_or(false, |s| s.anchor.is_some());
+        if has_visual {
+            if let Some(state) = self.copy_mode.as_mut() {
+                state.anchor = None;
+                state.linewise = false;
+            }
+            self.sync_selection_to_copy_cursor();
+            self.mark_for_rerender();
+        }
+        has_visual
+    }
+
     pub fn copy_mode_yank_text(&mut self) -> Option<String> {
         if self.copy_mode.is_none() {
             return None;

@@ -234,6 +234,9 @@ pub enum Action {
     ToggleCopyVisual,
     /// Toggle linewise (vim `V`) visual selection in the active pane's copy mode.
     ToggleCopyVisualLine,
+    /// Escape within copy mode: clear an active visual selection if one exists,
+    /// otherwise leave copy mode (switch to the client's default input mode).
+    CopyModeEscape,
     /// Yank the current copy-mode selection to the system clipboard and exit copy mode.
     CopyAndExitCopyMode,
     /// Scroll up in focus pane.

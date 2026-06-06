@@ -731,6 +731,14 @@ impl Pane for TerminalPane {
         self.set_should_render(true);
     }
 
+    fn copy_mode_escape(&mut self, _client_id: ClientId) -> bool {
+        let cleared_visual = self.grid.copy_mode_escape();
+        if cleared_visual {
+            self.set_should_render(true);
+        }
+        cleared_visual
+    }
+
     fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
         let text = self.grid.copy_mode_yank_text();
         self.set_should_render(true);

@@ -411,6 +411,7 @@ pub enum ScreenInstruction {
     MoveCopyCursor(ClientId, CopyMotion, Option<NotificationEnd>),
     ToggleCopyVisual(ClientId, Option<NotificationEnd>),
     ToggleCopyVisualLine(ClientId, Option<NotificationEnd>),
+    CopyModeEscape(ClientId, InputMode, Option<NotificationEnd>),
     CopyAndExitCopyMode(ClientId, Option<NotificationEnd>),
     GetPaneScrollback {
         pane_id: PaneId,
@@ -953,6 +954,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::MoveCopyCursor(..) => ScreenContext::MoveCopyCursor,
             ScreenInstruction::ToggleCopyVisual(..) => ScreenContext::ToggleCopyVisual,
             ScreenInstruction::ToggleCopyVisualLine(..) => ScreenContext::ToggleCopyVisualLine,
+            ScreenInstruction::CopyModeEscape(..) => ScreenContext::CopyModeEscape,
             ScreenInstruction::CopyAndExitCopyMode(..) => ScreenContext::CopyAndExitCopyMode,
             ScreenInstruction::GetPaneScrollback { .. } => ScreenContext::GetPaneScrollback,
             ScreenInstruction::ScrollUp(..) => ScreenContext::ScrollUp,
@@ -6637,6 +6639,26 @@ pub(crate) fn screen_thread_main(
                         .toggle_copy_mode_visual_line(client_id)
                 );
                 screen.render(None)?;
+            },
+            ScreenInstruction::CopyModeEscape(client_id, default_mode, _completion_tx) => {
+                // First Esc cancels an active visual selection; a second Esc (no
+                // selection left) leaves copy mode for the client's default mode.
+                let cleared_visual = match screen.get_active_tab_mut(client_id) {
+                    Ok(tab) => tab.copy_mode_escape(client_id),
+                    Err(_) => false,
+                };
+                if cleared_visual {
+                    screen.render(None)?;
+                } else {
+                    // Mirror SwitchToMode: update the server-side keybind mode
+                    // registry as well as the rendered mode_info, or they desync.
+                    screen
+                        .bus
+                        .senders
+                        .send_to_server(ServerInstruction::ChangeMode(client_id, default_mode))?;
+                    screen.change_mode(default_mode, Some(default_mode), client_id)?;
+                    screen.render(None)?;
+                }
             },
             ScreenInstruction::CopyAndExitCopyMode(client_id, _completion_tx) => {
                 active_tab_and_connected_client_id!(

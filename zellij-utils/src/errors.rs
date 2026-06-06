@@ -268,6 +268,7 @@ pub enum ScreenContext {
     MoveCopyCursor,
     ToggleCopyVisual,
     ToggleCopyVisualLine,
+    CopyModeEscape,
     CopyAndExitCopyMode,
     GetPaneScrollback,
     ScrollUp,

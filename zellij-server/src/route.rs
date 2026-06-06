@@ -522,6 +522,15 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::CopyModeEscape => {
+            senders
+                .send_to_screen(ScreenInstruction::CopyModeEscape(
+                    client_id,
+                    default_mode,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::CopyAndExitCopyMode => {
             senders
                 .send_to_screen(ScreenInstruction::CopyAndExitCopyMode(

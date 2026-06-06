@@ -347,6 +347,9 @@ pub trait Pane {
     fn apply_copy_motion(&mut self, _motion: CopyMotion, _client_id: ClientId) {}
     fn toggle_copy_visual(&mut self, _client_id: ClientId) {}
     fn toggle_copy_visual_line(&mut self, _client_id: ClientId) {}
+    fn copy_mode_escape(&mut self, _client_id: ClientId) -> bool {
+        false
+    }
     fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
         None
     }
@@ -4824,6 +4827,14 @@ impl Tab {
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             active_pane.toggle_copy_visual_line(client_id);
         }
+    }
+
+    /// Returns `true` if a visual selection was cancelled (stay in copy mode),
+    /// `false` if there was nothing to cancel (caller should exit copy mode).
+    pub fn copy_mode_escape(&mut self, client_id: ClientId) -> bool {
+        self.get_active_pane_or_floating_pane_mut(client_id)
+            .map(|p| p.copy_mode_escape(client_id))
+            .unwrap_or(false)
     }
 
     pub fn copy_mode_yank(&mut self, client_id: ClientId) -> Result<()> {
