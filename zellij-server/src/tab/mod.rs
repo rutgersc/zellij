@@ -353,6 +353,7 @@ pub trait Pane {
     fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
         None
     }
+    fn search_copy_mode_selection(&mut self, _client_id: ClientId) {}
     fn set_pane_default_colors(&mut self, _fg: Option<String>, _bg: Option<String>) {}
     fn get_pane_default_colors(&self) -> (Option<String>, Option<String>) {
         (None, None)
@@ -4808,6 +4809,12 @@ impl Tab {
     pub fn exit_copy_mode_in_active_pane(&mut self, client_id: ClientId) {
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             active_pane.exit_copy_mode(client_id);
+        }
+    }
+
+    pub fn search_copy_mode_selection_in_active_pane(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.search_copy_mode_selection(client_id);
         }
     }
 

@@ -5122,6 +5122,18 @@ impl Grid {
         text
     }
 
+    /// The current visual selection as a single-line search needle, or `None`
+    /// when no visual selection is active — so leaving copy mode for search with
+    /// nothing selected keeps any prior search untouched. Multi-line selections
+    /// collapse to their first line; a search needle is a single-row pattern.
+    pub fn copy_mode_selection_for_search(&self) -> Option<String> {
+        let state = self.copy_mode?;
+        state.anchor?;
+        let text = self.get_selected_text()?;
+        let first_line = text.lines().next().unwrap_or("");
+        (!first_line.is_empty()).then(|| first_line.to_string())
+    }
+
     pub fn apply_copy_motion(&mut self, motion: CopyMotion) {
         let Some(state) = self.copy_mode else {
             return;

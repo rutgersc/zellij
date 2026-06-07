@@ -3828,6 +3828,12 @@ impl Screen {
             }
         } else if previous_mode == InputMode::CopyMode && mode_info.mode != InputMode::CopyMode {
             if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
+                // Leaving copy mode for search: an active visual selection becomes the
+                // new search query. With nothing selected this is a no-op, so any prior
+                // search survives intact — a plain trip back to where the jump came from.
+                if mode_info.mode == InputMode::Search {
+                    active_tab.search_copy_mode_selection_in_active_pane(client_id);
+                }
                 active_tab.exit_copy_mode_in_active_pane(client_id);
             }
         }

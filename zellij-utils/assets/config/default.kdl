@@ -188,6 +188,8 @@ keybinds {
         bind "v" { ToggleCopyVisual; }
         bind "V" { ToggleCopyVisualLine; }
         bind "y" { CopyAndExitCopyMode; SwitchToMode "Normal"; }
+        // Back to search: a visual selection seeds a new search, else the prior search is kept.
+        bind "s" { SwitchToMode "Search"; }
     }
     tmux {
         bind "[" { SwitchToMode "Scroll"; }

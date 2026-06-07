@@ -716,6 +716,15 @@ impl Pane for TerminalPane {
         self.set_should_render(true);
     }
 
+    fn search_copy_mode_selection(&mut self, _client_id: ClientId) {
+        if let Some(needle) = self.grid.copy_mode_selection_for_search() {
+            self.search_term = needle.clone();
+            self.grid.clear_search();
+            self.grid.set_search_string(&needle);
+            self.set_should_render(true);
+        }
+    }
+
     fn apply_copy_motion(&mut self, motion: CopyMotion, _client_id: ClientId) {
         self.grid.apply_copy_motion(motion);
         self.set_should_render(true);
