@@ -121,6 +121,10 @@ pub enum CopyMotion {
     ScreenBottom,
     ParagraphForward,
     ParagraphBackward,
+    /// Jump to the first character of the active search hit (or the first match
+    /// in the viewport if none is active yet). Lets a search hand off directly
+    /// into copy mode landed on the result.
+    SearchResult,
 }
 
 impl FromStr for CopyMotion {
@@ -148,6 +152,7 @@ impl FromStr for CopyMotion {
             "screenbottom" => Ok(CopyMotion::ScreenBottom),
             "paragraphforward" | "}" => Ok(CopyMotion::ParagraphForward),
             "paragraphbackward" | "{" => Ok(CopyMotion::ParagraphBackward),
+            "searchresult" | "searchhit" => Ok(CopyMotion::SearchResult),
             _ => Err(format!("Failed to parse CopyMotion. Unknown motion: {}", s)),
         }
     }

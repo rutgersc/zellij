@@ -5305,6 +5305,21 @@ impl Grid {
                 }
                 col = 0;
             },
+            // Land on the start of the search hit the user just navigated to.
+            // `active` is the n/p-selected hit; before any navigation we fall
+            // back to the first match in view. The search has already scrolled
+            // the hit into the viewport, so its coordinates are valid as-is.
+            // No matches → leave the cursor where entering copy mode put it.
+            CopyMotion::SearchResult => {
+                let target = self
+                    .search_results
+                    .active
+                    .or_else(|| self.search_results.selections.first().copied());
+                if let Some(sel) = target {
+                    line = sel.start.line().min(last_line).max(0);
+                    col = sel.start.column().min(row_len(self, line).saturating_sub(1));
+                }
+            },
         }
 
         if let Some(state) = self.copy_mode.as_mut() {

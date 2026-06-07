@@ -3791,8 +3791,15 @@ impl Screen {
             )
         };
 
-        // If we leave the Search-related modes, we need to clear all previous searches
-        let search_related_modes = [InputMode::EnterSearch, InputMode::Search, InputMode::Scroll];
+        // If we leave the Search-related modes, we need to clear all previous searches.
+        // CopyMode counts as search-related so a Search/Scroll -> CopyMode jump keeps the
+        // hits (copy mode lands the cursor on the active one); they're cleared on the way out.
+        let search_related_modes = [
+            InputMode::EnterSearch,
+            InputMode::Search,
+            InputMode::Scroll,
+            InputMode::CopyMode,
+        ];
         if search_related_modes.contains(&previous_mode)
             && !search_related_modes.contains(&mode_info.mode)
         {
