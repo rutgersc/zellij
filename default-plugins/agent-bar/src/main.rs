@@ -76,17 +76,21 @@ const SESSIONLESS_LABEL: &str = "sessionless";
 //
 //   col 0      → grey if selected, else neutral.
 //   col 1 & 2  → in-view green · else alert (yellow, or red if unknown) · else
-//                selected grey · else neutral.
-//   col 3 name → alert (yellow/red) · else in-view green · else selected grey
-//                · else neutral.   (in-view outranks alert on cols 1-2 but
-//                alert outranks in-view on the body — that's the "carve".)
+//                selected grey · else neutral.   (context tint survives
+//                selection here — the middle keeps its green/yellow.)
+//   col 3 name → selected grey · else alert (yellow/red) · else in-view green
+//                · else neutral.   (selection outranks everything on the body,
+//                so a highlighted row is unmissable even when green/yellow.)
 //
-// Name fg always encodes status, picking a hue that reads on its body bg:
-//   busy    → magenta (reads on neutral/grey/green/yellow alike).
+// Name fg: selection overrides the status hue (selected-fg on selected-bg is a
+// high-contrast pair); otherwise it encodes status, picking a hue legible on
+// its body bg:
+//   busy    → magenta (reads on neutral/green/yellow alike).
 //   unknown → on-colour (its body is red).
-//   idle /  → text on a neutral body, selected-fg on grey, on-colour on a
-//   waiting    green/yellow body (colourless states carry no hue to lose).
-// The `>` marker takes on-colour over any tinted col 1, else the name fg.
+//   idle /  → text on a neutral body, on-colour on a green/yellow body
+//   waiting    (colourless states carry no hue to lose).
+// The `>` marker rides on col 1 (the middle), so it takes on-colour over a
+// tinted middle, selected-fg over a selected-grey middle, else the name fg.
 //
 // All colours resolve from `mode_info.style.colors` so a ChangeTheme repaints
 // everything at once — green/yellow/on-colour/magenta come from ribbon_selected,
@@ -1063,10 +1067,16 @@ fn render_agent_line(
     let alert = needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown;
     let alert_color = if is_unknown { colors.error } else { colors.yellow };
 
+    // Selection is the dominant signal: when a row is selected it claims the
+    // BODY (col 3) bg + the name fg outright, so the highlight is unmissable
+    // even on a green/yellow row. Only the MIDDLE (col 1/2) keeps the context
+    // tint, so a selected row still shows a sliver of its green/yellow there.
+    //
     // col 0   → selected grey, else neutral.
-    // col 1/2 → in-view green · alert · selected grey · neutral.
-    // col 3   → alert · in-view green · selected grey · neutral.  (in-view
-    //           outranks alert on cols 1-2; alert outranks in-view on col 3.)
+    // col 1/2 → in-view green · alert · selected grey · neutral.  (context tint
+    //           survives selection here — green outranks alert.)
+    // col 3   → selected grey · alert · in-view green · neutral.  (selection
+    //           outranks everything on the body.)
     let col0_bg = if selected { colors.selected_bg } else { colors.bar_bg };
     let mid_bg = if is_in_view {
         colors.green
@@ -1077,29 +1087,29 @@ fn render_agent_line(
     } else {
         colors.bar_bg
     };
-    let body_bg = if alert {
+    let body_bg = if selected {
+        colors.selected_bg
+    } else if alert {
         alert_color
     } else if is_in_view {
         colors.green
-    } else if selected {
-        colors.selected_bg
     } else {
         colors.bar_bg
     };
 
-    // Name fg encodes status, choosing a hue that reads on the body bg. Busy's
-    // magenta reads on every bg (and never lands on red, since unknown != busy).
-    // Idle/waiting carry no hue, so on a tinted body they take the legible
-    // on-colour rather than washing out.
+    // Name fg: selection overrides the status hue so the body always reads as
+    // selected-fg-on-selected-bg (a deliberately high-contrast pair). Otherwise
+    // it encodes status, choosing a hue that reads on the body bg — busy's
+    // magenta reads on every bg, idle/waiting take on-colour on a tinted body.
     let body_tinted = alert || is_in_view;
-    let name_fg = if matches!(status, AgentStatus::Busy) {
+    let name_fg = if selected {
+        colors.selected_fg
+    } else if matches!(status, AgentStatus::Busy) {
         colors.magenta
     } else if is_unknown {
         colors.on_color // body is red
     } else if body_tinted {
         colors.on_color // green / yellow body
-    } else if selected {
-        colors.selected_fg
     } else {
         colors.text
     };
@@ -1115,15 +1125,9 @@ fn render_agent_line(
     };
 
     // Marker (col 1), first wrap-line only (blanked on continuations so stacked
-    // agents stay distinct). `>` simply follows the name fg — which is already
-    // chosen to read on the col 1 bg — so a busy+selected row keeps its magenta
-    // marker instead of washing out to on-colour. The unrouted `✗` stays the
-    // error red, swapping to on-colour only on an alert (yellow/red) col 1
-    // where red wouldn't read.
-    // An in-flight click spinner preempts the static marker on the first
-    // wrap-line, so the "working" feedback lands exactly on the row you
-    // clicked. It rides on the name fg, which is already chosen to read on
-    // col 1's bg.
+    // agents stay distinct). An in-flight click spinner preempts the static
+    // marker on the first wrap-line, so the "working" feedback lands exactly on
+    // the row you clicked.
     let marker_char = if !is_first_wrap_line {
         ' '
     } else if let Some(spin) = spinner {
@@ -1133,8 +1137,17 @@ fn render_agent_line(
     } else {
         '>'
     };
+    // The marker rides on `mid_bg`, NOT the body, so its fg is chosen to read
+    // on the middle tint rather than on the (possibly selected) body. On a
+    // green/yellow middle it takes on-colour; on a selected-grey middle the
+    // selected fg; otherwise the name fg. The unrouted `✗` stays error red,
+    // swapping to on-colour only where red wouldn't read.
     let marker_fg = if unrouted && spinner.is_none() {
-        if alert { colors.on_color } else { colors.error }
+        if is_in_view || alert { colors.on_color } else { colors.error }
+    } else if is_in_view || alert {
+        colors.on_color
+    } else if selected {
+        colors.selected_fg
     } else {
         name_fg
     };
