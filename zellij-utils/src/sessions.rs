@@ -505,11 +505,25 @@ pub fn reap_stale_running_entries() -> io::Result<usize> {
 /// — removing them would orphan a possibly-still-running zellij server.
 /// The user clears those explicitly via `delete-session --force <name>`.
 pub fn reap_dead_registry_entries() -> io::Result<Vec<(String, String)>> {
+    reap_dead_registry_entries_where(|_| true)
+}
+
+/// Like [`reap_dead_registry_entries`] but scoped to a single display name, so
+/// `delete-session <name>` can clear one stale row without the blast radius of
+/// `delete-all-sessions`. Same Dead-only liveness filter — a live or stuck
+/// namesake is never removed.
+pub fn reap_dead_registry_entries_named(name: &str) -> io::Result<Vec<(String, String)>> {
+    reap_dead_registry_entries_where(|entry| entry.display_name == name)
+}
+
+fn reap_dead_registry_entries_where(
+    keep: impl Fn(&SessionEntry) -> bool,
+) -> io::Result<Vec<(String, String)>> {
     let registry = ensure_registry();
     let dead: Vec<(String, String)> = registry
         .running_sessions()
-        .iter()
-        .filter(|s| matches!(check_session_state(&s.id), SessionLiveness::Dead))
+        .into_iter()
+        .filter(|s| keep(s) && matches!(check_session_state(&s.id), SessionLiveness::Dead))
         .map(|s| (s.id.clone(), s.display_name.clone()))
         .collect();
     if dead.is_empty() {
@@ -986,15 +1000,26 @@ pub fn delete_session(name: &str, force: bool) {
             }
         });
     }
-    if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(name)) {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            eprintln!("Session: {:?} not found.", name);
-            process::exit(2);
-        } else {
-            log::error!("Failed to remove session {:?}: {:?}", name, e);
-        }
-    } else {
-        println!("Session: {:?} successfully deleted.", name);
+    // Clear any stale "running" registry rows for this name whose server is
+    // gone. The Dead hint in `list_sessions` ("run `zellij delete-session` to
+    // clear") promised this; without it the row outlived the cache folder and
+    // a folderless Dead entry only ever produced "not found" below. Dead-only,
+    // so a live/stuck namesake is never touched.
+    let reaped = reap_dead_registry_entries_named(name).unwrap_or_else(|e| {
+        log::error!("Failed to reap dead registry entries for {:?}: {:?}", name, e);
+        Vec::new()
+    });
+
+    match std::fs::remove_dir_all(session_info_folder_for_session(name)) {
+        Ok(()) => println!("Session: {:?} successfully deleted.", name),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if reaped.is_empty() {
+                eprintln!("Session: {:?} not found.", name);
+                process::exit(2);
+            }
+            println!("Session: {:?} cleared (stale registry entry).", name);
+        },
+        Err(e) => log::error!("Failed to remove session {:?}: {:?}", name, e),
     }
 }
 
