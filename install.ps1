@@ -61,14 +61,19 @@ if (-not $CopyOnly) {
         Start-Sleep -Milliseconds 300
     }
 
-    # --- 3. cargo install ---
+    # --- 3. build via xtask ---
+    # `cargo install` does NOT rebuild the bundled wasm plugins, so it re-embeds
+    # whatever stale plugins sit in target/ (unstripped, ~8MB each -> ~124MB binary).
+    # xtask build-release rebuilds the plugins under [profile.release] (strip=true),
+    # shrinking each to ~2MB and the no-web binary to ~40MB.
     Push-Location $repo
     try {
-        cargo install --path . --no-default-features --features web_server_capability --force
-        if ($LASTEXITCODE -ne 0) { throw "cargo install failed (exit $LASTEXITCODE)" }
+        cargo xtask ci build-release --no-web
+        if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location
     }
+    Copy-Item (Join-Path $repo 'target\release\zellij.exe') (Join-Path $cargoBin 'zellij.exe') -Force
 }
 
 # --- 4. Sideload ConPTY pair next to zellij.exe ---
