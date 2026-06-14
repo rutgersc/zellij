@@ -54,7 +54,7 @@ if (-not (Test-Path $conpty) -or -not (Test-Path $openConsole) -or $cacheVer -ne
 
 if (-not $CopyOnly) {
     # --- 2. Stop running zellij so the .exe is unlocked ---
-    $running = @(Get-Process zellij -ErrorAction SilentlyContinue)
+    $running = @(Get-Process zellij, zellijctl -ErrorAction SilentlyContinue)
     if ($running.Count -gt 0) {
         Write-Host "stopping $($running.Count) running zellij process(es) ..."
         $running | Stop-Process -Force
@@ -66,14 +66,21 @@ if (-not $CopyOnly) {
     # whatever stale plugins sit in target/ (unstripped, ~8MB each -> ~124MB binary).
     # xtask build-release rebuilds the plugins under [profile.release] (strip=true),
     # shrinking each to ~2MB and the no-web binary to ~40MB.
+    #
+    # zellijctl is the small client-only dispatcher mux shells out to; it's not
+    # part of the xtask release, so build it explicitly (links zellij-client +
+    # zellij-utils only — no plugins, no server, no vendored_curl/OpenSSL step).
     Push-Location $repo
     try {
         cargo xtask ci build-release --no-web
         if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
+        cargo build --release -p zellijctl
+        if ($LASTEXITCODE -ne 0) { throw "zellijctl build failed (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location
     }
-    Copy-Item (Join-Path $repo 'target\release\zellij.exe') (Join-Path $cargoBin 'zellij.exe') -Force
+    Copy-Item (Join-Path $repo 'target\release\zellij.exe')    (Join-Path $cargoBin 'zellij.exe')    -Force
+    Copy-Item (Join-Path $repo 'target\release\zellijctl.exe') (Join-Path $cargoBin 'zellijctl.exe') -Force
 }
 
 # --- 4. Sideload ConPTY pair next to zellij.exe ---

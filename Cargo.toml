@@ -67,6 +67,7 @@ members = [
     "zellij-tile",
     "zellij-tile-utils",
     "xtask",
+    "zellijctl",
     ".",
 ]
 
