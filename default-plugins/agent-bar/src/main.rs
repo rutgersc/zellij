@@ -89,8 +89,9 @@ const SESSIONLESS_LABEL: &str = "sessionless";
 //   unknown → on-colour (its body is red).
 //   idle /  → text on a neutral body, on-colour on a green/yellow body
 //   waiting    (colourless states carry no hue to lose).
-// The `>` marker rides on col 1 (the middle), so it takes on-colour over a
-// tinted middle, selected-fg over a selected-grey middle, else the name fg.
+// The `>` marker rides on col 1 (the middle): selection wins first (selected-fg,
+// matching the name so the selected row's marker + name are one solid highlight),
+// else on-colour over a tinted middle, else the name fg.
 //
 // All colours resolve from `mode_info.style.colors` so a ChangeTheme repaints
 // everything at once — green/yellow/on-colour/magenta come from ribbon_selected,
@@ -1137,17 +1138,18 @@ fn render_agent_line(
     } else {
         '>'
     };
-    // The marker rides on `mid_bg`, NOT the body, so its fg is chosen to read
-    // on the middle tint rather than on the (possibly selected) body. On a
-    // green/yellow middle it takes on-colour; on a selected-grey middle the
-    // selected fg; otherwise the name fg. The unrouted `✗` stays error red,
-    // swapping to on-colour only where red wouldn't read.
+    // The marker rides on `mid_bg`, NOT the body. Selection wins first so a
+    // selected row's `>` matches its name (both `selected_fg`) and the cursor
+    // reads as one solid highlight — even when the middle keeps a green/yellow
+    // tint. Otherwise the marker takes on-colour over a tinted middle, else the
+    // name fg. The unrouted `✗` stays error red (its own signal), swapping to
+    // on-colour only where red wouldn't read.
     let marker_fg = if unrouted && spinner.is_none() {
         if is_in_view || alert { colors.on_color } else { colors.error }
-    } else if is_in_view || alert {
-        colors.on_color
     } else if selected {
         colors.selected_fg
+    } else if is_in_view || alert {
+        colors.on_color
     } else {
         name_fg
     };
