@@ -18,12 +18,22 @@
 //! overwrite (see the palette block below). `✗` after the session header marks
 //! agents missing a `zellij_pane_id`.
 //!
+//! An agent whose live heartbeat is gone is kept as *tracked-but-not-active*
+//! (the daemon carries it forward as `active: false`): it renders dim with a
+//! `†` marker and no in-view/alert tint, so the list stays a durable history
+//! until the user clears it. `x` dismisses the selected inactive row — it
+//! writes an `AgentDismissed` tombstone to `agent-dismissed-events/` (the
+//! daemon then drops it from the readmodel) and hides it optimistically. Live
+//! rows ignore `x`.
+//!
 //! Click any row of an agent → `mux focus-agent <session_id>`. Up/Down
-//! moves the keyboard cursor across agents, Enter activates, Esc returns
-//! focus to the previous pane. While that `mux` command is in flight a
-//! braille spinner replaces the row's `>` marker (col 1), so a slow focus
-//! shows work happening right where you clicked; it clears on the matching
-//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS).
+//! moves the keyboard cursor across agents, Enter activates, `y` yanks the id,
+//! `x` dismisses an inactive row, Esc returns focus to the previous pane.
+//! Clicking/Enter on an inactive row only selects it (no pane to focus). While
+//! that `mux` command is in flight a braille spinner replaces the row's `>`
+//! marker (col 1), so a slow focus shows work happening right where you
+//! clicked; it clears on the matching RunCommandResult (or, as a safety net,
+//! after MAX_SPIN_TICKS).
 //!
 //! Every distinguishable load state — awaiting permission, no $HOME in
 //! env, file missing/unreadable/unparseable, empty snapshot — has its own
@@ -189,6 +199,10 @@ struct State {
     /// Optimistic mark-seen overlay; effective = max(disk, overlay).
     seen_overlay: HashMap<String, i64>,
     seen_events_dir: Option<PathBuf>,
+    /// Sids the user dismissed this session — hidden optimistically until the
+    /// daemon drops them from the readmodel (or they go active again on resume).
+    dismissed_overlay: HashSet<String>,
+    dismissed_events_dir: Option<PathBuf>,
     /// Keyboard cursor — agent index in display order (groups → agents).
     selected_idx: Option<usize>,
     own_plugin_id: Option<u32>,
@@ -244,6 +258,9 @@ impl ZellijPlugin for State {
                             change_host_folder(loc.host_root);
                             self.seen_events_dir = Some(PathBuf::from(
                                 "/host/.claude/custom-state/agent-seen-events",
+                            ));
+                            self.dismissed_events_dir = Some(PathBuf::from(
+                                "/host/.claude/custom-state/agent-dismissed-events",
                             ));
                             self.refresh_seen_disk();
                             // Synchronous initial read — first render
@@ -333,15 +350,19 @@ impl ZellijPlugin for State {
                     .find(|(r, _)| *r == row)
                     .map(|(_, sid)| sid.clone());
                 if let Some(sid) = hit {
-                    self.acknowledge_agent(&sid);
-                    self.in_flight.insert(sid.clone(), 0);
-                    let _ = self.dispatch_focus_agent(&sid);
                     if let Some(idx) = self
                         .display_order()
                         .iter()
                         .position(|a| a.session_id == sid)
                     {
                         self.selected_idx = Some(idx);
+                    }
+                    // Inactive rows have no pane — clicking selects (so `x` can
+                    // dismiss) but doesn't dispatch a doomed `mux focus-agent`.
+                    if !self.is_inactive(&sid) {
+                        self.acknowledge_agent(&sid);
+                        self.in_flight.insert(sid.clone(), 0);
+                        let _ = self.dispatch_focus_agent(&sid);
                     }
                     return true;
                 }
@@ -357,6 +378,7 @@ impl ZellijPlugin for State {
                 let go_last = matches!(key.bare_key, BareKey::End | BareKey::Char('G')) && no_mods;
                 let activate = matches!(key.bare_key, BareKey::Enter) && no_mods;
                 let yank = matches!(key.bare_key, BareKey::Char('y')) && no_mods;
+                let dismiss = matches!(key.bare_key, BareKey::Char('x')) && no_mods;
                 let cancel = matches!(key.bare_key, BareKey::Esc | BareKey::Char('q')) && no_mods;
                 if go_up && len > 0 {
                     self.selected_idx = Some(match self.selected_idx {
@@ -381,14 +403,29 @@ impl ZellijPlugin for State {
                     return true;
                 }
                 if activate {
+                    if let Some(agent) = self.selected_idx.and_then(|i| agents.get(i)) {
+                        // A dead agent has no pane to focus — Enter just keeps the
+                        // selection (press `x` to dismiss it). Live agents focus.
+                        if agent.active {
+                            let sid = agent.session_id.clone();
+                            self.acknowledge_agent(&sid);
+                            self.in_flight.insert(sid.clone(), 0);
+                            let _ = self.dispatch_focus_agent(&sid);
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+                if dismiss {
+                    // Only tracked-but-not-active rows can be dismissed — a live
+                    // agent would just reappear on the next heartbeat.
                     if let Some(sid) = self
                         .selected_idx
                         .and_then(|i| agents.get(i))
+                        .filter(|a| !a.active)
                         .map(|a| a.session_id.clone())
                     {
-                        self.acknowledge_agent(&sid);
-                        self.in_flight.insert(sid.clone(), 0);
-                        let _ = self.dispatch_focus_agent(&sid);
+                        self.dismiss_agent(&sid);
                         return true;
                     }
                     return false;
@@ -487,8 +524,25 @@ impl State {
         }
     }
 
+    /// Agents minus those optimistically dismissed this session (the daemon
+    /// hasn't dropped them from the readmodel yet). The render and selection
+    /// paths both work off this so an `x` dismiss takes effect instantly.
+    fn visible_agents(&self) -> Vec<Agent> {
+        self.current_agents()
+            .iter()
+            .filter(|a| !self.dismissed_overlay.contains(&a.session_id))
+            .cloned()
+            .collect()
+    }
+
+    fn is_inactive(&self, sid: &str) -> bool {
+        self.current_agents()
+            .iter()
+            .any(|a| a.session_id == sid && !a.active)
+    }
+
     fn display_order(&self) -> Vec<Agent> {
-        group_by_session(self.current_agents())
+        group_by_session(&self.visible_agents())
             .into_iter()
             .flat_map(|g| g.agents)
             .collect()
@@ -583,6 +637,39 @@ impl State {
         });
     }
 
+    /// Write an `AgentDismissed` tombstone and hide the row optimistically.
+    /// Mirrors `acknowledge_agent`'s atomic temp-then-rename. The timestamp is
+    /// wall-clock now (>= a dead agent's frozen `updated_at`, so the daemon
+    /// hides it); a later resume bumps `updated_at` past this and re-surfaces it.
+    fn dismiss_agent(&mut self, session_id: &str) {
+        self.dismissed_overlay.insert(session_id.to_string());
+        let Some(dir) = &self.dismissed_events_dir else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let event = serde_json::json!({
+            "session_id": session_id,
+            "dismissed_at_ms": now_ms(),
+        });
+        let Ok(json) = serde_json::to_vec(&event) else { return };
+        let target = dir.join(format!("{session_id}.json"));
+        let tmp = dir.join(format!("{session_id}.json.tmp"));
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &target);
+        }
+    }
+
+    /// Drop overlay entries once the agent is gone from the readmodel (daemon
+    /// caught up) or went active again (resumed) — keep hiding only while it's
+    /// still listed as inactive.
+    fn prune_dismissed_overlay(&mut self, agents: &[Agent]) {
+        let still_inactive: HashSet<&str> = agents
+            .iter()
+            .filter(|a| !a.active)
+            .map(|a| a.session_id.as_str())
+            .collect();
+        self.dismissed_overlay
+            .retain(|sid| still_inactive.contains(sid.as_str()));
+    }
+
     /// Tick every in-flight row's spinner age forward, dropping any that have
     /// outlived MAX_SPIN_TICKS (the missing-RunCommandResult safety net).
     /// Returns whether anything is still spinning — i.e. a repaint is due.
@@ -608,7 +695,12 @@ impl State {
     }
 
     fn cells_frame(&mut self, rows: usize, cols: usize, colors: &AgentColors) -> Vec<String> {
-        let raw_agents = self.current_agents().to_vec();
+        let all_agents = self.current_agents().to_vec();
+        self.prune_dismissed_overlay(&all_agents);
+        let raw_agents: Vec<Agent> = all_agents
+            .into_iter()
+            .filter(|a| !self.dismissed_overlay.contains(&a.session_id))
+            .collect();
         self.prune_overlay(&raw_agents);
         self.refresh_seen_disk();
 
@@ -630,7 +722,8 @@ impl State {
         let mut flags: HashMap<String, Flags> = HashMap::new();
         for agent in &raw_agents {
             let unrouted = agent.zellij_pane_id.is_none();
-            let unseen = agent.attention_at_ms > 0
+            let unseen = agent.active
+                && agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
             // In view = same zellij session AND the agent's pane sits in this
             // session's active tab. The session guard is load-bearing: pane
@@ -638,11 +731,12 @@ impl State {
             // session agent whose id collides with an in-view pane here would
             // falsely light green. (A cross-session agent is on another
             // screen anyway, so it's correctly never in-view.)
-            let is_in_view = agent.zellij_session.as_deref() == Some(session.as_str())
+            let is_in_view = agent.active
+                && agent.zellij_session.as_deref() == Some(session.as_str())
                 && matches!(agent.zellij_pane_id, Some(pid) if in_view_pane_ids.contains(&pid));
             flags.insert(
                 agent.session_id.clone(),
-                Flags { unrouted, needs_attention: unseen, is_in_view },
+                Flags { unrouted, needs_attention: unseen, is_in_view, active: agent.active },
             );
         }
 
@@ -684,6 +778,7 @@ impl State {
                     needs_attention,
                     unrouted,
                     is_in_view,
+                    active,
                     is_first_wrap_line,
                     ..
                 } => {
@@ -699,6 +794,7 @@ impl State {
                         *needs_attention,
                         *unrouted,
                         *is_in_view,
+                        *active,
                         *is_first_wrap_line,
                         selected,
                         spinner,
@@ -791,6 +887,9 @@ struct Flags {
     unrouted: bool,
     needs_attention: bool,
     is_in_view: bool,
+    /// False for tracked-but-not-active agents — rendered dim with a `†`
+    /// marker, no in-view/alert tint.
+    active: bool,
 }
 
 enum Line {
@@ -807,9 +906,10 @@ enum Line {
         needs_attention: bool,
         unrouted: bool,
         is_in_view: bool,
+        active: bool,
         /// True on the first wrap-line of an agent — the `>` (or `✗` if
-        /// unrouted) row marker shows only on this line so adjacent agents
-        /// with the same bg tint stay visually distinct.
+        /// unrouted, `†` if inactive) row marker shows only on this line so
+        /// adjacent agents with the same bg tint stay visually distinct.
         is_first_wrap_line: bool,
     },
 }
@@ -873,6 +973,7 @@ fn build_lines(
                 unrouted: false,
                 needs_attention: false,
                 is_in_view: false,
+                active: true,
             });
             let text = if a.name.trim().is_empty() {
                 a.session_id.get(..8).unwrap_or(&a.session_id).to_string()
@@ -889,6 +990,7 @@ fn build_lines(
                     needs_attention: f.needs_attention,
                     unrouted: f.unrouted,
                     is_in_view: f.is_in_view,
+                    active: f.active,
                     is_first_wrap_line: i == 0,
                 });
             }
@@ -1055,18 +1157,24 @@ fn render_agent_line(
     needs_attention: bool,
     unrouted: bool,
     is_in_view: bool,
+    active: bool,
     is_first_wrap_line: bool,
     selected: bool,
     spinner: Option<char>,
     colors: &AgentColors,
     cols: usize,
 ) -> String {
+    // Tracked-but-not-active rows carry no live signal — they render dim with a
+    // `†` marker and none of the in-view/alert tints. `dead` short-circuits all
+    // of those so a frozen busy/waiting/unknown status doesn't paint a stale hue.
+    let dead = !active;
     // Per-column priority stack (see the palette block at the top of this
     // file). `alert` = needs-attention / waiting / unknown; it shows yellow,
     // or red when the status itself is unknown.
-    let is_unknown = matches!(status, AgentStatus::Unknown(_));
-    let alert = needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown;
+    let is_unknown = !dead && matches!(status, AgentStatus::Unknown(_));
+    let alert = !dead && (needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown);
     let alert_color = if is_unknown { colors.error } else { colors.yellow };
+    let in_view = is_in_view && !dead;
 
     // Selection is the dominant signal: when a row is selected it claims the
     // BODY (col 3) bg + the name fg outright, so the highlight is unmissable
@@ -1079,7 +1187,7 @@ fn render_agent_line(
     // col 3   → selected grey · alert · in-view green · neutral.  (selection
     //           outranks everything on the body.)
     let col0_bg = if selected { colors.selected_bg } else { colors.bar_bg };
-    let mid_bg = if is_in_view {
+    let mid_bg = if in_view {
         colors.green
     } else if alert {
         alert_color
@@ -1092,7 +1200,7 @@ fn render_agent_line(
         colors.selected_bg
     } else if alert {
         alert_color
-    } else if is_in_view {
+    } else if in_view {
         colors.green
     } else {
         colors.bar_bg
@@ -1102,9 +1210,11 @@ fn render_agent_line(
     // selected-fg-on-selected-bg (a deliberately high-contrast pair). Otherwise
     // it encodes status, choosing a hue that reads on the body bg — busy's
     // magenta reads on every bg, idle/waiting take on-colour on a tinted body.
-    let body_tinted = alert || is_in_view;
+    let body_tinted = alert || in_view;
     let name_fg = if selected {
         colors.selected_fg
+    } else if dead {
+        colors.text // muted via `dim` below
     } else if matches!(status, AgentStatus::Busy) {
         colors.magenta
     } else if is_unknown {
@@ -1116,11 +1226,17 @@ fn render_agent_line(
     };
 
     // Bold whenever the row carries any signal so it pops without a full bg.
-    let bold = selected || is_in_view || alert;
+    let bold = selected || in_view || alert;
+    // Dead rows render faint (the chosen "dim text" look). A selected dead row
+    // stays full-strength so the cursor is unmistakable.
+    let dim = dead && !selected;
     let paint = |fg: PaletteColor, bg: PaletteColor, s: String| {
         let mut style = style!(fg, bg);
         if bold {
             style = style.bold();
+        }
+        if dim {
+            style = style.dimmed();
         }
         style.paint(s).to_string()
     };
@@ -1133,6 +1249,8 @@ fn render_agent_line(
         ' '
     } else if let Some(spin) = spinner {
         spin
+    } else if dead {
+        '\u{2020}' // † — tracked-but-not-active
     } else if unrouted {
         '\u{2717}' // ✗
     } else {
@@ -1144,11 +1262,13 @@ fn render_agent_line(
     // tint. Otherwise the marker takes on-colour over a tinted middle, else the
     // name fg. The unrouted `✗` stays error red (its own signal), swapping to
     // on-colour only where red wouldn't read.
-    let marker_fg = if unrouted && spinner.is_none() {
-        if is_in_view || alert { colors.on_color } else { colors.error }
+    let marker_fg = if dead {
+        if selected { colors.selected_fg } else { name_fg }
+    } else if unrouted && spinner.is_none() {
+        if in_view || alert { colors.on_color } else { colors.error }
     } else if selected {
         colors.selected_fg
-    } else if is_in_view || alert {
+    } else if in_view || alert {
         colors.on_color
     } else {
         name_fg
@@ -1245,5 +1365,13 @@ fn same_agents(a: &[Agent], b: &[Agent]) -> bool {
                 && x.name == y.name
                 && x.started_at_ms == y.started_at_ms
                 && x.attention_at_ms == y.attention_at_ms
+                && x.active == y.active
         })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

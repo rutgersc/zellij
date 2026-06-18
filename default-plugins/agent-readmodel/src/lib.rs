@@ -66,6 +66,16 @@ pub struct Agent {
     /// `agent-seen-events/` since seen-state is plugin-owned.
     #[serde(default)]
     pub attention_at_ms: i64,
+    /// False once the agent's live heartbeat is gone — the daemon carries it
+    /// forward as tracked-but-not-active so the bar keeps showing it until the
+    /// user dismisses it. Defaults to `true` so a snapshot from an older daemon
+    /// (no field) reads as all-live.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
