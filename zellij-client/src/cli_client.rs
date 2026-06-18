@@ -201,6 +201,7 @@ fn pipe_client(
                         process::exit(0);
                     },
                 },
+                None => return,
                 _ => {},
             }
         }
@@ -269,6 +270,7 @@ fn individual_messages_client(
                     break;
                 },
             },
+            None => break,
             _ => {},
         }
     }
