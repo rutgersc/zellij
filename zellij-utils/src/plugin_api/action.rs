@@ -1961,7 +1961,9 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::ToggleCopyVisual
             | Action::ToggleCopyVisualLine
             | Action::CopyModeEscape
-            | Action::CopyAndExitCopyMode => Err("Unsupported action"),
+            | Action::CopyAndExitCopyMode
+            | Action::FocusPrevJump
+            | Action::FocusNextJump => Err("Unsupported action"),
         }
     }
 }
