@@ -64,6 +64,9 @@ fn parse_spec(s: &str) -> Option<PaneId> {
 /// `entries[cursor] == e` guard also swallows our own jump echo, because `step`
 /// pre-positions the cursor at the pane we're about to land on.
 pub fn record(session: &str, pane: PaneId) {
+    if matches!(pane, PaneId::Plugin(_)) {
+        return; // plugin panes (status/tab bars, pickers) are UI furniture, not nav targets
+    }
     let e = Entry {
         session: session.to_string(),
         pane: spec(pane),
@@ -73,7 +76,14 @@ pub fn record(session: &str, pane: PaneId) {
         return;
     }
     s.entries.truncate(s.cursor + 1);
+    s.entries.retain(|x| x != &e); // dedup: re-focusing a pane moves it to the end, never repeats
     s.entries.push(e);
+    // cap to the most recent MAX entries (drop oldest)
+    const MAX: usize = 15;
+    if s.entries.len() > MAX {
+        let drop = s.entries.len() - MAX;
+        s.entries.drain(0..drop);
+    }
     s.cursor = s.entries.len() - 1;
     store(&s);
 }
