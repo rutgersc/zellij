@@ -53,6 +53,22 @@ pub struct Agent {
     #[serde(default)]
     pub cwd: String,
     pub status: AgentStatus,
+    /// Human reason the agent is blocked when `status == Waiting` (mirrors the
+    /// daemon's `waiting_for` / Claude heartbeat `waitingFor`, e.g. "permission
+    /// prompt"). No plugin renders it today — the bar derives the alert colour
+    /// from `status` alone — but it's part of the schema for consumers (the foam
+    /// picker) that do surface the reason.
+    #[serde(default)]
+    pub waiting_for: Option<String>,
+    /// Claude process kind — "interactive" or "bg" (a `run_in_background`
+    /// agent). Empty when written by an older daemon → treated as interactive.
+    #[serde(default)]
+    pub kind: String,
+    /// For a background agent, the `session_id` of the session it was forked
+    /// from — lets the bar nest bg children under their parent. `None` for
+    /// interactive sessions, or when the daemon couldn't resolve the link.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
     #[serde(default)]
     pub zellij_session: Option<String>,
     #[serde(default)]

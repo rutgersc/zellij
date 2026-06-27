@@ -68,6 +68,9 @@ const MAX_SPIN_TICKS: u32 = 100;
 /// Hard cap on rows used to render a single agent's name. Past this we
 /// truncate with `…` — the full name is still on the snapshot.
 const MAX_NAME_LINES: usize = 4;
+/// Nested bg children render on a single line — visually subordinate to their
+/// parent (which wraps up to MAX_NAME_LINES).
+const MAX_CHILD_NAME_LINES: usize = 1;
 /// Width of col 0 — the leftmost cell of every agent row. Shows the selection
 /// grey when keyboard-selected, otherwise neutral. It's the innermost (least
 /// dominant) layer of the per-column state stack (see palette block below).
@@ -191,6 +194,11 @@ struct State {
     mode_info: ModeInfo,
     /// Click hit-test: rendered_row → session_id. Rebuilt every render.
     row_ranges: Vec<(usize, String)>,
+    /// session_id → the session_id to actually focus when this row is clicked.
+    /// For a top-level agent it's itself; for a nested bg child it's the parent
+    /// (the child has no pane of its own). Absent → no pane to focus (orphan).
+    /// Rebuilt every render alongside `row_ranges`.
+    focus_targets: HashMap<String, String>,
     /// PaneManifest + active tab let us decide which agents are "here".
     pane_manifest: PaneManifest,
     active_tab_idx: Option<usize>,
@@ -357,12 +365,15 @@ impl ZellijPlugin for State {
                     {
                         self.selected_idx = Some(idx);
                     }
-                    // Inactive rows have no pane — clicking selects (so `x` can
-                    // dismiss) but doesn't dispatch a doomed `mux focus-agent`.
+                    // Inactive rows (no pane) and orphan children (no resolvable
+                    // parent) just select — no doomed `mux focus-agent`. A child
+                    // routes its focus to the parent but spins on its own row.
                     if !self.is_inactive(&sid) {
-                        self.acknowledge_agent(&sid);
-                        self.in_flight.insert(sid.clone(), 0);
-                        let _ = self.dispatch_focus_agent(&sid);
+                        if let Some(target) = self.focus_targets.get(&sid).cloned() {
+                            self.acknowledge_agent(&sid);
+                            self.in_flight.insert(sid.clone(), 0);
+                            let _ = self.dispatch_focus_agent(&target, &sid);
+                        }
                     }
                     return true;
                 }
@@ -404,13 +415,16 @@ impl ZellijPlugin for State {
                 }
                 if activate {
                     if let Some(agent) = self.selected_idx.and_then(|i| agents.get(i)) {
-                        // A dead agent has no pane to focus — Enter just keeps the
-                        // selection (press `x` to dismiss it). Live agents focus.
+                        // A dead agent (no pane) or an orphan child (no resolvable
+                        // parent) — Enter just keeps the selection. Otherwise focus
+                        // the row's target (parent for a child), spinning on the row.
                         if agent.active {
                             let sid = agent.session_id.clone();
-                            self.acknowledge_agent(&sid);
-                            self.in_flight.insert(sid.clone(), 0);
-                            let _ = self.dispatch_focus_agent(&sid);
+                            if let Some(target) = self.focus_targets.get(&sid).cloned() {
+                                self.acknowledge_agent(&sid);
+                                self.in_flight.insert(sid.clone(), 0);
+                                let _ = self.dispatch_focus_agent(&target, &sid);
+                            }
                         }
                         return true;
                     }
@@ -542,9 +556,9 @@ impl State {
     }
 
     fn display_order(&self) -> Vec<Agent> {
-        group_by_session(&self.visible_agents())
+        grouped(&self.visible_agents())
             .into_iter()
-            .flat_map(|g| g.agents)
+            .flat_map(|g| g.rows.into_iter().map(|r| r.agent))
             .collect()
     }
 
@@ -584,14 +598,17 @@ impl State {
         Some(0)
     }
 
-    /// Common dispatch for mouse click and Enter key.
-    fn dispatch_focus_agent(&self, sid: &str) -> String {
-        let label = sid.get(..8).unwrap_or(sid).to_string();
+    /// Common dispatch for mouse click and Enter key. `focus_sid` is the pane
+    /// to focus (a child routes to its parent); `echo_sid` is the row that owns
+    /// the in-flight spinner — echoed on RunCommandResult so the spinner clears
+    /// on the row the user actually clicked (which == focus_sid for a top-level
+    /// agent).
+    fn dispatch_focus_agent(&self, focus_sid: &str, echo_sid: &str) -> String {
+        let label = focus_sid.get(..8).unwrap_or(focus_sid).to_string();
         let mut ctx = BTreeMap::new();
         ctx.insert("click_label".into(), label.clone());
-        // Echoed back on RunCommandResult so we can clear this row's spinner.
-        ctx.insert("session_id".into(), sid.to_string());
-        run_command(&["mux", "focus-agent", sid], ctx);
+        ctx.insert("session_id".into(), echo_sid.to_string());
+        run_command(&["mux", "focus-agent", focus_sid], ctx);
         label
     }
 
@@ -740,8 +757,21 @@ impl State {
             );
         }
 
-        let groups = group_by_session(&raw_agents);
-        let display: Vec<Agent> = groups.iter().flat_map(|g| g.agents.clone()).collect();
+        let groups = grouped(&raw_agents);
+        let display: Vec<Agent> = groups
+            .iter()
+            .flat_map(|g| g.rows.iter().map(|r| r.agent.clone()))
+            .collect();
+        // Rebuild the click → focus-target map in lockstep with the rows: a
+        // child routes its click to the parent's pane; an orphan has none.
+        self.focus_targets.clear();
+        for g in &groups {
+            for r in &g.rows {
+                if let Some(t) = &r.focus_sid {
+                    self.focus_targets.insert(r.agent.session_id.clone(), t.clone());
+                }
+            }
+        }
 
         // Clamp selected_idx in case agents went away between ticks.
         self.selected_idx = self.selected_idx.and_then(|i| {
@@ -769,7 +799,8 @@ impl State {
             let rendered = match line {
                 Line::Padding => render_padding(colors, cols),
                 Line::Header { label, unrouted_in_group } => {
-                    render_header(label, *unrouted_in_group, colors, cols)
+                    let is_active = !session.is_empty() && label.as_str() == session.as_str();
+                    render_header(label, *unrouted_in_group, is_active, colors, cols)
                 },
                 Line::AgentRow {
                     sid,
@@ -780,7 +811,8 @@ impl State {
                     is_in_view,
                     active,
                     is_first_wrap_line,
-                    ..
+                    is_child,
+                    is_last_child,
                 } => {
                     let selected = selected_sid.as_deref() == Some(sid.as_str());
                     self.row_ranges.push((visible_row, sid.clone()));
@@ -796,6 +828,8 @@ impl State {
                         *is_in_view,
                         *active,
                         *is_first_wrap_line,
+                        *is_child,
+                        *is_last_child,
                         selected,
                         spinner,
                         colors,
@@ -856,10 +890,11 @@ impl State {
     }
 }
 
-/// One zellij-session's worth of agents.
+/// One zellij-session's worth of rows — top-level agents, each optionally
+/// followed by its nested background-agent children.
 struct Group {
     label: GroupLabel,
-    agents: Vec<Agent>,
+    rows: Vec<Row>,
     /// Earliest agent `started_at_ms` in the group — the session's creation
     /// time. Used as the group's sort key so its slot stays put as later
     /// agents come and go.
@@ -867,10 +902,29 @@ struct Group {
     any_unrouted: bool,
 }
 
+/// A single display row: an agent plus its place in the parent/child tree.
+#[derive(Clone)]
+struct Row {
+    agent: Agent,
+    /// True for a nested background-agent child (rendered indented under its
+    /// parent with a `└─`/`├─` connector, single-line).
+    is_child: bool,
+    /// Last child of its parent → `└─`, otherwise `├─`. Meaningless when
+    /// `!is_child`.
+    is_last_child: bool,
+    /// The session to focus when this row is clicked: itself for a top-level
+    /// agent, the parent for a child (children have no pane). `None` → nothing
+    /// to focus (an orphan under the placeholder parent).
+    focus_sid: Option<String>,
+}
+
 #[derive(Clone)]
 enum GroupLabel {
     Session(String),
     Sessionless,
+    /// Placeholder group for background agents whose parent session isn't in
+    /// the readmodel (e.g. the parent was closed while the bg job runs on).
+    UnknownParent,
 }
 
 impl GroupLabel {
@@ -878,6 +932,7 @@ impl GroupLabel {
         match self {
             GroupLabel::Session(s) => s.as_str(),
             GroupLabel::Sessionless => SESSIONLESS_LABEL,
+            GroupLabel::UnknownParent => "unknown parent",
         }
     }
 }
@@ -911,42 +966,114 @@ enum Line {
         /// unrouted, `†` if inactive) row marker shows only on this line so
         /// adjacent agents with the same bg tint stay visually distinct.
         is_first_wrap_line: bool,
+        /// A nested bg child — the `>` marker column becomes the `└`/`├`
+        /// connector (under the parent's `>`) so it reads as subordinate.
+        is_child: bool,
+        /// Last child of its parent → `└`, otherwise `├`.
+        is_last_child: bool,
     },
 }
 
-fn group_by_session(agents: &[Agent]) -> Vec<Group> {
-    let mut by_key: BTreeMap<Option<String>, Group> = BTreeMap::new();
-    for a in agents {
-        let key = a.zellij_session.clone();
-        let label = match &key {
-            Some(s) => GroupLabel::Session(s.clone()),
-            None => GroupLabel::Sessionless,
-        };
-        let entry = by_key.entry(key).or_insert(Group {
-            label,
-            agents: Vec::new(),
-            created_ms: i64::MAX,
-            any_unrouted: false,
-        });
-        if a.started_at_ms < entry.created_ms {
-            entry.created_ms = a.started_at_ms;
+/// Group top-level (interactive) agents by zellij session, nesting each
+/// background-agent child under its parent. Background agents whose parent
+/// isn't present collect into a trailing "unknown parent" placeholder group.
+/// `display_order` and `build_lines` both consume this, so their row order
+/// stays in lockstep.
+fn grouped(agents: &[Agent]) -> Vec<Group> {
+    let is_bg = |a: &Agent| a.kind == "bg";
+    let top_sids: HashSet<String> = agents
+        .iter()
+        .filter(|a| !is_bg(a))
+        .map(|a| a.session_id.clone())
+        .collect();
+
+    // Bucket bg children under their parent (if it's a visible top-level row),
+    // else set them aside as orphans.
+    let mut children_by_parent: HashMap<String, Vec<Agent>> = HashMap::new();
+    let mut orphans: Vec<Agent> = Vec::new();
+    for a in agents.iter().filter(|a| is_bg(a)) {
+        match &a.parent_session_id {
+            Some(p) if top_sids.contains(p) => {
+                children_by_parent.entry(p.clone()).or_default().push(a.clone())
+            },
+            _ => orphans.push(a.clone()),
         }
-        if a.zellij_pane_id.is_none() {
-            entry.any_unrouted = true;
-        }
-        entry.agents.push(a.clone());
     }
-    let mut groups: Vec<Group> = by_key.into_values().collect();
-    for g in &mut groups {
-        // Oldest agent first within the group (creation order).
-        g.agents.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
+    let by_started = |v: &mut Vec<Agent>| v.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
+    children_by_parent.values_mut().for_each(by_started);
+    by_started(&mut orphans);
+
+    // Turn a parent's buckets of children into nested rows (└─ on the last).
+    let child_rows = |parent_sid: &str, children_by_parent: &HashMap<String, Vec<Agent>>| -> Vec<Row> {
+        let kids = children_by_parent.get(parent_sid).cloned().unwrap_or_default();
+        let last = kids.len().saturating_sub(1);
+        kids.into_iter()
+            .enumerate()
+            .map(|(i, c)| Row {
+                agent: c,
+                is_child: true,
+                is_last_child: i == last,
+                focus_sid: Some(parent_sid.to_string()),
+            })
+            .collect()
+    };
+
+    let mut by_key: BTreeMap<Option<String>, Vec<Agent>> = BTreeMap::new();
+    for a in agents.iter().filter(|a| !is_bg(a)) {
+        by_key.entry(a.zellij_session.clone()).or_default().push(a.clone());
     }
+
+    let mut groups: Vec<Group> = by_key
+        .into_iter()
+        .map(|(key, mut tops)| {
+            tops.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
+            let created_ms = tops.iter().map(|a| a.started_at_ms).min().unwrap_or(i64::MAX);
+            let any_unrouted = tops.iter().any(|a| a.zellij_pane_id.is_none());
+            let label = match &key {
+                Some(s) => GroupLabel::Session(s.clone()),
+                None => GroupLabel::Sessionless,
+            };
+            let mut rows = Vec::new();
+            for t in tops {
+                let sid = t.session_id.clone();
+                let kids = child_rows(&sid, &children_by_parent);
+                rows.push(Row {
+                    agent: t,
+                    is_child: false,
+                    is_last_child: false,
+                    focus_sid: Some(sid),
+                });
+                rows.extend(kids);
+            }
+            Group { label, rows, created_ms, any_unrouted }
+        })
+        .collect();
+
+    // Sessionless after named sessions; otherwise oldest-first.
     groups.sort_by(|a, b| match (&a.label, &b.label) {
         (GroupLabel::Sessionless, GroupLabel::Sessionless) => std::cmp::Ordering::Equal,
         (GroupLabel::Sessionless, _) => std::cmp::Ordering::Greater,
         (_, GroupLabel::Sessionless) => std::cmp::Ordering::Less,
         _ => a.created_ms.cmp(&b.created_ms),
     });
+
+    // Orphaned bg children → a trailing placeholder-parent group.
+    if !orphans.is_empty() {
+        let created_ms = orphans.iter().map(|a| a.started_at_ms).min().unwrap_or(i64::MAX);
+        let last = orphans.len() - 1;
+        let rows = orphans
+            .into_iter()
+            .enumerate()
+            .map(|(i, o)| Row {
+                agent: o,
+                is_child: true,
+                is_last_child: i == last,
+                focus_sid: None,
+            })
+            .collect();
+        groups.push(Group { label: GroupLabel::UnknownParent, rows, created_ms, any_unrouted: true });
+    }
+
     groups
 }
 
@@ -968,19 +1095,24 @@ fn build_lines(
             label: g.label.as_str().to_string(),
             unrouted_in_group: g.any_unrouted,
         });
-        for a in &g.agents {
+        for row in &g.rows {
+            let a = &row.agent;
             let f = flags.get(&a.session_id).copied().unwrap_or(Flags {
                 unrouted: false,
                 needs_attention: false,
                 is_in_view: false,
                 active: true,
             });
-            let text = if a.name.trim().is_empty() {
+            let name = if a.name.trim().is_empty() {
                 a.session_id.get(..8).unwrap_or(&a.session_id).to_string()
             } else {
                 a.name.trim().to_string()
             };
-            let wrapped = wrap_text(&text, content_w, MAX_NAME_LINES);
+            // Children render single-line, name aligned under the parent's
+            // name; the `└`/`├` connector lives in the marker columns (rendered
+            // by render_agent_line), not in the text. Parents wrap to MAX_NAME_LINES.
+            let max_lines = if row.is_child { MAX_CHILD_NAME_LINES } else { MAX_NAME_LINES };
+            let wrapped = wrap_text(&name, content_w, max_lines);
             let start = lines.len();
             for (i, w) in wrapped.into_iter().enumerate() {
                 lines.push(Line::AgentRow {
@@ -992,6 +1124,8 @@ fn build_lines(
                     is_in_view: f.is_in_view,
                     active: f.active,
                     is_first_wrap_line: i == 0,
+                    is_child: row.is_child,
+                    is_last_child: row.is_last_child,
                 });
             }
             let end_exclusive = lines.len();
@@ -1103,6 +1237,7 @@ fn render_padding(colors: &AgentColors, cols: usize) -> String {
 fn render_header(
     label: &str,
     unrouted_in_group: bool,
+    is_active: bool,
     colors: &AgentColors,
     cols: usize,
 ) -> String {
@@ -1133,8 +1268,14 @@ fn render_header(
     } else {
         false
     };
-    let h_fg = colors.text;
-    let h_bg = colors.header_bg;
+    // The header of the session the user is currently in glows with the
+    // theme's active-tab green (matching the in-view agent tint), so "you are
+    // here" is obvious; other sessions keep the neutral header strip.
+    let (h_fg, h_bg) = if is_active {
+        (colors.on_color, colors.green)
+    } else {
+        (colors.text, colors.header_bg)
+    };
     let mut body = String::new();
     body.push_str(&style!(h_fg, h_bg).bold().paint(trimmed).to_string());
     if unrouted_suffix {
@@ -1159,6 +1300,8 @@ fn render_agent_line(
     is_in_view: bool,
     active: bool,
     is_first_wrap_line: bool,
+    is_child: bool,
+    is_last_child: bool,
     selected: bool,
     spinner: Option<char>,
     colors: &AgentColors,
@@ -1249,6 +1392,9 @@ fn render_agent_line(
         ' '
     } else if let Some(spin) = spinner {
         spin
+    } else if is_child {
+        // Connector sits in the marker column, directly under the parent's `>`.
+        if is_last_child { '\u{2514}' } else { '\u{251c}' } // └ / ├
     } else if dead {
         '\u{2020}' // † — tracked-but-not-active
     } else if unrouted {
@@ -1288,10 +1434,18 @@ fn render_agent_line(
     }
     let pad: String = std::iter::repeat(' ').take(name_w - w).collect();
 
+    // Col 2 is the connector's horizontal arm (`─`, same fg as the marker) on a
+    // child's first line, else a plain space.
+    let (col2_char, col2_fg) = if is_child && is_first_wrap_line {
+        ("\u{2500}".to_string(), marker_fg)
+    } else {
+        (" ".to_string(), name_fg)
+    };
+
     let mut row = String::new();
     row.push_str(&paint(name_fg, col0_bg, " ".to_string())); // col 0
-    row.push_str(&paint(marker_fg, mid_bg, marker_char.to_string())); // col 1: marker
-    row.push_str(&paint(name_fg, mid_bg, " ".to_string())); // col 2: space
+    row.push_str(&paint(marker_fg, mid_bg, marker_char.to_string())); // col 1: marker / connector
+    row.push_str(&paint(col2_fg, mid_bg, col2_char)); // col 2: space or `─` arm
     row.push_str(&paint(name_fg, body_bg, visible)); // col 3: name
     row.push_str(&paint(name_fg, body_bg, pad));
     row
