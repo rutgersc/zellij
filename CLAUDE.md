@@ -60,3 +60,12 @@ Files that don't exist on `zellij-org/main` are the fork-only ones; `git log --d
     zellij 0.45.0 (f6696d920000)
 
 A `-dirty` suffix appears when the working tree had uncommitted changes at build time. `unknown` means the build happened outside a git checkout.
+
+## agent-bar colours mirror into the foam `sessions` picker
+
+The `agent-bar` plugin's per-agent state colours (`render_agent_line` /
+`AgentColors` in `default-plugins/agent-bar/src/main.rs`) are the **source of
+truth** for a second renderer living outside this repo: the fzf session picker
+in the foam vault (`code/sessions/src/pick.rs`, `format_line`).
+They're a coupled pair — **when you change which colour an agent state gets
+here, update the picker to match**.
