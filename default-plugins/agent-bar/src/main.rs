@@ -29,7 +29,10 @@
 //! Click any row of an agent → `mux focus-agent <session_id>`. Up/Down
 //! moves the keyboard cursor across agents, Enter activates, `y` yanks the id,
 //! `x` dismisses an inactive row, Esc returns focus to the previous pane.
-//! Clicking/Enter on an inactive row only selects it (no pane to focus). While
+//! Clicking/Enter dispatches for tracked-but-not-active rows too — a dead
+//! agent's zellij pane usually outlives its heartbeat, so `mux focus-agent`
+//! navigates to it and aborts loudly only if the pane is actually gone. Rows
+//! with no resolvable focus target (orphan children) only select. While
 //! that `mux` command is in flight a braille spinner replaces the row's `>`
 //! marker (col 1), so a slow focus shows work happening right where you
 //! clicked; it clears on the matching RunCommandResult (or, as a safety net,
@@ -365,15 +368,17 @@ impl ZellijPlugin for State {
                     {
                         self.selected_idx = Some(idx);
                     }
-                    // Inactive rows (no pane) and orphan children (no resolvable
-                    // parent) just select — no doomed `mux focus-agent`. A child
-                    // routes its focus to the parent but spins on its own row.
-                    if !self.is_inactive(&sid) {
-                        if let Some(target) = self.focus_targets.get(&sid).cloned() {
-                            self.acknowledge_agent(&sid);
-                            self.in_flight.insert(sid.clone(), 0);
-                            let _ = self.dispatch_focus_agent(&target, &sid);
-                        }
+                    // Dispatch whenever the row resolves to a focus target —
+                    // including tracked-but-not-active agents, whose zellij pane
+                    // usually outlives the dead Claude heartbeat. `mux
+                    // focus-agent` verifies the pane is still there and aborts if
+                    // not. Orphan children (no resolvable parent) carry no target,
+                    // so they just select. A child spins on its own row while
+                    // focusing the parent.
+                    if let Some(target) = self.focus_targets.get(&sid).cloned() {
+                        self.acknowledge_agent(&sid);
+                        self.in_flight.insert(sid.clone(), 0);
+                        let _ = self.dispatch_focus_agent(&target, &sid);
                     }
                     return true;
                 }
@@ -415,16 +420,16 @@ impl ZellijPlugin for State {
                 }
                 if activate {
                     if let Some(agent) = self.selected_idx.and_then(|i| agents.get(i)) {
-                        // A dead agent (no pane) or an orphan child (no resolvable
-                        // parent) — Enter just keeps the selection. Otherwise focus
-                        // the row's target (parent for a child), spinning on the row.
-                        if agent.active {
-                            let sid = agent.session_id.clone();
-                            if let Some(target) = self.focus_targets.get(&sid).cloned() {
-                                self.acknowledge_agent(&sid);
-                                self.in_flight.insert(sid.clone(), 0);
-                                let _ = self.dispatch_focus_agent(&target, &sid);
-                            }
+                        // Focus the row's target (a child routes to its parent),
+                        // spinning on the row. Tracked-but-not-active agents
+                        // dispatch too — their pane may still be alive, and `mux
+                        // focus-agent` aborts loudly if it's gone. Orphan children
+                        // (no resolvable parent) carry no target → just select.
+                        let sid = agent.session_id.clone();
+                        if let Some(target) = self.focus_targets.get(&sid).cloned() {
+                            self.acknowledge_agent(&sid);
+                            self.in_flight.insert(sid.clone(), 0);
+                            let _ = self.dispatch_focus_agent(&target, &sid);
                         }
                         return true;
                     }
@@ -547,12 +552,6 @@ impl State {
             .filter(|a| !self.dismissed_overlay.contains(&a.session_id))
             .cloned()
             .collect()
-    }
-
-    fn is_inactive(&self, sid: &str) -> bool {
-        self.current_agents()
-            .iter()
-            .any(|a| a.session_id == sid && !a.active)
     }
 
     fn display_order(&self) -> Vec<Agent> {
