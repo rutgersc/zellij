@@ -3313,7 +3313,12 @@ fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
     let result: Result<(), String> = runtime.block_on(async {
         let mut set: JoinSet<(String, std::io::Result<()>)> = JoinSet::new();
         for name in session_names {
-            let path = ZELLIJ_SOCK_DIR.join(&name);
+            // The socket/named-pipe is keyed by the generated session id, not
+            // the display_name the session manager kills by. Resolve via the
+            // registry (mirrors `kill_sessions`); the raw-name fallback only
+            // ever hits for a legacy session whose id == display_name.
+            let path = zellij_utils::sessions::resolve_session_socket_path(&name)
+                .unwrap_or_else(|| ZELLIJ_SOCK_DIR.join(&name));
             set.spawn(async move {
                 let res = zellij_utils::ipc::async_send_kill_and_await(&path).await;
                 (name, res)
