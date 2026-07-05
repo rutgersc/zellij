@@ -368,15 +368,16 @@ impl ZellijPlugin for State {
                     {
                         self.selected_idx = Some(idx);
                     }
-                    // Dispatch whenever the row resolves to a focus target —
-                    // including tracked-but-not-active agents, whose zellij pane
-                    // usually outlives the dead Claude heartbeat. `mux
-                    // focus-agent` verifies the pane is still there and aborts if
-                    // not. Orphan children (no resolvable parent) carry no target,
-                    // so they just select. A child spins on its own row while
-                    // focusing the parent.
+                    // A click acknowledges the row's attention (clears the yellow)
+                    // regardless of whether it can be focused — that's the only
+                    // way to mark a select-only bg agent seen, since it has no
+                    // pane to route to.
+                    self.acknowledge_agent(&sid);
+                    // Focus only when the row routes to a pane. bg agents carry no
+                    // target (select-only); a dead-but-routed agent's pane usually
+                    // outlives its heartbeat, and `mux focus-agent` verifies the
+                    // pane still exists and aborts loudly if not.
                     if let Some(target) = self.focus_targets.get(&sid).cloned() {
-                        self.acknowledge_agent(&sid);
                         self.in_flight.insert(sid.clone(), 0);
                         let _ = self.dispatch_focus_agent(&target, &sid);
                     }
@@ -420,14 +421,15 @@ impl ZellijPlugin for State {
                 }
                 if activate {
                     if let Some(agent) = self.selected_idx.and_then(|i| agents.get(i)) {
-                        // Focus the row's target (a child routes to its parent),
-                        // spinning on the row. Tracked-but-not-active agents
-                        // dispatch too — their pane may still be alive, and `mux
-                        // focus-agent` aborts loudly if it's gone. Orphan children
-                        // (no resolvable parent) carry no target → just select.
                         let sid = agent.session_id.clone();
+                        // Enter acknowledges the row's attention (clears the
+                        // yellow) even for select-only bg agents — that's their
+                        // only way to be marked seen (no pane to focus).
+                        self.acknowledge_agent(&sid);
+                        // Focus only when routable. bg carry no target; a
+                        // dead-but-routed agent's pane usually outlives its
+                        // heartbeat, and `mux focus-agent` aborts loudly if gone.
                         if let Some(target) = self.focus_targets.get(&sid).cloned() {
-                            self.acknowledge_agent(&sid);
                             self.in_flight.insert(sid.clone(), 0);
                             let _ = self.dispatch_focus_agent(&target, &sid);
                         }
@@ -752,7 +754,13 @@ impl State {
                 && matches!(agent.zellij_pane_id, Some(pid) if in_view_pane_ids.contains(&pid));
             flags.insert(
                 agent.session_id.clone(),
-                Flags { unrouted, needs_attention: unseen, is_in_view, active: agent.active },
+                Flags {
+                    unrouted,
+                    needs_attention: unseen,
+                    is_in_view,
+                    active: agent.active,
+                    is_bg: agent.kind == "bg",
+                },
             );
         }
 
@@ -761,8 +769,9 @@ impl State {
             .iter()
             .flat_map(|g| g.rows.iter().map(|r| r.agent.clone()))
             .collect();
-        // Rebuild the click → focus-target map in lockstep with the rows: a
-        // child routes its click to the parent's pane; an orphan has none.
+        // Rebuild the click → focus-target map in lockstep with the rows:
+        // interactive agents map to their own pane; background agents have no
+        // target (select-only).
         self.focus_targets.clear();
         for g in &groups {
             for r in &g.rows {
@@ -812,6 +821,7 @@ impl State {
                     is_first_wrap_line,
                     is_child,
                     is_last_child,
+                    is_bg,
                 } => {
                     let selected = selected_sid.as_deref() == Some(sid.as_str());
                     self.row_ranges.push((visible_row, sid.clone()));
@@ -829,6 +839,7 @@ impl State {
                         *is_first_wrap_line,
                         *is_child,
                         *is_last_child,
+                        *is_bg,
                         selected,
                         spinner,
                         colors,
@@ -889,8 +900,8 @@ impl State {
     }
 }
 
-/// One zellij-session's worth of rows — top-level agents, each optionally
-/// followed by its nested background-agent children.
+/// One section of rows — either a zellij session's interactive agents, the
+/// sessionless bucket, or the decoupled background-agents section.
 struct Group {
     label: GroupLabel,
     rows: Vec<Row>,
@@ -911,9 +922,8 @@ struct Row {
     /// Last child of its parent → `└─`, otherwise `├─`. Meaningless when
     /// `!is_child`.
     is_last_child: bool,
-    /// The session to focus when this row is clicked: itself for a top-level
-    /// agent, the parent for a child (children have no pane). `None` → nothing
-    /// to focus (an orphan under the placeholder parent).
+    /// The session to focus when this row is clicked: itself for an interactive
+    /// agent. `None` → not clickable (a background agent — no pane to focus).
     focus_sid: Option<String>,
 }
 
@@ -921,9 +931,11 @@ struct Row {
 enum GroupLabel {
     Session(String),
     Sessionless,
-    /// Placeholder group for background agents whose parent session isn't in
-    /// the readmodel (e.g. the parent was closed while the bg job runs on).
-    UnknownParent,
+    /// All background (`run_in_background`) agents. They're daemon-owned, have no
+    /// pane of their own, and are reached through Claude's agent view rather than
+    /// by focusing a pane here — so they're decoupled into their own section and
+    /// rendered select-only.
+    BackgroundAgents,
 }
 
 impl GroupLabel {
@@ -931,7 +943,7 @@ impl GroupLabel {
         match self {
             GroupLabel::Session(s) => s.as_str(),
             GroupLabel::Sessionless => SESSIONLESS_LABEL,
-            GroupLabel::UnknownParent => "unknown parent",
+            GroupLabel::BackgroundAgents => "bg agents",
         }
     }
 }
@@ -944,6 +956,9 @@ struct Flags {
     /// False for tracked-but-not-active agents — rendered dim with a `†`
     /// marker, no in-view/alert tint.
     active: bool,
+    /// A background (`run_in_background`) agent — rendered with a neutral `∙`
+    /// marker instead of `>`/`✗`, and never clickable (no pane to focus).
+    is_bg: bool,
 }
 
 enum Line {
@@ -970,52 +985,20 @@ enum Line {
         is_child: bool,
         /// Last child of its parent → `└`, otherwise `├`.
         is_last_child: bool,
+        /// A background agent — neutral `∙` marker, select-only.
+        is_bg: bool,
     },
 }
 
-/// Group top-level (interactive) agents by zellij session, nesting each
-/// background-agent child under its parent. Background agents whose parent
-/// isn't present collect into a trailing "unknown parent" placeholder group.
-/// `display_order` and `build_lines` both consume this, so their row order
-/// stays in lockstep.
+/// Group interactive agents by zellij session (flat top-level rows). All
+/// background (`run_in_background`) agents are decoupled into a single trailing
+/// "bg agents" section — they're daemon-owned, have no pane, and aren't
+/// clickable (`focus_sid: None`); they're reached through Claude's agent view,
+/// not by focusing a pane here. They still render as full top-level rows (wrap
+/// to `MAX_NAME_LINES`, not the single-line child form). `display_order` and
+/// `build_lines` both consume this, so their row order stays in lockstep.
 fn grouped(agents: &[Agent]) -> Vec<Group> {
     let is_bg = |a: &Agent| a.kind == "bg";
-    let top_sids: HashSet<String> = agents
-        .iter()
-        .filter(|a| !is_bg(a))
-        .map(|a| a.session_id.clone())
-        .collect();
-
-    // Bucket bg children under their parent (if it's a visible top-level row),
-    // else set them aside as orphans.
-    let mut children_by_parent: HashMap<String, Vec<Agent>> = HashMap::new();
-    let mut orphans: Vec<Agent> = Vec::new();
-    for a in agents.iter().filter(|a| is_bg(a)) {
-        match &a.parent_session_id {
-            Some(p) if top_sids.contains(p) => {
-                children_by_parent.entry(p.clone()).or_default().push(a.clone())
-            },
-            _ => orphans.push(a.clone()),
-        }
-    }
-    let by_started = |v: &mut Vec<Agent>| v.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
-    children_by_parent.values_mut().for_each(by_started);
-    by_started(&mut orphans);
-
-    // Turn a parent's buckets of children into nested rows (└─ on the last).
-    let child_rows = |parent_sid: &str, children_by_parent: &HashMap<String, Vec<Agent>>| -> Vec<Row> {
-        let kids = children_by_parent.get(parent_sid).cloned().unwrap_or_default();
-        let last = kids.len().saturating_sub(1);
-        kids.into_iter()
-            .enumerate()
-            .map(|(i, c)| Row {
-                agent: c,
-                is_child: true,
-                is_last_child: i == last,
-                focus_sid: Some(parent_sid.to_string()),
-            })
-            .collect()
-    };
 
     let mut by_key: BTreeMap<Option<String>, Vec<Agent>> = BTreeMap::new();
     for a in agents.iter().filter(|a| !is_bg(a)) {
@@ -1032,18 +1015,13 @@ fn grouped(agents: &[Agent]) -> Vec<Group> {
                 Some(s) => GroupLabel::Session(s.clone()),
                 None => GroupLabel::Sessionless,
             };
-            let mut rows = Vec::new();
-            for t in tops {
-                let sid = t.session_id.clone();
-                let kids = child_rows(&sid, &children_by_parent);
-                rows.push(Row {
-                    agent: t,
-                    is_child: false,
-                    is_last_child: false,
-                    focus_sid: Some(sid),
-                });
-                rows.extend(kids);
-            }
+            let rows = tops
+                .into_iter()
+                .map(|t| {
+                    let sid = t.session_id.clone();
+                    Row { agent: t, is_child: false, is_last_child: false, focus_sid: Some(sid) }
+                })
+                .collect();
             Group { label, rows, created_ms, any_unrouted }
         })
         .collect();
@@ -1056,21 +1034,21 @@ fn grouped(agents: &[Agent]) -> Vec<Group> {
         _ => a.created_ms.cmp(&b.created_ms),
     });
 
-    // Orphaned bg children → a trailing placeholder-parent group.
-    if !orphans.is_empty() {
-        let created_ms = orphans.iter().map(|a| a.started_at_ms).min().unwrap_or(i64::MAX);
-        let last = orphans.len() - 1;
-        let rows = orphans
+    // Background agents → one trailing section, flat top-level rows, select-only.
+    let mut bg: Vec<Agent> = agents.iter().filter(|a| is_bg(a)).cloned().collect();
+    if !bg.is_empty() {
+        bg.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
+        let created_ms = bg.iter().map(|a| a.started_at_ms).min().unwrap_or(i64::MAX);
+        let rows = bg
             .into_iter()
-            .enumerate()
-            .map(|(i, o)| Row {
-                agent: o,
-                is_child: true,
-                is_last_child: i == last,
-                focus_sid: None,
-            })
+            .map(|a| Row { agent: a, is_child: false, is_last_child: false, focus_sid: None })
             .collect();
-        groups.push(Group { label: GroupLabel::UnknownParent, rows, created_ms, any_unrouted: true });
+        groups.push(Group {
+            label: GroupLabel::BackgroundAgents,
+            rows,
+            created_ms,
+            any_unrouted: false,
+        });
     }
 
     groups
@@ -1101,6 +1079,7 @@ fn build_lines(
                 needs_attention: false,
                 is_in_view: false,
                 active: true,
+                is_bg: false,
             });
             let name = if a.name.trim().is_empty() {
                 a.session_id.get(..8).unwrap_or(&a.session_id).to_string()
@@ -1125,6 +1104,7 @@ fn build_lines(
                     is_first_wrap_line: i == 0,
                     is_child: row.is_child,
                     is_last_child: row.is_last_child,
+                    is_bg: f.is_bg,
                 });
             }
             let end_exclusive = lines.len();
@@ -1301,6 +1281,7 @@ fn render_agent_line(
     is_first_wrap_line: bool,
     is_child: bool,
     is_last_child: bool,
+    is_bg: bool,
     selected: bool,
     spinner: Option<char>,
     colors: &AgentColors,
@@ -1396,6 +1377,8 @@ fn render_agent_line(
         if is_last_child { '\u{2514}' } else { '\u{251c}' } // └ / ├
     } else if dead {
         '\u{2020}' // † — tracked-but-not-active
+    } else if is_bg {
+        '\u{2219}' // ∙ — background agent: select-only, no pane to route to
     } else if unrouted {
         '\u{2717}' // ✗
     } else {
@@ -1409,7 +1392,7 @@ fn render_agent_line(
     // on-colour only where red wouldn't read.
     let marker_fg = if dead {
         if selected { colors.selected_fg } else { name_fg }
-    } else if unrouted && spinner.is_none() {
+    } else if unrouted && !is_bg && spinner.is_none() {
         if in_view || alert { colors.on_color } else { colors.error }
     } else if selected {
         colors.selected_fg
