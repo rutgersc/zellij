@@ -26,17 +26,19 @@
 //! daemon then drops it from the readmodel) and hides it optimistically. Live
 //! rows ignore `x`.
 //!
-//! Click any row of an agent → `mux focus-agent <session_id>`. Up/Down
-//! moves the keyboard cursor across agents, Enter activates, `y` yanks the id,
-//! `x` dismisses an inactive row, Esc returns focus to the previous pane.
-//! Clicking/Enter dispatches for tracked-but-not-active rows too — a dead
-//! agent's zellij pane usually outlives its heartbeat, so `mux focus-agent`
-//! navigates to it and aborts loudly only if the pane is actually gone. Rows
-//! with no resolvable focus target (orphan children) only select. While
-//! that `mux` command is in flight a braille spinner replaces the row's `>`
-//! marker (col 1), so a slow focus shows work happening right where you
-//! clicked; it clears on the matching RunCommandResult (or, as a safety net,
-//! after MAX_SPIN_TICKS).
+//! Click a live agent's row → `mux focus-agent <session_id>`. A dead
+//! (tracked-but-not-active) row only selects on click/Enter — its heartbeat is
+//! gone, so routing on a casual click is likelier wrong than right. Up/Down
+//! moves the keyboard cursor across agents, Enter activates the selected live
+//! row, `g` goes to the selected agent's pane best-effort — live OR dead: a
+//! dead agent's zellij pane usually outlives its heartbeat, so `mux
+//! focus-agent` navigates to it and aborts loudly only if the pane is actually
+//! gone. `y` yanks the id, `x` dismisses an inactive row, Esc returns focus to
+//! the previous pane. Rows with no resolvable focus target (bg / orphan
+//! children) only select. While that `mux` command is in flight a braille
+//! spinner replaces the row's `>` marker (col 1), so a slow focus shows work
+//! happening right where you clicked; it clears on the matching
+//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS).
 //!
 //! Every distinguishable load state — awaiting permission, no $HOME in
 //! env, file missing/unreadable/unparseable, empty snapshot — has its own
@@ -373,14 +375,11 @@ impl ZellijPlugin for State {
                     // way to mark a select-only bg agent seen, since it has no
                     // pane to route to.
                     self.acknowledge_agent(&sid);
-                    // Focus only when the row routes to a pane. bg agents carry no
-                    // target (select-only); a dead-but-routed agent's pane usually
-                    // outlives its heartbeat, and `mux focus-agent` verifies the
-                    // pane still exists and aborts loudly if not.
-                    if let Some(target) = self.focus_targets.get(&sid).cloned() {
-                        self.in_flight.insert(sid.clone(), 0);
-                        let _ = self.dispatch_focus_agent(&target, &sid);
-                    }
+                    // Route only a LIVE agent's pane. A dead (tracked-but-not-
+                    // active) row only selects — its heartbeat is gone, so routing
+                    // on a casual click is likelier wrong than right. Press `g` for
+                    // a best-effort jump to a dead agent's still-alive pane.
+                    self.focus_row(&sid, false);
                     return true;
                 }
                 false
@@ -391,10 +390,12 @@ impl ZellijPlugin for State {
                 let no_mods = key.has_no_modifiers();
                 let go_up = matches!(key.bare_key, BareKey::Up | BareKey::Char('k')) && no_mods;
                 let go_down = matches!(key.bare_key, BareKey::Down | BareKey::Char('j')) && no_mods;
-                let go_first = matches!(key.bare_key, BareKey::Home | BareKey::Char('g')) && no_mods;
+                let go_first = matches!(key.bare_key, BareKey::Home) && no_mods;
                 let go_last = matches!(key.bare_key, BareKey::End | BareKey::Char('G')) && no_mods;
+                let go_pane = matches!(key.bare_key, BareKey::Char('g')) && no_mods;
                 let activate = matches!(key.bare_key, BareKey::Enter) && no_mods;
                 let yank = matches!(key.bare_key, BareKey::Char('y')) && no_mods;
+                let yank_cmd = matches!(key.bare_key, BareKey::Char('v')) && no_mods;
                 let dismiss = matches!(key.bare_key, BareKey::Char('x')) && no_mods;
                 let cancel = matches!(key.bare_key, BareKey::Esc | BareKey::Char('q')) && no_mods;
                 if go_up && len > 0 {
@@ -419,6 +420,22 @@ impl ZellijPlugin for State {
                     self.selected_idx = Some(len - 1);
                     return true;
                 }
+                if go_pane {
+                    if let Some(sid) = self
+                        .selected_idx
+                        .and_then(|i| agents.get(i))
+                        .map(|a| a.session_id.clone())
+                    {
+                        // Go to the selected agent's pane, best effort — routes a
+                        // live OR dead row. A dead agent's zellij pane usually
+                        // outlives its heartbeat; `mux focus-agent` verifies it and
+                        // aborts loudly if the pane is actually gone.
+                        self.acknowledge_agent(&sid);
+                        self.focus_row(&sid, true);
+                        return true;
+                    }
+                    return false;
+                }
                 if activate {
                     if let Some(agent) = self.selected_idx.and_then(|i| agents.get(i)) {
                         let sid = agent.session_id.clone();
@@ -426,13 +443,9 @@ impl ZellijPlugin for State {
                         // yellow) even for select-only bg agents — that's their
                         // only way to be marked seen (no pane to focus).
                         self.acknowledge_agent(&sid);
-                        // Focus only when routable. bg carry no target; a
-                        // dead-but-routed agent's pane usually outlives its
-                        // heartbeat, and `mux focus-agent` aborts loudly if gone.
-                        if let Some(target) = self.focus_targets.get(&sid).cloned() {
-                            self.in_flight.insert(sid.clone(), 0);
-                            let _ = self.dispatch_focus_agent(&target, &sid);
-                        }
+                        // Route only a LIVE agent — a dead row only selects (press
+                        // `g` to force a best-effort jump to its pane).
+                        self.focus_row(&sid, false);
                         return true;
                     }
                     return false;
@@ -458,6 +471,20 @@ impl ZellijPlugin for State {
                         .map(|a| a.session_id.clone())
                     {
                         copy_to_clipboard(sid);
+                        return true;
+                    }
+                    return false;
+                }
+                if yank_cmd {
+                    // Copy the exact CLI behind the go-to-pane action:
+                    // `mux focus-agent <focus_sid>`. Only rows that route to a pane
+                    // have a command — bg / orphan rows carry no focus target.
+                    if let Some(target) = self
+                        .selected_idx
+                        .and_then(|i| agents.get(i))
+                        .and_then(|a| self.focus_targets.get(&a.session_id))
+                    {
+                        copy_to_clipboard(format!("mux focus-agent {target}"));
                         return true;
                     }
                     return false;
@@ -604,6 +631,28 @@ impl State {
     /// the in-flight spinner — echoed on RunCommandResult so the spinner clears
     /// on the row the user actually clicked (which == focus_sid for a top-level
     /// agent).
+    /// Dispatch `mux focus-agent` for a row when it routes to a pane. `allow_dead`
+    /// gates tracked-but-not-active rows: click/Enter pass `false` (a dead row's
+    /// heartbeat is gone, so it only selects), the `g` key passes `true` for a
+    /// best-effort jump — a dead agent's zellij pane usually outlives its
+    /// heartbeat, and `mux focus-agent` verifies the pane and aborts loudly if it
+    /// is actually gone. bg / orphan rows carry no target and never route.
+    fn focus_row(&mut self, sid: &str, allow_dead: bool) {
+        let is_dead = self
+            .current_agents()
+            .iter()
+            .find(|a| a.session_id == sid)
+            .map(|a| !a.active)
+            .unwrap_or(false);
+        if is_dead && !allow_dead {
+            return;
+        }
+        if let Some(target) = self.focus_targets.get(sid).cloned() {
+            self.in_flight.insert(sid.to_string(), 0);
+            let _ = self.dispatch_focus_agent(&target, sid);
+        }
+    }
+
     fn dispatch_focus_agent(&self, focus_sid: &str, echo_sid: &str) -> String {
         let label = focus_sid.get(..8).unwrap_or(focus_sid).to_string();
         let mut ctx = BTreeMap::new();
