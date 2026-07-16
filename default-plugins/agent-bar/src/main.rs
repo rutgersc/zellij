@@ -789,7 +789,14 @@ impl State {
         let mut flags: HashMap<String, Flags> = HashMap::new();
         for agent in &raw_agents {
             let unrouted = agent.zellij_pane_id.is_none();
+            // A busy agent is actively working, not waiting on you: going busy
+            // again means you gave it new work, which acknowledges the prior
+            // completion. Suppress the stale yellow now — the next completion
+            // re-raises it with a fresh `attention_at_ms`. Without this the
+            // alert lingers when you type on a pane you're already viewing (the
+            // done→busy flip has no acknowledge path of its own).
             let unseen = agent.active
+                && !matches!(agent.status, AgentStatus::Busy)
                 && agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
             // In view = same zellij session AND the agent's pane sits in this
