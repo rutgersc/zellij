@@ -1,6 +1,7 @@
 //! `Tab`s holds multiple panes. It tracks their coordinates (x/y) and size,
 //! as well as how they should be resized
 
+mod alt_screen_scroll;
 mod clipboard;
 mod copy_command;
 mod layout_applier;
@@ -41,6 +42,7 @@ use crate::ui::{
 use layout_applier::LayoutApplier;
 use swap_layouts::SwapLayouts;
 
+use self::alt_screen_scroll::AltScreenScroll;
 use self::clipboard::ClipboardProvider;
 use crate::route::NotificationEnd;
 use crate::{
@@ -6102,6 +6104,9 @@ impl Tab {
         }
     }
     pub fn scroll_active_terminal_up(&mut self, client_id: ClientId) {
+        if self.forward_scroll_in_alternate_screen(AltScreenScroll::LineUp, client_id) {
+            return;
+        }
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             active_pane.scroll_up(1, client_id);
         }
@@ -6134,6 +6139,9 @@ impl Tab {
     pub fn scroll_active_terminal_down(&mut self, client_id: ClientId) -> Result<()> {
         let err_context = || format!("failed to scroll down active pane for client {client_id}");
 
+        if self.forward_scroll_in_alternate_screen(AltScreenScroll::LineDown, client_id) {
+            return Ok(());
+        }
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             active_pane.scroll_down(1, client_id);
             if !active_pane.is_scrolled() {
@@ -6180,6 +6188,9 @@ impl Tab {
     }
 
     pub fn scroll_active_terminal_up_page(&mut self, client_id: ClientId) {
+        if self.forward_scroll_in_alternate_screen(AltScreenScroll::PageUp, client_id) {
+            return;
+        }
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             // prevent overflow when row == 0
             let scroll_rows = active_pane.rows().max(1).saturating_sub(1);
@@ -6202,6 +6213,9 @@ impl Tab {
         let err_context =
             || format!("failed to scroll down one page in active pane for client {client_id}");
 
+        if self.forward_scroll_in_alternate_screen(AltScreenScroll::PageDown, client_id) {
+            return Ok(());
+        }
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             let scroll_rows = active_pane.get_content_rows();
             active_pane.scroll_down(scroll_rows, client_id);
@@ -6231,6 +6245,9 @@ impl Tab {
     }
 
     pub fn scroll_active_terminal_up_half_page(&mut self, client_id: ClientId) {
+        if self.forward_scroll_in_alternate_screen(AltScreenScroll::PageUp, client_id) {
+            return;
+        }
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             // prevent overflow when row == 0
             let scroll_rows = (active_pane.rows().max(1).saturating_sub(1)) / 2;
@@ -6242,6 +6259,9 @@ impl Tab {
         let err_context =
             || format!("failed to scroll down half a page in active pane for client {client_id}");
 
+        if self.forward_scroll_in_alternate_screen(AltScreenScroll::PageDown, client_id) {
+            return Ok(());
+        }
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             let scroll_rows = (active_pane.rows().max(1) - 1) / 2;
             active_pane.scroll_down(scroll_rows, client_id);
