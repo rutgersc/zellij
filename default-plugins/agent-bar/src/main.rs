@@ -16,7 +16,8 @@
 //! attention/waiting (yellow, red if unknown), in-view (green), and selection
 //! (grey) each claim columns by priority, so combinations layer rather than
 //! overwrite (see the palette block below). `✗` after the session header marks
-//! agents missing a `zellij_pane_id`.
+//! agents missing a `zellij_pane_id`; `⧉` marks a session some *other* terminal
+//! window already has attached, so you don't open the same one twice.
 //!
 //! An agent whose live heartbeat is gone is kept as *tracked-but-not-active*
 //! (the daemon carries it forward as `active: false`): it renders dim with a
@@ -115,6 +116,8 @@ const SESSIONLESS_LABEL: &str = "sessionless";
 // everything at once — green/yellow/on-colour/magenta come from ribbon_selected,
 // exit_code_error and text_unselected. Only the structural glyphs are hardcoded.
 const UNROUTED: &str = "\u{2717}";
+/// Header suffix for a session another terminal window is attached to.
+const OPEN_ELSEWHERE: &str = "\u{29C9}";
 
 /// Theme-driven colours for every agent state. Built once per render from
 /// `mode_info.style.colors` so a ChangeTheme keystroke updates the whole
@@ -207,6 +210,9 @@ struct State {
     /// PaneManifest + active tab let us decide which agents are "here".
     pane_manifest: PaneManifest,
     active_tab_idx: Option<usize>,
+    /// session name → attached client count, from `get_session_list()`. A count
+    /// past our own client means another terminal window has that session open.
+    session_clients: HashMap<String, usize>,
     /// Latest scan of `agent-seen-events/` keyed by claude_id.
     seen_disk: HashMap<String, i64>,
     /// Optimistic mark-seen overlay; effective = max(disk, overlay).
@@ -343,6 +349,9 @@ impl ZellijPlugin for State {
                         *last = Some(new);
                     }
                     if self.refresh_seen_disk() {
+                        changed = true;
+                    }
+                    if self.refresh_session_clients() {
                         changed = true;
                     }
                 }
@@ -751,6 +760,27 @@ impl State {
         true
     }
 
+    /// Pull per-session client counts. Also pushes a fresh SessionUpdate to every
+    /// plugin as a side effect, so this doubles as the panel's session refresh.
+    fn refresh_session_clients(&mut self) -> bool {
+        let new: HashMap<String, usize> = match get_session_list() {
+            Ok(snapshot) => snapshot
+                .live_sessions
+                .into_iter()
+                .map(|s| (s.name, s.connected_clients))
+                .collect(),
+            // Only fails when the server's session-scan state is missing, which
+            // can't recover — drop the counts rather than keep asserting a stale
+            // "open elsewhere" on a header.
+            Err(_) => HashMap::new(),
+        };
+        if new == self.session_clients {
+            return false;
+        }
+        self.session_clients = new;
+        true
+    }
+
     fn refresh_seen_disk(&mut self) -> bool {
         let Some(dir) = &self.seen_events_dir else { return false };
         let new = agents::read_seen_events(dir);
@@ -846,7 +876,8 @@ impl State {
         // marker + the space are reserved on the left). Headers use
         // `cols - OUTER_PAD`.
         let name_wrap_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
-        let (lines, agent_row_starts) = build_lines(&groups, &flags, name_wrap_w);
+        let (lines, agent_row_starts) =
+            build_lines(&groups, &flags, name_wrap_w, &self.session_clients, &session);
 
         // Scroll so selected agent's first line is visible.
         self.adjust_scroll(&agent_row_starts, &lines, rows);
@@ -862,9 +893,16 @@ impl State {
             let line = &lines[abs_idx];
             let rendered = match line {
                 Line::Padding => render_padding(colors, cols),
-                Line::Header { label, unrouted_in_group } => {
+                Line::Header { label, unrouted_in_group, open_elsewhere } => {
                     let is_active = !session.is_empty() && label.as_str() == session.as_str();
-                    render_header(label, *unrouted_in_group, is_active, colors, cols)
+                    render_header(
+                        label,
+                        *unrouted_in_group,
+                        *open_elsewhere,
+                        is_active,
+                        colors,
+                        cols,
+                    )
                 },
                 Line::AgentRow {
                     sid,
@@ -1023,6 +1061,8 @@ enum Line {
     Header {
         label: String,
         unrouted_in_group: bool,
+        /// Another terminal window is attached to this session.
+        open_elsewhere: bool,
     },
     AgentRow {
         sid: String,
@@ -1117,6 +1157,8 @@ fn build_lines(
     groups: &[Group],
     flags: &HashMap<String, Flags>,
     content_w: usize,
+    session_clients: &HashMap<String, usize>,
+    own_session: &str,
 ) -> (Vec<Line>, Vec<(usize, usize)>) {
     let mut lines: Vec<Line> = Vec::new();
     let mut agent_rows: Vec<(usize, usize)> = Vec::new();
@@ -1124,9 +1166,15 @@ fn build_lines(
         if gi > 0 {
             lines.push(Line::Padding);
         }
+        let clients = session_clients.get(g.label.as_str()).copied().unwrap_or(0);
+        // Discount our own client so our session flags only when a SECOND window
+        // also has it attached. The sessionless / bg-agents labels never match a
+        // real session, so they land on 0 and never flag.
+        let is_own = !own_session.is_empty() && g.label.as_str() == own_session;
         lines.push(Line::Header {
             label: g.label.as_str().to_string(),
             unrouted_in_group: g.any_unrouted,
+            open_elsewhere: clients.saturating_sub(is_own as usize) > 0,
         });
         for row in &g.rows {
             let a = &row.agent;
@@ -1272,6 +1320,7 @@ fn render_padding(colors: &AgentColors, cols: usize) -> String {
 fn render_header(
     label: &str,
     unrouted_in_group: bool,
+    open_elsewhere: bool,
     is_active: bool,
     colors: &AgentColors,
     cols: usize,
@@ -1303,11 +1352,22 @@ fn render_header(
     } else {
         false
     };
+    let elsewhere_suffix = if open_elsewhere && text_budget >= 2 {
+        text_budget = text_budget.saturating_sub(2);
+        true
+    } else {
+        false
+    };
     // The header of the session the user is currently in glows with the
     // theme's active-tab green (matching the in-view agent tint), so "you are
     // here" is obvious; other sessions keep the neutral header strip.
+    // A session another window holds takes the busy-magenta on the neutral strip
+    // — the one hue in the palette that isn't already spoken for by in-view green
+    // or attention yellow, so "someone else has this" can't be misread as either.
     let (h_fg, h_bg) = if is_active {
         (colors.on_color, colors.green)
+    } else if open_elsewhere {
+        (colors.magenta, colors.header_bg)
     } else {
         (colors.text, colors.header_bg)
     };
@@ -1318,6 +1378,14 @@ fn render_header(
             &style!(colors.error, h_bg)
                 .bold()
                 .paint(format!(" {UNROUTED}"))
+                .to_string(),
+        );
+    }
+    if elsewhere_suffix {
+        body.push_str(
+            &style!(h_fg, h_bg)
+                .bold()
+                .paint(format!(" {OPEN_ELSEWHERE}"))
                 .to_string(),
         );
     }
