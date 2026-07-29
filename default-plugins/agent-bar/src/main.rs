@@ -3,13 +3,16 @@
 //! `~/.claude/readmodel/agents.json` every `POLL_SECS`.
 //!
 //! Layout: each agent's `name` is word-wrapped to the pane width (1..=4
-//! rows). Agents are grouped under the zellij session they belong to;
-//! groups (and agents within them) are ordered by `started_at_ms` asc, so
-//! the oldest sessions stay at the top and newly created ones append at the
-//! bottom. A session's slot is pinned by its earliest agent's creation
-//! time, so it doesn't jump around as later agents come and go. Agents
-//! without a `zellij_session` collect in a "sessionless" group pinned to
-//! the very bottom.
+//! rows). Agents are grouped under the zellij session they belong to, and
+//! **every live zellij session gets a header whether or not it has agents** —
+//! the panel is a session list first, an agent list second. Clicking a session
+//! header switches this client to that session; clicking an agent row routes to
+//! its pane. Groups are ordered by the zellij session's own creation time
+//! (oldest at the top, new ones append at the bottom), pinned on first sight so
+//! a slot doesn't drift; a session that has left the live list keeps its slot
+//! from its earliest agent's `started_at_ms`. Agents within a group are ordered
+//! by `started_at_ms` asc. Agents without a `zellij_session` collect in a
+//! "sessionless" group pinned to the very bottom.
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
@@ -27,7 +30,10 @@
 //! daemon then drops it from the readmodel) and hides it optimistically. Live
 //! rows ignore `x`.
 //!
-//! Click a live agent's row → `mux focus-agent <session_id>`. A dead
+//! Click a session header → `switch_session` to it (the header of the session
+//! you're already in is inert, as is a header for a session that only exists in
+//! the readmodel — switching to a name with no live session would silently
+//! create one). Click a live agent's row → `mux focus-agent <session_id>`. A dead
 //! (tracked-but-not-active) row only selects on click/Enter — its heartbeat is
 //! gone, so routing on a casual click is likelier wrong than right. Up/Down
 //! moves the keyboard cursor across agents, Enter activates the selected live
@@ -39,7 +45,10 @@
 //! children) only select. While that `mux` command is in flight a braille
 //! spinner replaces the row's `>` marker (col 1), so a slow focus shows work
 //! happening right where you clicked; it clears on the matching
-//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS).
+//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS). The wheel moves
+//! the viewport without moving the cursor — load-bearing now that agentless
+//! sessions each cost two rows: a header below the fold has no agent row near it
+//! to navigate to, so without the wheel it would be unreachable.
 //!
 //! Every distinguishable load state — awaiting permission, no $HOME in
 //! env, file missing/unreadable/unparseable, empty snapshot — has its own
@@ -185,6 +194,23 @@ impl AgentColors {
     }
 }
 
+/// A live zellij session, independent of whether any agent runs in it.
+#[derive(Clone, PartialEq)]
+struct SessionMeta {
+    /// Attached clients. Past our own, another terminal window holds it.
+    clients: usize,
+    /// Wall-clock creation, derived from the age `get_session_list()` reports.
+    created_ms: i64,
+}
+
+/// What a rendered row routes to when clicked.
+#[derive(Clone)]
+enum RowTarget {
+    Agent(String),
+    /// A live session's header — switches this client to it.
+    Session(String),
+}
+
 #[derive(Default)]
 enum LoadState {
     #[default]
@@ -200,8 +226,9 @@ enum LoadState {
 struct State {
     load: LoadState,
     mode_info: ModeInfo,
-    /// Click hit-test: rendered_row → session_id. Rebuilt every render.
-    row_ranges: Vec<(usize, String)>,
+    /// Click hit-test: rendered_row → what that row routes to. Rebuilt every
+    /// render.
+    row_ranges: Vec<(usize, RowTarget)>,
     /// session_id → the session_id to actually focus when this row is clicked.
     /// For a top-level agent it's itself; for a nested bg child it's the parent
     /// (the child has no pane of its own). Absent → no pane to focus (orphan).
@@ -210,9 +237,10 @@ struct State {
     /// PaneManifest + active tab let us decide which agents are "here".
     pane_manifest: PaneManifest,
     active_tab_idx: Option<usize>,
-    /// session name → attached client count, from `get_session_list()`. A count
-    /// past our own client means another terminal window has that session open.
-    session_clients: HashMap<String, usize>,
+    /// Every live zellij session from `get_session_list()`, keyed by name. Drives
+    /// the always-present per-session header, the group sort order, and the `⧉`
+    /// suffix (a client count past our own = another terminal window has it).
+    sessions: HashMap<String, SessionMeta>,
     /// Latest scan of `agent-seen-events/` keyed by claude_id.
     seen_disk: HashMap<String, i64>,
     /// Optimistic mark-seen overlay; effective = max(disk, overlay).
@@ -229,6 +257,10 @@ struct State {
     last_external_focused_pane: Option<u32>,
     /// Row scroll offset into the rendered line list.
     scroll_offset: usize,
+    /// Set whenever the cursor MOVES, consumed by the next `adjust_scroll`. The
+    /// viewport chases the selection only then — otherwise a wheel scroll that
+    /// pushes the selected row off-screen would be yanked straight back.
+    follow_selection: bool,
     /// session_ids whose `mux focus-agent` was dispatched but hasn't reported
     /// back yet (cleared on RunCommandResult). The value is the row's age in
     /// fast ticks — used both as the spinner frame index and the
@@ -292,6 +324,10 @@ impl ZellijPlugin for State {
                         },
                         None => LoadState::NoHomeInEnv,
                     };
+                    // Seed the session list synchronously too, so the very first
+                    // frame already carries every session's header rather than
+                    // waiting a poll for them to appear.
+                    self.refresh_sessions();
                     self.cur_timeout = POLL_SECS;
                     set_timeout(POLL_SECS);
                     return true;
@@ -324,6 +360,7 @@ impl ZellijPlugin for State {
                     } else {
                         None
                     };
+                    self.follow_selection = now_focused;
                     self.was_focused = now_focused;
                     return true;
                 }
@@ -351,7 +388,7 @@ impl ZellijPlugin for State {
                     if self.refresh_seen_disk() {
                         changed = true;
                     }
-                    if self.refresh_session_clients() {
+                    if self.refresh_sessions() {
                         changed = true;
                     }
                 }
@@ -364,34 +401,58 @@ impl ZellijPlugin for State {
                 set_timeout(self.cur_timeout);
                 changed
             },
+            // The wheel moves the viewport only — it never moves the cursor, and
+            // `follow_selection` stays clear so the next render won't snap back to
+            // the selected row. Overshoot down is clamped at render time, where the
+            // line count and viewport height are known.
+            Event::Mouse(Mouse::ScrollUp(lines)) => {
+                let before = self.scroll_offset;
+                self.scroll_offset = self.scroll_offset.saturating_sub(lines.max(1));
+                self.scroll_offset != before
+            },
+            Event::Mouse(Mouse::ScrollDown(lines)) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(lines.max(1));
+                true
+            },
             Event::Mouse(Mouse::LeftClick(line, _col)) => {
                 let row = if line < 0 { return false } else { line as usize };
                 let hit = self
                     .row_ranges
                     .iter()
                     .find(|(r, _)| *r == row)
-                    .map(|(_, sid)| sid.clone());
-                if let Some(sid) = hit {
-                    if let Some(idx) = self
-                        .display_order()
-                        .iter()
-                        .position(|a| a.session_id == sid)
-                    {
-                        self.selected_idx = Some(idx);
-                    }
-                    // A click acknowledges the row's attention (clears the yellow)
-                    // regardless of whether it can be focused — that's the only
-                    // way to mark a select-only bg agent seen, since it has no
-                    // pane to route to.
-                    self.acknowledge_agent(&sid);
-                    // Route only a LIVE agent's pane. A dead (tracked-but-not-
-                    // active) row only selects — its heartbeat is gone, so routing
-                    // on a casual click is likelier wrong than right. Press `g` for
-                    // a best-effort jump to a dead agent's still-alive pane.
-                    self.focus_row(&sid, false);
-                    return true;
+                    .map(|(_, target)| target.clone());
+                match hit {
+                    // Header click → attach this client to that session. Only
+                    // headers of live sessions other than our own carry a target
+                    // (see `Line::Header::switch_to`), so this can't create a
+                    // session or pointlessly re-attach the one we're in.
+                    Some(RowTarget::Session(name)) => {
+                        switch_session(Some(&name));
+                        true
+                    },
+                    Some(RowTarget::Agent(sid)) => {
+                        if let Some(idx) = self
+                            .display_order()
+                            .iter()
+                            .position(|a| a.session_id == sid)
+                        {
+                            self.selected_idx = Some(idx);
+                            self.follow_selection = true;
+                        }
+                        // A click acknowledges the row's attention (clears the yellow)
+                        // regardless of whether it can be focused — that's the only
+                        // way to mark a select-only bg agent seen, since it has no
+                        // pane to route to.
+                        self.acknowledge_agent(&sid);
+                        // Route only a LIVE agent's pane. A dead (tracked-but-not-
+                        // active) row only selects — its heartbeat is gone, so routing
+                        // on a casual click is likelier wrong than right. Press `g` for
+                        // a best-effort jump to a dead agent's still-alive pane.
+                        self.focus_row(&sid, false);
+                        true
+                    },
+                    None => false,
                 }
-                false
             },
             Event::Key(key) => {
                 let agents = self.display_order();
@@ -412,6 +473,7 @@ impl ZellijPlugin for State {
                         Some(i) if i > 0 => i - 1,
                         _ => 0,
                     });
+                    self.follow_selection = true;
                     return true;
                 }
                 if go_down && len > 0 {
@@ -419,14 +481,17 @@ impl ZellijPlugin for State {
                         Some(i) => (i + 1).min(len - 1),
                         None => 0,
                     });
+                    self.follow_selection = true;
                     return true;
                 }
                 if go_first && len > 0 {
                     self.selected_idx = Some(0);
+                    self.follow_selection = true;
                     return true;
                 }
                 if go_last && len > 0 {
                     self.selected_idx = Some(len - 1);
+                    self.follow_selection = true;
                     return true;
                 }
                 if go_pane {
@@ -552,7 +617,10 @@ impl ZellijPlugin for State {
                 Some(ReadResult::ParseError(e)) => {
                     Action::Diag(colors.error, format!("parse error: {e}"))
                 },
-                Some(ReadResult::Ok(agents)) if agents.is_empty() => {
+                // Session headers stand on their own, so an empty readmodel still
+                // renders cells. "no agents" is only the whole story when there
+                // are no sessions to list either.
+                Some(ReadResult::Ok(agents)) if agents.is_empty() && self.sessions.is_empty() => {
                     Action::Diag(colors.text, "no agents".to_string())
                 },
                 Some(ReadResult::Ok(_)) => Action::Cells,
@@ -593,7 +661,7 @@ impl State {
     }
 
     fn display_order(&self) -> Vec<Agent> {
-        grouped(&self.visible_agents())
+        grouped(&self.visible_agents(), &self.sessions)
             .into_iter()
             .flat_map(|g| g.rows.into_iter().map(|r| r.agent))
             .collect()
@@ -760,24 +828,36 @@ impl State {
         true
     }
 
-    /// Pull per-session client counts. Also pushes a fresh SessionUpdate to every
+    /// Pull the live session list. Also pushes a fresh SessionUpdate to every
     /// plugin as a side effect, so this doubles as the panel's session refresh.
-    fn refresh_session_clients(&mut self) -> bool {
-        let new: HashMap<String, usize> = match get_session_list() {
+    fn refresh_sessions(&mut self) -> bool {
+        let now = now_ms();
+        let new: HashMap<String, SessionMeta> = match get_session_list() {
             Ok(snapshot) => snapshot
                 .live_sessions
                 .into_iter()
-                .map(|s| (s.name, s.connected_clients))
+                .map(|s| {
+                    // `creation_time` is an AGE, not an epoch. Derive the absolute
+                    // key once and then keep it: the reported age is truncated to
+                    // whole seconds, so recomputing it every poll would jitter the
+                    // group order and make every poll look like a change.
+                    let created_ms = self
+                        .sessions
+                        .get(&s.name)
+                        .map(|m| m.created_ms)
+                        .unwrap_or_else(|| now - s.creation_time.as_millis() as i64);
+                    (s.name, SessionMeta { clients: s.connected_clients, created_ms })
+                })
                 .collect(),
             // Only fails when the server's session-scan state is missing, which
-            // can't recover — drop the counts rather than keep asserting a stale
-            // "open elsewhere" on a header.
+            // can't recover — drop the list rather than keep asserting stale
+            // headers.
             Err(_) => HashMap::new(),
         };
-        if new == self.session_clients {
+        if new == self.sessions {
             return false;
         }
-        self.session_clients = new;
+        self.sessions = new;
         true
     }
 
@@ -850,7 +930,7 @@ impl State {
             );
         }
 
-        let groups = grouped(&raw_agents);
+        let groups = grouped(&raw_agents, &self.sessions);
         let display: Vec<Agent> = groups
             .iter()
             .flat_map(|g| g.rows.iter().map(|r| r.agent.clone()))
@@ -877,7 +957,7 @@ impl State {
         // `cols - OUTER_PAD`.
         let name_wrap_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
         let (lines, agent_row_starts) =
-            build_lines(&groups, &flags, name_wrap_w, &self.session_clients, &session);
+            build_lines(&groups, &flags, name_wrap_w, &self.sessions, &session);
 
         // Scroll so selected agent's first line is visible.
         self.adjust_scroll(&agent_row_starts, &lines, rows);
@@ -893,8 +973,12 @@ impl State {
             let line = &lines[abs_idx];
             let rendered = match line {
                 Line::Padding => render_padding(colors, cols),
-                Line::Header { label, unrouted_in_group, open_elsewhere } => {
+                Line::Header { label, unrouted_in_group, open_elsewhere, switch_to } => {
                     let is_active = !session.is_empty() && label.as_str() == session.as_str();
+                    if let Some(name) = switch_to {
+                        self.row_ranges
+                            .push((visible_row, RowTarget::Session(name.clone())));
+                    }
                     render_header(
                         label,
                         *unrouted_in_group,
@@ -918,7 +1002,8 @@ impl State {
                     is_bg,
                 } => {
                     let selected = selected_sid.as_deref() == Some(sid.as_str());
-                    self.row_ranges.push((visible_row, sid.clone()));
+                    self.row_ranges
+                        .push((visible_row, RowTarget::Agent(sid.clone())));
                     let spinner = self
                         .in_flight
                         .get(sid)
@@ -974,23 +1059,21 @@ impl State {
         lines: &[Line],
         rows: usize,
     ) {
-        let Some(sel) = self.selected_idx else {
-            self.scroll_offset = 0;
-            return;
-        };
-        let Some(&(start, end_exclusive)) = agent_row_starts.get(sel) else {
-            return;
-        };
-        let total = lines.len();
-        let max_scroll = total.saturating_sub(rows);
-        if start < self.scroll_offset {
-            self.scroll_offset = start.saturating_sub(1); // keep header in view if possible
-        } else if end_exclusive > self.scroll_offset + rows {
-            self.scroll_offset = end_exclusive.saturating_sub(rows);
+        let follow = std::mem::take(&mut self.follow_selection);
+        let range = self
+            .selected_idx
+            .filter(|_| follow)
+            .and_then(|sel| agent_row_starts.get(sel).copied());
+        if let Some((start, end_exclusive)) = range {
+            if start < self.scroll_offset {
+                self.scroll_offset = start.saturating_sub(1); // keep header in view if possible
+            } else if end_exclusive > self.scroll_offset + rows {
+                self.scroll_offset = end_exclusive.saturating_sub(rows);
+            }
         }
-        if self.scroll_offset > max_scroll {
-            self.scroll_offset = max_scroll;
-        }
+        // Also the landing place for a wheel scroll, which adds optimistically
+        // without knowing the line count or viewport height.
+        self.scroll_offset = self.scroll_offset.min(lines.len().saturating_sub(rows));
     }
 }
 
@@ -1063,6 +1146,12 @@ enum Line {
         unrouted_in_group: bool,
         /// Another terminal window is attached to this session.
         open_elsewhere: bool,
+        /// The session to switch to when this header is clicked. `None` — an
+        /// inert header — for the session we're already in, the sessionless /
+        /// bg-agents pseudo-groups, and a session that only exists in the
+        /// readmodel (switching to a name with no live session would silently
+        /// create one).
+        switch_to: Option<String>,
     },
     AgentRow {
         sid: String,
@@ -1086,17 +1175,22 @@ enum Line {
     },
 }
 
-/// Group interactive agents by zellij session (flat top-level rows). All
-/// background (`run_in_background`) agents are decoupled into a single trailing
-/// "bg agents" section — they're daemon-owned, have no pane, and aren't
-/// clickable (`focus_sid: None`); they're reached through Claude's agent view,
-/// not by focusing a pane here. They still render as full top-level rows (wrap
-/// to `MAX_NAME_LINES`, not the single-line child form). `display_order` and
-/// `build_lines` both consume this, so their row order stays in lockstep.
-fn grouped(agents: &[Agent]) -> Vec<Group> {
+/// Group interactive agents by zellij session (flat top-level rows). Every live
+/// zellij session gets a group even with no agents in it, so the panel always
+/// lists the full set of sessions. All background (`run_in_background`) agents
+/// are decoupled into a single trailing "bg agents" section — they're
+/// daemon-owned, have no pane, and aren't clickable (`focus_sid: None`); they're
+/// reached through Claude's agent view, not by focusing a pane here. They still
+/// render as full top-level rows (wrap to `MAX_NAME_LINES`, not the single-line
+/// child form). `display_order` and `build_lines` both consume this, so their
+/// row order stays in lockstep.
+fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Group> {
     let is_bg = |a: &Agent| a.kind == "bg";
 
     let mut by_key: BTreeMap<Option<String>, Vec<Agent>> = BTreeMap::new();
+    for name in sessions.keys() {
+        by_key.entry(Some(name.clone())).or_default();
+    }
     for a in agents.iter().filter(|a| !is_bg(a)) {
         by_key.entry(a.zellij_session.clone()).or_default().push(a.clone());
     }
@@ -1105,7 +1199,16 @@ fn grouped(agents: &[Agent]) -> Vec<Group> {
         .into_iter()
         .map(|(key, mut tops)| {
             tops.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
-            let created_ms = tops.iter().map(|a| a.started_at_ms).min().unwrap_or(i64::MAX);
+            // Sort key is the zellij SESSION's creation time, so agentless and
+            // agentful groups compare on one clock. A session that has left the
+            // live list (only tracked-but-inactive agents remain) keeps its slot
+            // from its earliest agent instead.
+            let created_ms = key
+                .as_ref()
+                .and_then(|s| sessions.get(s))
+                .map(|m| m.created_ms)
+                .or_else(|| tops.iter().map(|a| a.started_at_ms).min())
+                .unwrap_or(i64::MAX);
             let any_unrouted = tops.iter().any(|a| a.zellij_pane_id.is_none());
             let label = match &key {
                 Some(s) => GroupLabel::Session(s.clone()),
@@ -1157,16 +1260,20 @@ fn build_lines(
     groups: &[Group],
     flags: &HashMap<String, Flags>,
     content_w: usize,
-    session_clients: &HashMap<String, usize>,
+    sessions: &HashMap<String, SessionMeta>,
     own_session: &str,
 ) -> (Vec<Line>, Vec<(usize, usize)>) {
     let mut lines: Vec<Line> = Vec::new();
     let mut agent_rows: Vec<(usize, usize)> = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
+        // Breathing room above every non-first group, agentless ones included:
+        // without it adjacent headers stack flush and their filled strips merge
+        // into one block instead of reading as separate sessions.
         if gi > 0 {
             lines.push(Line::Padding);
         }
-        let clients = session_clients.get(g.label.as_str()).copied().unwrap_or(0);
+        let meta = sessions.get(g.label.as_str());
+        let clients = meta.map(|m| m.clients).unwrap_or(0);
         // Discount our own client so our session flags only when a SECOND window
         // also has it attached. The sessionless / bg-agents labels never match a
         // real session, so they land on 0 and never flag.
@@ -1175,6 +1282,10 @@ fn build_lines(
             label: g.label.as_str().to_string(),
             unrouted_in_group: g.any_unrouted,
             open_elsewhere: clients.saturating_sub(is_own as usize) > 0,
+            switch_to: match &g.label {
+                GroupLabel::Session(name) if !is_own && meta.is_some() => Some(name.clone()),
+                _ => None,
+            },
         });
         for row in &g.rows {
             let a = &row.agent;
