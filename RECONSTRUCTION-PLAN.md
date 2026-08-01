@@ -4,10 +4,10 @@ Rebuild the fork as the **smallest set of commits that is byte-identical at the 
 `backup/atomize-pre-cleanup`, with every commit owning its files.
 
 - **Base:** `e9173cba` — *feat: PWA support for the web client (#5184)*, the merge-base with `zellij-org/main`
-- **Original:** `backup/atomize-target` — **66 commits**, 100 files, **57 files touched more than once**
+- **Original:** `backup/atomize-target` — **67 commits**, 100 files, **57 files touched more than once**
 - **Target:** ~33 commits, **0 files touched more than once** apart from the deliberate exceptions in §6
 
-> Updated after commits 64–66 landed. They removed dead code and hoisted a probe,
+> Updated after commits 64–67 landed. They removed dead code and hoisted a probe,
 > which turned three items into **churn** (added *and* deleted inside the range) — see
 > §3.1. The diff target is now the 66-commit tip, not the 63-commit one.
 
@@ -54,6 +54,7 @@ them, and commits 64 and 65 disappear along with them.
 | `SessionRegistry::exited_sessions()` | `ab663eba` **#1** | `01925df3` **#64** | S1 never adds it |
 | `reap_stale_running_entries()` | `8e202143` **#2** | `01925df3` **#64** | S2 never adds it |
 | per-call pipe enumeration in `check_session_state` | `a216b2e1` **#62** | `041e3edc` **#66** | S5 introduces `LivenessProbe` directly |
+| `SessionLiveness::Stuck` + `SessionDisplayStatus::Stuck` + the cwd-attach `exit(1)` | `8e202143` **#2** | `52da69cc` **#67** | S2 ships 2-state from the start |
 
 `git-overlap` reports **0 churn** because it detects churn at *file* granularity and none of
 these files were deleted. Function-level churn has to be found with `git log -S`.
@@ -69,7 +70,7 @@ Ordered. Foundational first, feature commits after, artifacts last.
 | # | commit | folds |
 |---|---|---|
 | **S1** | `sessions: registry (sessions.kdl), decouple names from sockets` | 1, 52, 58 — **minus** `pid` and `exited_sessions` (§3.1) |
-| **S2** | `sessions: 3-state liveness (Alive/Stuck/Dead) in ls` | 2 — **minus** `reap_stale_running_entries` (§3.1) |
+| **S2** | `sessions: liveness (Alive/Dead) in ls` | 2 — **minus** `reap_stale_running_entries` and all of `Stuck` (§3.1) |
 | **S3** | `sessions: reap DEAD registry entries` | 3, 39 |
 | **S4** | `sessions: case-insensitive attach, reject overlapping/non-ASCII names` | 31 |
 | **S5** | `sessions: derive Dead from the pipe namespace via LivenessProbe` | 62, 66 — snapshot built in from the start |
@@ -103,8 +104,8 @@ Ordered. Foundational first, feature commits after, artifacts last.
 | **B4** | `chore: pre-commit wasm-rebake hook + .cargo config` | 27 |
 | **ART** | `chore: rebake default-plugin wasm` | 29, 45, and every wasm rider |
 
-66 → 33 named commits, of which 24 carry real logic. Commits **64** and **65** have no
-destination — they only delete what §3.1 says never to add.
+67 → 33 named commits, of which 24 carry real logic. Commits **64**, **65** and **67** have
+no destination — they only delete what §3.1 says never to add.
 
 ## 5. Full inventory
 
@@ -179,6 +180,7 @@ reordered during earlier squashing, so author dates are misleading.
 | 64 | `01925df3` | R | CLEANUP | **dropped** — deletes #1's `exited_sessions` + #2's `reap_stale_running_entries` |
 | 65 | `e066f12a` | R | CLEANUP | **dropped** — deletes #1's `pid` field |
 | 66 | `041e3edc` | R | PERF | fold → **S5** — `LivenessProbe`, hoists the snapshot out of 8 loops |
+| 67 | `52da69cc` | R | CLEANUP | **dropped** — deletes #2's `Stuck` state |
 
 ## 6. Shared files
 
@@ -311,9 +313,11 @@ Each of these changes content, so none belong in the reconstruction.
 - **Junk subjects** — `wfwf`, `c`, `naav`, `w`, `bg agents`, `clear stale sessions`,
   `agentbar loading indication`, `fix kill by tab`. All fold into anchors, so most vanish;
   #13 survives as **U5** and needs a real message.
-- **Collapse the DEAD machinery** — S2/S3 and part of S4 exist only because liveness was
-  *recorded* rather than derived. With S5 in place, `Dead` becomes unrepresentable and
-  ~350 lines could go. Content change: separate commit, after the rebase.
+- **Collapse the DEAD machinery** — `Dead` is *not* obsolete: it means "a registry row whose
+  uuid has no bound pipe", and the registry is still the enumeration source (only it knows
+  uuid→name). Stale rows stay representable until something prunes on read. An earlier draft
+  of this file claimed `Dead` becomes unrepresentable under S5 — that was wrong. What S5
+  changed is that detecting it became cheap, not that the concept went away.
 - **Registry / kdl schema reshape** — deliberately deferred. Old state can be wiped, so
   back-compat is not a constraint: `SessionState::Exited` degrades to a "don't bother
   probing" hint, and the legacy socket-file migration that manufactures Exited rows can go
@@ -326,6 +330,8 @@ Each of these changes content, so none belong in the reconstruction.
 - ~~unreachable `reap_stale_running_entries` / `exited_sessions`~~ → `01925df3`
 - ~~unread `SessionEntry.pid`~~ → `e066f12a`
 - ~~`check_session_state` enumerating the namespace per call~~ → `041e3edc`
+- ~~the `Stuck` state~~ → `52da69cc` (its causes were fixed by `08fe52d8` / `962ac334` /
+  `e46ca68f`; all it produced by then were false positives that hard-failed attach)
 - **TH1 ordering** — #54 (*keep palette across reload*) precedes #55 (*follow Windows app
   theme*) in branch order, i.e. the fix lands before the feature it fixes. Confirm which
   order actually compiles before folding.
