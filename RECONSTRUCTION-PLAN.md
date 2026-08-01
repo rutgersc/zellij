@@ -4,12 +4,16 @@ Rebuild the fork as the **smallest set of commits that is byte-identical at the 
 `backup/atomize-pre-cleanup`, with every commit owning its files.
 
 - **Base:** `e9173cba` — *feat: PWA support for the web client (#5184)*, the merge-base with `zellij-org/main`
-- **Original:** `backup/atomize-pre-cleanup` — 63 commits, 100 files, **56 files touched more than once**, 0 churn
-- **Target:** ~24 commits, **0 files touched more than once** apart from the two deliberate exceptions in §6
+- **Original:** `backup/atomize-target` — **66 commits**, 100 files, **57 files touched more than once**
+- **Target:** ~33 commits, **0 files touched more than once** apart from the deliberate exceptions in §6
+
+> Updated after commits 64–66 landed. They removed dead code and hoisted a probe,
+> which turned three items into **churn** (added *and* deleted inside the range) — see
+> §3.1. The diff target is now the 66-commit tip, not the 63-commit one.
 
 ## 1. The contract
 
-**Strict diff-equivalence.** `git diff backup/atomize-pre-cleanup <new-tip>` must be **empty**.
+**Strict diff-equivalence.** `git diff backup/atomize-target <new-tip>` must be **empty**.
 Nothing is dropped, nothing is rewritten, no "while I'm here" fixes. This is a pure
 re-partition of the same bytes across fewer commits.
 
@@ -20,8 +24,9 @@ Anything that would change content is out of scope and belongs in §8 as a follo
 
 ```bash
 python C:/Projects/foam/scripts/git-overlap/overlap.py "e9173cba..HEAD"
-git log --reverse --no-merges --format='%h|%an|%s' --name-status e9173cba..HEAD
+git log --reverse --no-merges --format='%h|%an|%s' --name-status e9173cba..atomize
 git show --format= --unified=0 <sha> -- <file> | grep '^@@'     # per-hunk regions
+git log -S '<symbol>' --oneline e9173cba..atomize -- <file>     # add/delete pairs
 ```
 
 ## 3. The finding that shapes everything
@@ -37,17 +42,37 @@ needed nowhere. That makes strict diff-equivalence realistic.
 The one file that genuinely mixes four unrelated concerns is `zellij-utils/src/consts.rs`,
 and even there the hunks sit in disjoint line regions (§6.1).
 
+## 3.1 Churn — added and deleted inside the range
+
+Commits 64–66 deleted code that earlier commits in this same range introduced. Against the
+**new** tip those add/delete pairs are pure noise: the minimal branch simply never adds
+them, and commits 64 and 65 disappear along with them.
+
+| item | added by | deleted by | in the minimal branch |
+|---|---|---|---|
+| `SessionEntry.pid` (+ kdl parse/serialize, both server writers, 4 test sites) | `ab663eba` **#1** | `e066f12a` **#65** | S1 never adds it |
+| `SessionRegistry::exited_sessions()` | `ab663eba` **#1** | `01925df3` **#64** | S1 never adds it |
+| `reap_stale_running_entries()` | `8e202143` **#2** | `01925df3` **#64** | S2 never adds it |
+| per-call pipe enumeration in `check_session_state` | `a216b2e1` **#62** | `041e3edc` **#66** | S5 introduces `LivenessProbe` directly |
+
+`git-overlap` reports **0 churn** because it detects churn at *file* granularity and none of
+these files were deleted. Function-level churn has to be found with `git log -S`.
+
+**This is why the diff target had to move.** Against the old 63-commit tip these three items
+were live code and had to be reproduced; against the 66-commit tip they must not exist. Same
+reconstruction, different contract — pin the target ref and don't let it drift.
+
 ## 4. Target commit set
 
 Ordered. Foundational first, feature commits after, artifacts last.
 
 | # | commit | folds |
 |---|---|---|
-| **S1** | `sessions: registry (sessions.kdl), decouple names from sockets` | 1, 52, 58 |
-| **S2** | `sessions: 3-state liveness (Alive/Stuck/Dead) in ls` | 2 |
+| **S1** | `sessions: registry (sessions.kdl), decouple names from sockets` | 1, 52, 58 — **minus** `pid` and `exited_sessions` (§3.1) |
+| **S2** | `sessions: 3-state liveness (Alive/Stuck/Dead) in ls` | 2 — **minus** `reap_stale_running_entries` (§3.1) |
 | **S3** | `sessions: reap DEAD registry entries` | 3, 39 |
 | **S4** | `sessions: case-insensitive attach, reject overlapping/non-ASCII names` | 31 |
-| **S5** | `sessions: settle Dead from the pipe namespace` | 62 |
+| **S5** | `sessions: derive Dead from the pipe namespace via LivenessProbe` | 62, 66 — snapshot built in from the start |
 | **S6** | `sessions: drop dead sessions from the plugin session list` | 63 *(server half)* |
 | **W1** | `windows: session switching — zombie servers, pipe resolution, DACL` | 7, 26 |
 | **W2** | `windows: VT reader + ANSI mouse sequences` | 10 |
@@ -78,7 +103,8 @@ Ordered. Foundational first, feature commits after, artifacts last.
 | **B4** | `chore: pre-commit wasm-rebake hook + .cargo config` | 27 |
 | **ART** | `chore: rebake default-plugin wasm` | 29, 45, and every wasm rider |
 
-63 → 33 named commits, of which 24 carry real logic.
+66 → 33 named commits, of which 24 carry real logic. Commits **64** and **65** have no
+destination — they only delete what §3.1 says never to add.
 
 ## 5. Full inventory
 
@@ -150,6 +176,9 @@ reordered during earlier squashing, so author dates are misleading.
 | 61 | `1a5b9d81` | R | AGENTBAR | fold → **A1** |
 | 62 | `a216b2e1` | R | SESSION | **S5** |
 | 63 | `6a31fade` | R | mixed | **split** → **S6** + **A1** *(§6.4)* |
+| 64 | `01925df3` | R | CLEANUP | **dropped** — deletes #1's `exited_sessions` + #2's `reap_stale_running_entries` |
+| 65 | `e066f12a` | R | CLEANUP | **dropped** — deletes #1's `pid` field |
+| 66 | `041e3edc` | R | PERF | fold → **S5** — `LivenessProbe`, hoists the snapshot out of 8 loops |
 
 ## 6. Shared files
 
@@ -212,7 +241,7 @@ All touches serve one feature; the whole contribution goes to one destination.
 |---|---|---|
 | `default-plugins/agent-bar/src/main.rs` | 13 | A1 |
 | `zellij-server/src/panes/grid.rs` | 8 | C1 *(7)* + W3 *(#25)* |
-| `zellij-utils/src/sessions.rs` | 6 | S1–S5 |
+| `zellij-utils/src/sessions.rs` | 9 | S1–S5 — 3 of the 9 are the §3.1 deletions and vanish |
 | `zellij-utils/assets/config/default.kdl` | 7 | C1 *(6)* + G1 *(#22)* |
 | `zellij-server/src/screen.rs` | 9 | S1, S4, C1, N1, TH1 — disjoint regions, verify at execution |
 | `zellij-server/src/lib.rs` | 5 | S1 *(start_server/init_session)*, U1 *(SessionState)*, W1 *(+289 module)*, U3 *(Drop)*, N1 |
@@ -224,8 +253,8 @@ All touches serve one feature; the whole contribution goes to one destination.
 
 ### 6.6 Artifacts — the largest single source of noise
 
-13 `.wasm` files account for **~60 of the overlapping touches**: `agent-bar.wasm` alone is
-rebaked 10 times. They are pure build output of `xtask ci build-release`.
+15 `.wasm` files account for **69 of the overlapping touches**: `agent-bar.wasm` alone is
+rebaked 11 times. They are pure build output of `xtask ci build-release`.
 
 **Policy: one `ART` commit at the tip**, holding the final state of every `.wasm`. Feature
 commits carry no artifacts. This is the single biggest reduction in the matrix and cannot
@@ -244,6 +273,7 @@ sources and 4 splits, `rebase -i` reordering is more error-prone than replay.
 
 1. `git branch backup/atomize-pre-cleanup atomize` — **done**
 2. Cherry-pick each destination's sources in order, `--no-commit`, then one commit per target
+   — for S1, S2 and S5, take the **post-cleanup** shape from `atomize`, not the original commit
 3. For the §6.4 splits, `git checkout <sha> -- <paths>` per destination
 4. Skip all `.wasm` and `assets/prost*` throughout; add them once as **ART** at the tip
 5. After each target: `cargo check` (fast) — the tree must stay buildable commit-by-commit
@@ -251,9 +281,13 @@ sources and 4 splits, `rebase -i` reordering is more error-prone than replay.
 ## 8. Verification — non-negotiable
 
 ```bash
-git diff backup/atomize-pre-cleanup e9173cba-minimal        # MUST be empty
-git diff --stat backup/atomize-pre-cleanup e9173cba-minimal # MUST print nothing
+git diff backup/atomize-target e9173cba-minimal        # MUST be empty
+git diff --stat backup/atomize-target e9173cba-minimal # MUST print nothing
 ```
+
+`backup/atomize-target` is pinned at `041e3edc`. `backup/atomize-pre-cleanup` (`6a31fade`)
+is the older 63-commit tip — **not** a valid target any more, since §3.1's three items still
+exist there.
 
 A non-empty diff means content changed, not just history. Investigate before continuing —
 do not "fix it up" at the tip.
@@ -264,7 +298,7 @@ Build checkpoints: **S1** (the registry, everything leans on it), **C1**, and th
 git worktree add -q --detach /tmp/wt <sha> && ( cd /tmp/wt && cargo check ) ; git worktree remove --force /tmp/wt
 ```
 
-Keep `backup/atomize-pre-cleanup` until the diff is verified empty.
+Keep both backup refs until the diff is verified empty.
 
 ## 9. Decisions deferred to after a verified-empty diff
 
@@ -280,8 +314,18 @@ Each of these changes content, so none belong in the reconstruction.
 - **Collapse the DEAD machinery** — S2/S3 and part of S4 exist only because liveness was
   *recorded* rather than derived. With S5 in place, `Dead` becomes unrepresentable and
   ~350 lines could go. Content change: separate commit, after the rebase.
-- **Marker file removal** — its PID is never read, its path duplicates its own filename, and
-  its mtime duplicates the registry's `created_at`.
+- **Registry / kdl schema reshape** — deliberately deferred. Old state can be wiped, so
+  back-compat is not a constraint: `SessionState::Exited` degrades to a "don't bother
+  probing" hint, and the legacy socket-file migration that manufactures Exited rows can go
+  with it.
+- **Marker file removal** — its path duplicates its own filename and its mtime duplicates the
+  registry's `created_at`. *(Its PID field is already gone — commit 65.)*
+
+**Done since the first draft** — struck from this list, now reflected in §3.1:
+
+- ~~unreachable `reap_stale_running_entries` / `exited_sessions`~~ → `01925df3`
+- ~~unread `SessionEntry.pid`~~ → `e066f12a`
+- ~~`check_session_state` enumerating the namespace per call~~ → `041e3edc`
 - **TH1 ordering** — #54 (*keep palette across reload*) precedes #55 (*follow Windows app
   theme*) in branch order, i.e. the fix lands before the feature it fixes. Confirm which
   order actually compiles before folding.
