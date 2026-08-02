@@ -924,16 +924,11 @@ pub(crate) fn start_client(opts: CliArgs) {
                         // crashed before exit are not reaped. Walk them all so a
                         // stale row can't shadow the live session sharing its name.
                         let registry = zellij_utils::sessions::ensure_registry();
+                        let probe = zellij_utils::sessions::LivenessProbe::new();
                         registry
                             .running_sessions()
                             .into_iter()
-                            .any(|s| {
-                                s.display_name == name
-                                    && matches!(
-                                        zellij_utils::sessions::check_session_state(&s.id),
-                                        zellij_utils::sessions::SessionLiveness::Alive
-                                    )
-                            })
+                            .any(|s| s.display_name == name && probe.is_alive(&s.id))
                             .then_some(name)
                     })
                 } else {
