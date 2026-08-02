@@ -5203,6 +5203,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zellijctl"
+version = "0.45.0"
+dependencies = [
+ "clap",
+ "zellij-client",
+ "zellij-utils",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.7.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
