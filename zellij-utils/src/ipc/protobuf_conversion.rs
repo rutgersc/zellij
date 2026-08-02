@@ -2146,6 +2146,15 @@ impl From<crate::input::actions::Action>
                     direction: direction_to_proto_i32(direction),
                 })
             },
+            // Copy-mode actions are server-side only and have no protobuf representation.
+            // Map to NoOp so plugin-API conversions don't error.
+            crate::input::actions::Action::MoveCopyCursor { .. }
+            | crate::input::actions::Action::ToggleCopyVisual
+            | crate::input::actions::Action::ToggleCopyVisualLine
+            | crate::input::actions::Action::CopyModeEscape
+            | crate::input::actions::Action::CopyAndExitCopyMode => {
+                ActionType::NoOp(NoOpAction {})
+            },
         };
 
         Self {
@@ -3416,6 +3425,7 @@ fn input_mode_to_proto_i32(mode: InputMode) -> i32 {
         InputMode::Move => ProtoInputMode::Move as i32,
         InputMode::Prompt => ProtoInputMode::Prompt as i32,
         InputMode::Tmux => ProtoInputMode::Tmux as i32,
+        InputMode::CopyMode => ProtoInputMode::CopyMode as i32,
     }
 }
 
@@ -3435,6 +3445,7 @@ fn proto_i32_to_input_mode(i: i32) -> Result<InputMode> {
         Some(ProtoInputMode::Move) => Ok(InputMode::Move),
         Some(ProtoInputMode::Prompt) => Ok(InputMode::Prompt),
         Some(ProtoInputMode::Tmux) => Ok(InputMode::Tmux),
+        Some(ProtoInputMode::CopyMode) => Ok(InputMode::CopyMode),
         _ => Err(anyhow!("Invalid InputMode value: {}", i)),
     }
 }
