@@ -204,9 +204,8 @@ fn tab_line_prefix(
     dimmed: bool,
     breadcrumb_ancestry: &[String],
 ) -> (Vec<LinePart>, Option<(usize, usize)>) {
-    let prefix_text = " Zellij ".to_string();
-
-    let running_text_len = prefix_text.chars().count();
+    // No " Zellij " brand prefix — the session name alone identifies the bar.
+    // Name renders as " name " (no parens) since it no longer follows a label.
     let text_color = palette.text_unselected.base;
     let bg_color = palette.text_unselected.background;
     let prefix_style = if dimmed {
@@ -214,12 +213,7 @@ fn tab_line_prefix(
     } else {
         style!(text_color, bg_color).bold()
     };
-    let prefix_styled_text = prefix_style.paint(prefix_text);
-    let mut parts = vec![LinePart {
-        part: prefix_styled_text.to_string(),
-        len: running_text_len,
-        tab_index: None,
-    }];
+    let mut parts = Vec::new();
     let mut breadcrumb_range = None;
     if !breadcrumb_ancestry.is_empty() {
         if let Some(name) = session_name {
@@ -244,8 +238,8 @@ fn tab_line_prefix(
             } else {
                 style!(text_color, bg_color).bold()
             };
-            if cols.saturating_sub(running_text_len) >= ancestor_len + name_len + closing_len {
-                let ancestor_start = running_text_len;
+            if cols >= ancestor_len + name_len + closing_len {
+                let ancestor_start = 0;
                 let ancestor_end = ancestor_start + ancestor_len;
                 breadcrumb_range = Some((ancestor_start, ancestor_end));
                 parts.push(LinePart {
@@ -268,10 +262,10 @@ fn tab_line_prefix(
         return (parts, breadcrumb_range);
     }
     if let Some(name) = session_name {
-        let name_part = format!("({}) ", name);
+        let name_part = format!(" {} ", name);
         let name_part_len = name_part.width();
         let name_part_styled_text = prefix_style.paint(name_part);
-        if cols.saturating_sub(running_text_len) >= name_part_len {
+        if cols >= name_part_len {
             parts.push(LinePart {
                 part: name_part_styled_text.to_string(),
                 len: name_part_len,
