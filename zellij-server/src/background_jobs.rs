@@ -753,8 +753,17 @@ fn read_other_live_session_states(
 ) -> BTreeMap<String, SessionInfo> {
     let mut session_infos_on_machine = BTreeMap::new();
     let registry = zellij_utils::sessions::ensure_registry();
+    // One liveness snapshot for the whole scan — see `LivenessProbe`.
+    let probe = zellij_utils::sessions::LivenessProbe::new();
 
     for entry in registry.running_sessions() {
+        // `running_sessions()` filters on the registry's recorded state word, not
+        // on whether a server is there — a session that died without updating the
+        // registry stays "running" forever and would be reported here as live.
+        // Derive liveness instead, the way `zellij ls` always has.
+        if !probe.is_alive(&entry.id) {
+            continue;
+        }
         let session_name = &entry.display_name;
         let creation_time = std::fs::metadata(sock_dir.join(&entry.id))
             .ok()
