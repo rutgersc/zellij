@@ -10,11 +10,13 @@ use zellij_client::{
 };
 
 use zellij_utils::sessions::{
-    assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
-    generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
-    get_sessions_sorted_by_mtime, kill_session as kill_session_impl, match_session_name,
-    print_sessions, print_sessions_with_index, resurrection_layout, session_exists,
-    session_listing_error_message, validate_session_name, ActiveSession, SessionNameMatch,
+    assert_dead_session, assert_session, assert_session_ne, check_session_state,
+    delete_session as delete_session_impl, generate_unique_session_name, get_active_session,
+    get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
+    kill_session as kill_session_impl, match_session_name, print_sessions,
+    print_sessions_with_index, resurrection_layout, session_exists,
+    session_listing_error_message, validate_session_name, ActiveSession, SessionDisplayStatus,
+    SessionLiveness, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
@@ -79,6 +81,7 @@ pub(crate) fn kill_all_sessions(yes: bool) {
 pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
     use std::collections::BTreeMap;
     use zellij_server::background_jobs::scan_session_list_default_dirs;
+    use zellij_utils::sessions::reap_dead_registry_entries;
 
     let active_sessions: Vec<String> = get_sessions()
         .unwrap_or_default()
@@ -117,6 +120,19 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
     }
     for session in &dead_sessions {
         delete_session_impl(&session.0, force);
+    }
+    // Resurrectable iteration only covers cache-dir entries. Dead registry
+    // rows (state=running but no process) have no cache and would persist
+    // forever otherwise — purge them here so `delete-all-sessions` actually
+    // means *all*.
+    match reap_dead_registry_entries() {
+        Ok(reaped) if !reaped.is_empty() => {
+            for (_, name) in &reaped {
+                println!("Registry: {:?} removed (stale entry).", name);
+            }
+        },
+        Err(e) => eprintln!("Failed to reap dead registry entries: {e}"),
+        _ => {},
     }
     process::exit(0);
 }
@@ -556,13 +572,18 @@ fn attach_with_session_name(
     create: bool,
 ) -> ClientInfo {
     match &session_name {
-        Some(session) if create => match session_exists(session) {
-            Ok(true) => ClientInfo::Attach(session_name.unwrap(), config_options),
-            Ok(false) => ClientInfo::New(session_name.unwrap(), None, None),
-            Err(kind) => {
-                eprintln!("{}", session_listing_error_message(kind));
-                process::exit(1);
-            },
+        Some(session) if create => {
+            // Resolve case-insensitively to the canonical stored name so we
+            // attach to an existing `foo` even when the user typed `Foo`,
+            // rather than spawning a second case-variant session.
+            match match_session_name(session) {
+                Ok(SessionNameMatch::Exact(s)) => ClientInfo::Attach(s, config_options),
+                Ok(_) => ClientInfo::New(session_name.unwrap(), None, None),
+                Err(kind) => {
+                    eprintln!("{}", session_listing_error_message(kind));
+                    process::exit(1);
+                },
+            }
         },
         Some(prefix) => match match_session_name(prefix) {
             Ok(SessionNameMatch::UniquePrefix(s)) | Ok(SessionNameMatch::Exact(s)) => {
@@ -576,7 +597,7 @@ fn attach_with_session_name(
                 print_sessions(
                     sessions
                         .iter()
-                        .map(|s| (s.clone(), Duration::default(), false))
+                        .map(|s| (s.clone(), Duration::default(), SessionDisplayStatus::Alive))
                         .collect(),
                     false,
                     false,
@@ -968,7 +989,7 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
                 print_sessions(
                     sessions
                         .iter()
-                        .map(|s| (s.clone(), Duration::default(), false))
+                        .map(|s| (s.clone(), Duration::default(), SessionDisplayStatus::Alive))
                         .collect(),
                     false,
                     false,

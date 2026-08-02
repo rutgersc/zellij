@@ -360,6 +360,7 @@ fn create_new_screen_with_kitty_graphics(
         web_server_ip,
         web_server_port,
         NestedSessionHandling::default(),
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     seed_first_client_size(screen, size)
 }
@@ -428,6 +429,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
                 )
                 .expect("TEST")
             })
@@ -514,6 +516,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
                 )
                 .expect("TEST")
             })
@@ -5697,6 +5700,7 @@ fn create_new_screen_with_message_capture(
         web_server_ip,
         web_server_port,
         NestedSessionHandling::default(),
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (seed_first_client_size(screen, size), messages)
 }
@@ -8803,6 +8807,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         web_server_ip,
         web_server_port,
         NestedSessionHandling::default(),
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (
         seed_first_client_size(screen, size),
@@ -9481,6 +9486,7 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
         web_server_ip,
         web_server_port,
         NestedSessionHandling::default(),
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (
         seed_first_client_size(screen, size),
@@ -10013,6 +10019,7 @@ fn create_non_mirrored_screen(size: Size) -> Screen {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         8080,
         NestedSessionHandling::default(),
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     seed_first_client_size(screen, size)
 }

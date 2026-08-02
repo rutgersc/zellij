@@ -20,6 +20,12 @@ use isahc::prelude::*;
 use isahc::AsyncReadResponseExt;
 use isahc::{config::RedirectPolicy, HttpClient, Request};
 
+use crate::panes::PaneId;
+use crate::plugins::{PluginId, PluginInstruction};
+use crate::pty::PtyInstruction;
+use crate::screen::ScreenInstruction;
+use crate::thread_bus::Bus;
+use crate::{ClientId, ServerInstruction};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
@@ -29,13 +35,6 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
-
-use crate::panes::PaneId;
-use crate::plugins::{PluginId, PluginInstruction};
-use crate::pty::PtyInstruction;
-use crate::screen::ScreenInstruction;
-use crate::thread_bus::Bus;
-use crate::{ClientId, ServerInstruction};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum BackgroundJob {

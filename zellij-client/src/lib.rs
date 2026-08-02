@@ -159,6 +159,7 @@ use zellij_utils::{
     ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
     nested_session,
     pane_size::Size,
+    sessions::{register_session, resolve_session_socket_path},
     vendored::termwiz::input::InputEvent,
 };
 
@@ -336,21 +337,61 @@ fn spawn_web_server(_cli_args: &CliArgs) -> Result<String, String> {
     Ok("".to_owned())
 }
 
-fn check_ipc_pipe_length(ipc_pipe: &Path) {
-    use zellij_utils::consts::ZELLIJ_SOCK_MAX_LENGTH;
-    let path_len = ipc_pipe.as_os_str().len();
-    if path_len >= ZELLIJ_SOCK_MAX_LENGTH {
-        eprintln!(
-            "Error: the IPC socket path is too long ({} bytes, max {}):\n  {}\n\n\
-             This is usually caused by a long $TMPDIR path.\n\
-             To fix this, set a shorter socket directory, eg.:\n  \
-             ZELLIJ_SOCKET_DIR=/tmp/zellij zellij",
-            path_len,
-            ZELLIJ_SOCK_MAX_LENGTH - 1,
-            ipc_pipe.display()
+fn ensure_sock_dir() {
+    zellij_utils::consts::check_sock_dir_length();
+    let sock_dir = ZELLIJ_SOCK_DIR.clone();
+    if let Err(e) = std::fs::create_dir_all(&sock_dir) {
+        exit_after_startup_error(
+            None,
+            format!(
+                "Error: failed to create the Zellij socket directory:\n  {}\n\n\
+                 Reason: {}\n\n\
+                 This usually means the directory (or one of its parents) is owned by \
+                 another user or is not writable - for example if Zellij was previously \
+                 run with `sudo`, or if $XDG_RUNTIME_DIR points to a directory you do not \
+                 own.\nTo fix this, remove or correct the offending directory, or set a \
+                 writable socket directory, eg.:\n  ZELLIJ_SOCKET_DIR=/tmp/zellij-$USER zellij",
+                sock_dir.display(),
+                e
+            ),
         );
-        std::process::exit(1);
     }
+    if let Err(e) = set_permissions(&sock_dir, 0o700) {
+        exit_after_startup_error(
+            None,
+            format!(
+                "Error: failed to set permissions (0700) on the Zellij socket directory:\n  {}\n\n\
+                 Reason: {}\n\n\
+                 This usually means the directory is owned by another user.\n\
+                 To fix this, remove or correct the offending directory, or set a writable \
+                 socket directory, eg.:\n  ZELLIJ_SOCKET_DIR=/tmp/zellij-$USER zellij",
+                sock_dir.display(),
+                e
+            ),
+        );
+    }
+}
+
+/// Create a new IPC pipe path for a brand-new session.
+///
+/// Generates a UUID, registers the session in `sessions.kdl`, and returns
+/// `ZELLIJ_SOCK_DIR/<uuid>`.
+fn new_session_ipc_pipe(session_name: &str) -> PathBuf {
+    ensure_sock_dir();
+    let session_id = register_session(session_name).unwrap_or_else(|e| {
+        eprintln!("Failed to register session: {}", e);
+        std::process::exit(1);
+    });
+    ZELLIJ_SOCK_DIR.join(&session_id)
+}
+
+/// Resolve an existing session name to its IPC pipe path.
+///
+/// Looks up the session in `sessions.kdl`. Falls back to the legacy
+/// `ZELLIJ_SOCK_DIR/<name>` path for sessions created before the registry.
+fn resolve_session_ipc_pipe(session_name: &str) -> PathBuf {
+    ensure_sock_dir();
+    resolve_session_socket_path(session_name).unwrap_or_else(|| ZELLIJ_SOCK_DIR.join(session_name))
 }
 
 #[derive(Clone, Copy)]
@@ -398,43 +439,6 @@ fn spawn_server_error_message(e: io::Error) -> String {
          ZELLIJ_SOCKET_DIR=/tmp/zellij-$USER zellij",
         e
     )
-}
-
-fn create_ipc_pipe(teardown: Option<TerminalTeardown>) -> PathBuf {
-    let mut sock_dir = ZELLIJ_SOCK_DIR.clone();
-    if let Err(e) = std::fs::create_dir_all(&sock_dir) {
-        exit_after_startup_error(
-            teardown,
-            format!(
-                "Error: failed to create the Zellij socket directory:\n  {}\n\n\
-                 Reason: {}\n\n\
-                 This usually means the directory (or one of its parents) is owned by \
-                 another user or is not writable - for example if Zellij was previously \
-                 run with `sudo`, or if $XDG_RUNTIME_DIR points to a directory you do not \
-                 own.\nTo fix this, remove or correct the offending directory, or set a \
-                 writable socket directory, eg.:\n  ZELLIJ_SOCKET_DIR=/tmp/zellij-$USER zellij",
-                sock_dir.display(),
-                e
-            ),
-        );
-    }
-    if let Err(e) = set_permissions(&sock_dir, 0o700) {
-        exit_after_startup_error(
-            teardown,
-            format!(
-                "Error: failed to set permissions (0700) on the Zellij socket directory:\n  {}\n\n\
-                 Reason: {}\n\n\
-                 This usually means the directory is owned by another user.\n\
-                 To fix this, remove or correct the offending directory, or set a writable \
-                 socket directory, eg.:\n  ZELLIJ_SOCKET_DIR=/tmp/zellij-$USER zellij",
-                sock_dir.display(),
-                e
-            ),
-        );
-    }
-    sock_dir.push(envs::get_session_name().unwrap());
-    check_ipc_pipe_length(&sock_dir);
-    sock_dir
 }
 
 /// Spawn the Zellij server process.
@@ -1007,8 +1011,8 @@ pub fn start_client(
     let (first_msg, ipc_pipe) = match info {
         ClientInfo::Attach(name, config_options) => {
             envs::set_session_name(name.clone());
-            os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
+            os_input.update_session_name(name.clone());
+            let ipc_pipe = resolve_session_ipc_pipe(&name);
             let is_web_client = false;
 
             let cli_assets = CliAssets {
@@ -1057,8 +1061,8 @@ pub fn start_client(
         },
         ClientInfo::Watch(name, _config_options) => {
             envs::set_session_name(name.clone());
-            os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
+            os_input.update_session_name(name.clone());
+            let ipc_pipe = resolve_session_ipc_pipe(&name);
             let is_web_client = false;
 
             (
@@ -1089,8 +1093,8 @@ pub fn start_client(
                 cwd,
             };
 
-            os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
+            os_input.update_session_name(name.clone());
+            let ipc_pipe = new_session_ipc_pipe(&name);
 
             if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
                 exit_after_startup_error(Some(terminal_teardown), spawn_server_error_message(e));
@@ -1145,8 +1149,8 @@ pub fn start_client(
                 cwd: layout_cwd,
             };
 
-            os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
+            os_input.update_session_name(name.clone());
+            let ipc_pipe = new_session_ipc_pipe(&name);
 
             if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
                 exit_after_startup_error(Some(terminal_teardown), spawn_server_error_message(e));
@@ -1605,8 +1609,8 @@ pub fn start_server_detached(
                 cwd,
             };
 
-            os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe(None);
+            os_input.update_session_name(name.clone());
+            let ipc_pipe = new_session_ipc_pipe(&name);
 
             if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
                 exit_after_startup_error(None, spawn_server_error_message(e));
@@ -1662,8 +1666,8 @@ pub fn start_server_detached(
                 cwd: layout_cwd,
             };
 
-            os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe(None);
+            os_input.update_session_name(name.clone());
+            let ipc_pipe = new_session_ipc_pipe(&name);
 
             if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
                 exit_after_startup_error(None, spawn_server_error_message(e));
