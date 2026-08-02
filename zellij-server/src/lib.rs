@@ -15,6 +15,7 @@ pub mod background_jobs;
 mod global_async_runtime;
 mod logging_pipe;
 mod pane_groups;
+mod pane_nav;
 mod plugins;
 mod pty;
 mod pty_writer;
