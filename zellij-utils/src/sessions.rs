@@ -785,7 +785,6 @@ fn probe_socket(_name: &str) -> SessionLiveness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDisplayStatus {
     Alive,
-    Dead,
     Resurrectable,
 }
 
@@ -818,10 +817,6 @@ pub fn print_sessions(
                 } else {
                     match status {
                         SessionDisplayStatus::Alive => String::new(),
-                        SessionDisplayStatus::Dead => {
-                            "(DEAD - stale registry entry, run `zellij delete-session` to clear)"
-                                .to_string()
-                        },
                         SessionDisplayStatus::Resurrectable => {
                             "(EXITED - attach to resurrect)".to_string()
                         },
@@ -832,11 +827,6 @@ pub fn print_sessions(
             } else {
                 match status {
                     SessionDisplayStatus::Alive => String::new(),
-                    SessionDisplayStatus::Dead => {
-                        "(\u{1b}[31;1mDEAD\u{1b}[m - stale registry entry, run \
-                         `zellij delete-session` to clear)"
-                            .to_string()
-                    },
                     SessionDisplayStatus::Resurrectable => {
                         "(\u{1b}[31;1mEXITED\u{1b}[m - attach to resurrect)".to_string()
                     },
@@ -979,24 +969,23 @@ pub fn delete_session(name: &str, force: bool) {
 }
 
 pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
-    // Iterate the registry directly so every entry is visible — including Dead
-    // ones (stale "running" entries whose server process is gone).
-    // `get_sessions()` filters those out because attach paths can't use them,
-    // but `ls` exists to *show* state so the user can spot registry leaks.
+    // Liveness is derived from the socket namespace, so a registry row whose
+    // server is gone can never be reported as live — it is invisible rather
+    // than wrong. There is nothing for the user to act on, so `ls` omits those
+    // rows instead of printing a leak they would have to clear by hand.
+    // `delete-session` and `delete-all-sessions` still reap them from the kdl.
     let registry = ensure_registry();
     let probe = LivenessProbe::new();
     let mut output: Vec<(String, Duration, SessionDisplayStatus)> = Vec::new();
     let mut running_names: HashSet<String> = HashSet::new();
     for entry in registry.running_sessions() {
+        if !probe.is_alive(&entry.id) {
+            continue;
+        }
         running_names.insert(entry.display_name.clone());
-        let status = match probe.check(&entry.id) {
-            SessionLiveness::Alive => SessionDisplayStatus::Alive,
-            SessionLiveness::Dead => SessionDisplayStatus::Dead,
-        };
+        let status = SessionDisplayStatus::Alive;
         // Prefer the socket's ctime/mtime (reflects when the server actually
-        // started). For Dead entries the socket may already be gone — fall
-        // back to the registry's `created_at` so the age column stays useful
-        // for spotting old stale entries.
+        // started), falling back to the registry's `created_at`.
         let sock_path = ZELLIJ_SOCK_DIR.join(&entry.id);
         let elapsed = std::fs::metadata(&sock_path)
             .ok()
@@ -1016,8 +1005,8 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
         output.push((entry.display_name.clone(), duration, status));
     }
     // Resurrectable entries (exited-session layout caches) are surfaced only
-    // for names without any running registry entry — a name with a live (or
-    // even Dead) running entry already represents that session in the list.
+    // for names without a live registry entry — a live session already
+    // represents that name in the list.
     for (name, duration) in get_resurrectable_sessions() {
         if !running_names.contains(&name) {
             output.push((name, duration, SessionDisplayStatus::Resurrectable));
