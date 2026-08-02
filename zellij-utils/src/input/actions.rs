@@ -97,6 +97,67 @@ impl FromStr for SearchOption {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum CopyMotion {
+    #[default]
+    Left,
+    Right,
+    Up,
+    Down,
+    WordForward,
+    WordEnd,
+    WordBackward,
+    LineStart,
+    LineFirstNonBlank,
+    LineEnd,
+    BufferTop,
+    BufferBottom,
+    HalfPageUp,
+    HalfPageDown,
+    PageUp,
+    PageDown,
+    ScreenTop,
+    ScreenMiddle,
+    ScreenBottom,
+    ParagraphForward,
+    ParagraphBackward,
+    /// Jump to the first character of the active search hit (or the first match
+    /// in the viewport if none is active yet). Lets a search hand off directly
+    /// into copy mode landed on the result.
+    SearchResult,
+}
+
+impl FromStr for CopyMotion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "left" | "h" => Ok(CopyMotion::Left),
+            "right" | "l" => Ok(CopyMotion::Right),
+            "up" | "k" => Ok(CopyMotion::Up),
+            "down" | "j" => Ok(CopyMotion::Down),
+            "wordforward" | "w" => Ok(CopyMotion::WordForward),
+            "wordend" | "e" => Ok(CopyMotion::WordEnd),
+            "wordbackward" | "b" => Ok(CopyMotion::WordBackward),
+            "linestart" | "0" => Ok(CopyMotion::LineStart),
+            "linefirstnonblank" | "^" => Ok(CopyMotion::LineFirstNonBlank),
+            "lineend" | "$" => Ok(CopyMotion::LineEnd),
+            "buffertop" | "gg" | "top" => Ok(CopyMotion::BufferTop),
+            "bufferbottom" | "G" | "bottom" => Ok(CopyMotion::BufferBottom),
+            "halfpageup" => Ok(CopyMotion::HalfPageUp),
+            "halfpagedown" => Ok(CopyMotion::HalfPageDown),
+            "pageup" => Ok(CopyMotion::PageUp),
+            "pagedown" => Ok(CopyMotion::PageDown),
+            "screentop" => Ok(CopyMotion::ScreenTop),
+            "screenmiddle" | "screenmid" => Ok(CopyMotion::ScreenMiddle),
+            "screenbottom" => Ok(CopyMotion::ScreenBottom),
+            "paragraphforward" | "}" => Ok(CopyMotion::ParagraphForward),
+            "paragraphbackward" | "{" => Ok(CopyMotion::ParagraphBackward),
+            "searchresult" | "searchhit" => Ok(CopyMotion::SearchResult),
+            _ => Err(format!("Failed to parse CopyMotion. Unknown motion: {}", s)),
+        }
+    }
+}
+
 // As these actions are bound to the default config, please
 // do take care when refactoring - or renaming.
 // They might need to be adjusted in the default config
@@ -188,6 +249,19 @@ pub enum Action {
     EditScrollback {
         ansi: bool,
     },
+    /// Move the copy-mode cursor in a vim-style direction within the active pane.
+    MoveCopyCursor {
+        motion: CopyMotion,
+    },
+    /// Toggle charwise (vim `v`) visual selection in the active pane's copy mode.
+    ToggleCopyVisual,
+    /// Toggle linewise (vim `V`) visual selection in the active pane's copy mode.
+    ToggleCopyVisualLine,
+    /// Escape within copy mode: clear an active visual selection if one exists,
+    /// otherwise leave copy mode (switch to the client's default input mode).
+    CopyModeEscape,
+    /// Yank the current copy-mode selection to the system clipboard and exit copy mode.
+    CopyAndExitCopyMode,
     /// Scroll up in focus pane.
     ScrollUp,
     /// Scroll up at point

@@ -21,6 +21,7 @@ use zellij_utils::data::{
     PluginPermission, RegexHighlight, ResizeStrategy, Style, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
+use zellij_utils::input::actions::CopyMotion;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::position::Position;
@@ -343,6 +344,18 @@ pub trait Pane {
     fn get_selected_text(&self, _client_id: ClientId) -> Option<String> {
         None
     }
+    fn enter_copy_mode(&mut self, _client_id: ClientId) {}
+    fn exit_copy_mode(&mut self, _client_id: ClientId) {}
+    fn apply_copy_motion(&mut self, _motion: CopyMotion, _client_id: ClientId) {}
+    fn toggle_copy_visual(&mut self, _client_id: ClientId) {}
+    fn toggle_copy_visual_line(&mut self, _client_id: ClientId) {}
+    fn copy_mode_escape(&mut self, _client_id: ClientId) -> bool {
+        false
+    }
+    fn copy_mode_yank_text(&mut self, _client_id: ClientId) -> Option<String> {
+        None
+    }
+    fn search_copy_mode_selection(&mut self, _client_id: ClientId) {}
     fn set_pane_default_colors(&mut self, _fg: Option<String>, _bg: Option<String>) {}
     fn get_pane_default_colors(&self) -> (Option<String>, Option<String>) {
         (None, None)
@@ -4807,6 +4820,62 @@ impl Tab {
         }
         Ok(())
     }
+    pub fn enter_copy_mode_in_active_pane(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.enter_copy_mode(client_id);
+        }
+    }
+
+    pub fn exit_copy_mode_in_active_pane(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.exit_copy_mode(client_id);
+        }
+    }
+
+    pub fn search_copy_mode_selection_in_active_pane(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.search_copy_mode_selection(client_id);
+        }
+    }
+
+    pub fn move_copy_mode_cursor(&mut self, motion: CopyMotion, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.apply_copy_motion(motion, client_id);
+        }
+    }
+
+    pub fn toggle_copy_mode_visual(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.toggle_copy_visual(client_id);
+        }
+    }
+
+    pub fn toggle_copy_mode_visual_line(&mut self, client_id: ClientId) {
+        if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
+            active_pane.toggle_copy_visual_line(client_id);
+        }
+    }
+
+    /// Returns `true` if a visual selection was cancelled (stay in copy mode),
+    /// `false` if there was nothing to cancel (caller should exit copy mode).
+    pub fn copy_mode_escape(&mut self, client_id: ClientId) -> bool {
+        self.get_active_pane_or_floating_pane_mut(client_id)
+            .map(|p| p.copy_mode_escape(client_id))
+            .unwrap_or(false)
+    }
+
+    pub fn copy_mode_yank(&mut self, client_id: ClientId) -> Result<()> {
+        let yanked = self
+            .get_active_pane_or_floating_pane_mut(client_id)
+            .and_then(|p| p.copy_mode_yank_text(client_id));
+        if let Some(text) = yanked {
+            self.copy_text_to_clipboard(&text).with_context(|| {
+                format!("failed to yank copy-mode selection for client {client_id}")
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn copy_text_to_clipboard(&self, text: &str) -> Result<()> {
         self.write_selection_to_clipboard(text)
             .with_context(|| format!("failed to write text to clipboard"))?;
