@@ -33,7 +33,7 @@ dependencies = [
  "ansi_term",
  "serde",
  "serde_json",
- "unicode-width 0.1.10",
+ "unicode-width 0.1.14",
  "zellij-tile",
  "zellij-tile-utils",
 ]
