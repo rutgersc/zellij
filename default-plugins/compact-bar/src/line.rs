@@ -345,8 +345,9 @@ impl<'a> TabLinePrefixBuilder<'a> {
     }
 
     fn build(&self, session_name: Option<&str>, mode: InputMode) -> TabLinePrefix {
-        let mut parts = vec![self.create_zellij_part()];
-        let mut used_len = parts.get(0).map_or(0, |p| p.len);
+        // No " Zellij " brand prefix — the session name alone identifies the bar.
+        let mut parts = Vec::new();
+        let mut used_len = 0;
         let mut breadcrumb_range = None;
 
         if let Some(name) = session_name {
@@ -432,24 +433,8 @@ impl<'a> TabLinePrefixBuilder<'a> {
         Some((parts, (ancestor_start, ancestor_end), total_len))
     }
 
-    fn create_zellij_part(&self) -> LinePart {
-        let prefix_text = " Zellij ";
-        let colors = self.get_text_colors();
-        let text_style = if self.dimmed {
-            style!(colors.text, colors.background).italic()
-        } else {
-            style!(colors.text, colors.background).bold()
-        };
-
-        LinePart {
-            part: text_style.paint(prefix_text).to_string(),
-            len: prefix_text.chars().count(),
-            tab_index: None,
-        }
-    }
-
     fn create_session_name_part(&self, name: &str, used_len: usize) -> Option<LinePart> {
-        let name_part = format!("({})", name);
+        let name_part = format!(" {} ", name);
         let name_part_len = name_part.width();
 
         if self.cols.saturating_sub(used_len) >= name_part_len {

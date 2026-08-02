@@ -107,6 +107,13 @@ pub fn tab_style(
 ) -> LinePart {
     let separator = tab_separator(capabilities);
 
+    let display_name = if tabname.starts_with("Tab #") {
+        "unnamed"
+    } else {
+        &tabname
+    };
+    tabname = format!("{}:{}", tab.position + 1, display_name);
+
     if tab.is_fullscreen_active {
         tabname.push_str(" (FULLSCREEN)");
     } else if tab.is_sync_panes_active {
