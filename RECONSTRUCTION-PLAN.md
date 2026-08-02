@@ -11,6 +11,87 @@ Rebuild the fork as the **smallest set of commits that is byte-identical at the 
 > which turned three items into **churn** (added *and* deleted inside the range) — see
 > §3.1. The diff target is now the 66-commit tip, not the 63-commit one.
 
+## 0. Outcome — executed
+
+**Done.** `git diff backup/atomize-target HEAD -- . ':(exclude)RECONSTRUCTION-PLAN.md'` is
+**empty**, the tip builds clean (`zellij 0.45.0 (5a81bc30f9f1)`, no `-dirty` after the plugin
+rebake), and **67 commits became 22**, ordered by independence: what stands alone comes first,
+what depends on it follows.
+
+### Order is a claim, and the claim is tested
+
+The first ten commits are fixes to *upstream* code. That is not a judgement call — each was
+cherry-picked **individually onto bare `e9173cba`, with no fork commit present**, and each
+applied cleanly. A patch that applies to untouched upstream cannot be repairing something the
+fork introduced. Reproduce it with:
+
+```bash
+git switch --detach e9173cba
+git cherry-pick -n <sha> && git diff --name-only --diff-filter=U   # empty => independent
+```
+
+Two of the twelve candidates failed that test and were placed accordingly:
+
+| commit | needs | placed |
+|---|---|---|
+| `bb1f0a29` restore float visibility | `488ca8ff` — *textual* adjacency in `tab/mod.rs`, not a fork dependency | kept adjacent, logging first |
+| `04160671` cwd-attach picks the live session | the registry, and the block `c546c95c` adds | folded into the cwd commit, below the infrastructure line |
+
+`divens` authorship is preserved on the two commits that are theirs — cherry-pick carries it,
+and squashing would have erased it.
+
+### The tiers
+
+| | |
+|---|---|
+| **upstream fixes** x10 | provably independent (above); `94db0479` is diagnostic logging, isolated so it can be dropped without touching behaviour |
+| **fork infrastructure** | build tooling · sessions registry · Windows platform · cwd naming |
+| **features** | copymode · bars · auto-tab-name · pane-nav · themes · agent-bar |
+| **refinement** | derive liveness from the bound-pipe namespace |
+| **artifacts** | rebaked wasm + regenerated protobuf |
+
+Ordering constraints that are real, not stylistic: **sessions precedes Windows** (`e46ca68f`
+calls `resolve_session_ipc_pipe`, which the registry introduces), and **within any file, hunks
+must keep their original order** — clustering may reorder across independent files, never
+within one. Both were learned by violating them.
+
+### Method
+
+Cluster by concern, replay each cluster's sources **in original order** with `cherry-pick -n`,
+squash each cluster into one commit. Shared integration files are touched by several commits —
+once per concern. `input/actions.rs` appears in copymode, pane-nav and fixes because three
+features genuinely add action variants. That is the honest shape.
+
+### What this replaced
+
+A first attempt assigned every file to exactly one owning cluster and committed its final
+content: byte-identical tip, **zero** files touched twice, and commits that lied.
+`feat(pane-nav)` held a 103-line module and none of its wiring — nine of its ten files had
+been dealt elsewhere. Optimising "no file touched twice" destroyed what that metric stood for.
+That branch survives as `e9173cba-minimal`.
+
+### Corrections to earlier claims in this document
+
+- **§7.1's "provable cycle" was wrong.** `screen.rs` is touched S -> C -> S -> C -> N -> TH,
+  which looked like it forced copymode and sessions each to precede the other. Splitting the
+  session work into an early core and a late derived group dissolves it. Patch replay was
+  abandoned on a bad argument.
+- **Silent loss is the real hazard.** The replay helper swallowed cherry-pick failures with
+  `|| true`, losing `host_theme_watcher.rs` (78 lines), both bar `line.rs` files, and initially
+  all of auto-tab-name — no error, twelve files drifted. Only the diff-against-target caught
+  it. Never let a replay step fail quietly.
+- **`Cargo.toml`'s `strip`** is a genuine same-line clash (`"none"` vs `true`), not an ordering
+  bug: two commits write it for different reasons. Last writer wins — read the value off the
+  target rather than guessing.
+
+### Operational note
+
+Five abandoned replays left **38,288 loose objects, ~12.4 GB** — each restart orphaning a
+commit set plus fifteen ~1.5 MB wasm blobs. The reconciliation rebase timed out past ten
+minutes. After `git gc --prune=now`: single-file checkout 147ms -> 47ms, and the same rebase
+finished in **4.7 seconds**. In a repo carrying large binary assets, budget a gc after any
+abandoned history rewrite.
+
 ## 1. The contract
 
 **Strict diff-equivalence.** `git diff backup/atomize-target <new-tip>` must be **empty**.
