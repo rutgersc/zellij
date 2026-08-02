@@ -169,6 +169,7 @@ pub const BUILTIN_PLUGIN_NAMES: &[&str] = &[
     "layout-manager",
     "link",
     "auto-tab-name",
+    "agent-bar",
 ];
 
 #[cfg(not(target_family = "wasm"))]
@@ -234,6 +235,7 @@ mod not_wasm {
                 add_plugin!(assets, "layout-manager.wasm");
                 add_plugin!(assets, "link.wasm");
                 add_plugin!(assets, "auto-tab-name.wasm");
+                add_plugin!(assets, "agent-bar.wasm");
             }
             assets
         };
