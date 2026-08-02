@@ -60,6 +60,7 @@ impl PluginConfig {
                 if tag == "status-bar"
                     || tag == "tab-bar"
                     || tag == "compact-bar"
+                    || tag == "agent-bar"
                     || tag == "strider"
                     || tag == "session-manager"
                     || tag == "configuration"
