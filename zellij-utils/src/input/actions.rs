@@ -219,6 +219,10 @@ pub enum Action {
     /// Switch focus to next pane in specified direction.
     FocusNextPane,
     FocusPreviousPane,
+    /// Walk a persisted cross-session pane jumplist backwards (browser-style).
+    FocusPrevJump,
+    /// Walk a persisted cross-session pane jumplist forwards (browser-style).
+    FocusNextJump,
     /// Move the focus pane in specified direction.
     SwitchFocus,
     MoveFocus {

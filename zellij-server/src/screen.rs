@@ -364,6 +364,8 @@ pub enum ScreenInstruction {
     SwitchFocus(ClientId, Option<NotificationEnd>),
     FocusNextPane(ClientId, Option<NotificationEnd>),
     FocusPreviousPane(ClientId, Option<NotificationEnd>),
+    FocusPrevJump(ClientId, Option<NotificationEnd>),
+    FocusNextJump(ClientId, Option<NotificationEnd>),
     MoveFocusLeft(ClientId, Option<NotificationEnd>),
     MoveFocusLeftOrPreviousTab(ClientId, Option<NotificationEnd>),
     MoveFocusDown(ClientId, Option<NotificationEnd>),
@@ -925,6 +927,8 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::SwitchFocus(..) => ScreenContext::SwitchFocus,
             ScreenInstruction::FocusNextPane(..) => ScreenContext::FocusNextPane,
             ScreenInstruction::FocusPreviousPane(..) => ScreenContext::FocusPreviousPane,
+            ScreenInstruction::FocusPrevJump(..) => ScreenContext::FocusPrevJump,
+            ScreenInstruction::FocusNextJump(..) => ScreenContext::FocusNextJump,
             ScreenInstruction::MoveFocusLeft(..) => ScreenContext::MoveFocusLeft,
             ScreenInstruction::MoveFocusLeftOrPreviousTab(..) => {
                 ScreenContext::MoveFocusLeftOrPreviousTab
@@ -1392,6 +1396,7 @@ pub(crate) struct Screen {
     global_last_active_tab_id: usize,
     tab_history: BTreeMap<ClientId, Vec<usize>>,
     pane_history: BTreeMap<ClientId, Vec<PaneId>>,
+    last_nav_recorded: BTreeMap<ClientId, PaneId>,
     mode_info: BTreeMap<ClientId, ModeInfo>,
     default_mode_info: ModeInfo, // TODO: restructure ModeInfo to prevent this duplication
     style: Style,
@@ -1584,6 +1589,7 @@ impl Screen {
             terminal_emulator_color_codes: Rc::new(RefCell::new(HashMap::new())),
             tab_history: BTreeMap::new(),
             pane_history: BTreeMap::new(),
+            last_nav_recorded: BTreeMap::new(),
             mode_info: BTreeMap::new(),
             default_mode_info: mode_info,
             draw_pane_frames,
@@ -5383,6 +5389,10 @@ impl Screen {
                 let history = self.pane_history.entry(client_id).or_insert_with(|| vec![]);
                 history.retain(|e| e != &active_pane_id);
                 history.push(active_pane_id.into());
+                if self.last_nav_recorded.get(&client_id) != Some(&active_pane_id) {
+                    self.last_nav_recorded.insert(client_id, active_pane_id);
+                    crate::pane_nav::record(&self.session_name, active_pane_id);
+                }
             }
         }
     }
@@ -5669,6 +5679,37 @@ fn find_already_running_panes(
     }
 
     (tiled_to_ignore, floating_indices)
+}
+
+fn do_pane_jump(screen: &mut Screen, client_id: ClientId, forward: bool) -> Result<()> {
+    let Some((session, pane)) = crate::pane_nav::step(forward) else {
+        return Ok(());
+    };
+    if session == screen.session_name {
+        screen.focus_pane_with_id(pane, true, false, client_id)?;
+        screen.render(None)?;
+    } else {
+        let pane_id = match pane {
+            PaneId::Terminal(id) => (id, false),
+            PaneId::Plugin(id) => (id, true),
+        };
+        let connect_to_session = zellij_utils::data::ConnectToSession {
+            name: Some(session),
+            tab_position: None,
+            pane_id: Some(pane_id),
+            layout: None,
+            cwd: None,
+        };
+        screen
+            .bus
+            .senders
+            .send_to_server(ServerInstruction::SwitchSession(
+                connect_to_session,
+                client_id,
+                None,
+            ))?;
+    }
+    Ok(())
 }
 
 // The box is here in order to make the
@@ -6238,6 +6279,12 @@ pub(crate) fn screen_thread_main(
                     screen.render(None)?;
                     screen.log_and_report_session_state()?;
                 }
+            },
+            ScreenInstruction::FocusPrevJump(client_id, _completion_tx) => {
+                do_pane_jump(&mut screen, client_id, false)?;
+            },
+            ScreenInstruction::FocusNextJump(client_id, _completion_tx) => {
+                do_pane_jump(&mut screen, client_id, true)?;
             },
             ScreenInstruction::MoveFocusLeft(client_id, mut _completion_tx) => {
                 if screen.get_first_client_id().is_none() {

@@ -370,6 +370,22 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::FocusPrevJump => {
+            senders
+                .send_to_screen(ScreenInstruction::FocusPrevJump(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::FocusNextJump => {
+            senders
+                .send_to_screen(ScreenInstruction::FocusNextJump(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::FocusPaneByPaneId { pane_id } => {
             senders
                 .send_to_screen(ScreenInstruction::FocusPaneWithId(
