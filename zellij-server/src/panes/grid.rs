@@ -29,6 +29,7 @@ use vte;
 use zellij_utils::{
     consts::{DEFAULT_SCROLL_BUFFER_SIZE, SCROLL_BUFFER_SIZE},
     data::{Palette, PaletteColor, Styling},
+    input::actions::CopyMotion,
     input::mouse::{MouseEvent, MouseEventType},
     input::options::DEFAULT_WORD_SEPARATORS,
     nested_session::{self, NestedSessionMessage},
@@ -702,6 +703,7 @@ pub struct Grid {
     pub height: usize,
     pub pending_messages_to_pty: Vec<Vec<u8>>,
     pub selection: Selection,
+    pub copy_mode: Option<CopyModeState>,
     pub title: Option<String>,
     pub is_scrolled: bool,
     pub link_handler: Rc<RefCell<LinkHandler>>,
@@ -1061,6 +1063,7 @@ impl Grid {
             terminal_emulator_color_codes,
             output_buffer: Default::default(),
             selection: Default::default(),
+            copy_mode: None,
             title_stack: vec![],
             title: None,
             changed_colors: None,
@@ -1831,6 +1834,7 @@ impl Grid {
             self.read_changes(content_x, content_y);
 
         let plugin_highlight_selections = self.compute_plugin_highlight_selections();
+        let copy_mode_cursor = self.copy_mode_cursor_highlight(style);
 
         for character_chunk in character_chunks.iter_mut() {
             character_chunk.add_changed_colors(self.changed_colors);
@@ -1843,6 +1847,20 @@ impl Grid {
                 self.pane_default_fg.map(AnsiCode::RgbCode),
                 self.pane_default_bg.map(AnsiCode::RgbCode),
             );
+            // Pushed before the selection so `.find()` resolves the cursor cell
+            // to the reverse-video highlight while the rest stays selection-coloured.
+            if let Some(cursor_highlight) = copy_mode_cursor {
+                if cursor_highlight
+                    .selection
+                    .contains_row(character_chunk.y.saturating_sub(content_y))
+                {
+                    character_chunk.add_selection_and_colors(
+                        cursor_highlight,
+                        content_x,
+                        content_y,
+                    );
+                }
+            }
             if self
                 .selection
                 .contains_row(character_chunk.y.saturating_sub(content_y))
@@ -5755,6 +5773,577 @@ impl Row {
 
 fn is_selection_boundary_character(character: char, word_separators: &str) -> bool {
     character.is_ascii_whitespace() || word_separators.contains(character)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CopyModeState {
+    pub cursor: Position,
+    pub anchor: Option<Position>,
+    /// When a visual selection is active (`anchor.is_some()`), whether it is
+    /// linewise (vim `V`) rather than charwise (vim `v`). Dormant otherwise.
+    pub linewise: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Whitespace,
+    Word,
+    Other,
+}
+
+fn classify(c: char) -> WordClass {
+    if c.is_whitespace() {
+        WordClass::Whitespace
+    } else if c.is_alphanumeric() || c == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Other
+    }
+}
+
+impl Grid {
+    pub fn enter_copy_mode(&mut self) {
+        let max_row = self.viewport.len().saturating_sub(1) as i32;
+        let row = (self.cursor.y as i32).min(max_row).max(0);
+        let col = self.cursor.x as u16;
+        let cursor = Position::new(row, col);
+        self.copy_mode = Some(CopyModeState {
+            cursor,
+            anchor: None,
+            linewise: false,
+        });
+        self.selection.reset();
+        self.sync_selection_to_copy_cursor();
+        self.output_buffer.update_line(cursor.line.0 as usize);
+        self.mark_for_rerender();
+    }
+
+    pub fn exit_copy_mode(&mut self) {
+        let old_selection = self.selection;
+        self.copy_mode = None;
+        self.selection.reset();
+        self.update_selected_lines(&old_selection, &self.selection.clone());
+        self.mark_for_rerender();
+    }
+
+    /// Vim `v`: enter charwise visual, leave it if already charwise, or switch
+    /// down from linewise to charwise (keeping the anchor).
+    pub fn toggle_copy_visual(&mut self) {
+        if let Some(state) = self.copy_mode.as_mut() {
+            match (state.anchor, state.linewise) {
+                (Some(_), true) => state.linewise = false,
+                (Some(_), false) => state.anchor = None,
+                (None, _) => {
+                    state.anchor = Some(state.cursor);
+                    state.linewise = false;
+                },
+            }
+            self.sync_selection_to_copy_cursor();
+            self.mark_for_rerender();
+        }
+    }
+
+    /// Vim `V`: enter linewise visual, leave it if already linewise, or switch
+    /// up from charwise to linewise (keeping the anchor).
+    pub fn toggle_copy_visual_line(&mut self) {
+        if let Some(state) = self.copy_mode.as_mut() {
+            match (state.anchor, state.linewise) {
+                (Some(_), false) => state.linewise = true,
+                (Some(_), true) => state.anchor = None,
+                (None, _) => {
+                    state.anchor = Some(state.cursor);
+                    state.linewise = true;
+                },
+            }
+            self.sync_selection_to_copy_cursor();
+            self.mark_for_rerender();
+        }
+    }
+
+    /// Returns `true` if an active visual selection was cancelled (cursor stays
+    /// in copy mode), `false` if there was nothing to cancel — in which case the
+    /// caller should leave copy mode.
+    pub fn copy_mode_escape(&mut self) -> bool {
+        let has_visual = self.copy_mode.map_or(false, |s| s.anchor.is_some());
+        if has_visual {
+            if let Some(state) = self.copy_mode.as_mut() {
+                state.anchor = None;
+                state.linewise = false;
+            }
+            self.sync_selection_to_copy_cursor();
+            self.mark_for_rerender();
+        }
+        has_visual
+    }
+
+    pub fn copy_mode_yank_text(&mut self) -> Option<String> {
+        if self.copy_mode.is_none() {
+            return None;
+        }
+        let text = if self.selection.is_empty() {
+            None
+        } else {
+            self.get_selected_text()
+        };
+        self.exit_copy_mode();
+        text
+    }
+
+    /// The current visual selection as a single-line search needle, or `None`
+    /// when no visual selection is active — so leaving copy mode for search with
+    /// nothing selected keeps any prior search untouched. Multi-line selections
+    /// collapse to their first line; a search needle is a single-row pattern.
+    pub fn copy_mode_selection_for_search(&self) -> Option<String> {
+        let state = self.copy_mode?;
+        state.anchor?;
+        let text = self.get_selected_text()?;
+        let first_line = text.lines().next().unwrap_or("");
+        (!first_line.is_empty()).then(|| first_line.to_string())
+    }
+
+    pub fn apply_copy_motion(&mut self, motion: CopyMotion) {
+        let Some(state) = self.copy_mode else {
+            return;
+        };
+        let (mut line, mut col) = (state.cursor.line.0, state.cursor.column.0);
+        let height = self.viewport.len() as isize;
+        if height == 0 {
+            return;
+        }
+        let last_line = height - 1;
+        let row_len = |g: &Grid, l: isize| -> usize {
+            g.viewport
+                .get(l.max(0) as usize)
+                .map(|r| r.columns.len())
+                .unwrap_or(0)
+        };
+        // A row is "blank" (paragraph boundary) when empty or all-whitespace.
+        // Off-viewport indices count as blank so scans terminate at the edge.
+        let is_blank = |g: &Grid, l: isize| -> bool {
+            g.viewport
+                .get(l.max(0) as usize)
+                .map(|r| r.columns.iter().all(|c| c.character.is_whitespace()))
+                .unwrap_or(true)
+        };
+
+        match motion {
+            CopyMotion::Left => {
+                if col > 0 {
+                    col -= 1;
+                }
+            },
+            CopyMotion::Right => {
+                let max_col = row_len(self, line).saturating_sub(1);
+                if col < max_col {
+                    col += 1;
+                }
+            },
+            CopyMotion::Up => {
+                if line > 0 {
+                    line -= 1;
+                } else {
+                    self.scroll_up_one_line();
+                }
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::Down => {
+                if line < last_line {
+                    line += 1;
+                } else {
+                    self.scroll_down_one_line();
+                }
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::LineStart => {
+                col = 0;
+            },
+            CopyMotion::LineEnd => {
+                col = self
+                    .viewport
+                    .get(line.max(0) as usize)
+                    .and_then(|r| {
+                        r.columns
+                            .iter()
+                            .rposition(|c| !c.character.is_whitespace())
+                    })
+                    .unwrap_or(0);
+            },
+            CopyMotion::LineFirstNonBlank => {
+                col = self
+                    .viewport
+                    .get(line.max(0) as usize)
+                    .and_then(|r| {
+                        r.columns
+                            .iter()
+                            .position(|c| !c.character.is_whitespace())
+                    })
+                    .unwrap_or(0);
+            },
+            CopyMotion::BufferTop => {
+                line = 0;
+                col = 0;
+            },
+            CopyMotion::BufferBottom => {
+                line = last_line;
+                col = 0;
+            },
+            CopyMotion::WordForward => {
+                let (nl, nc) = next_word_start(&self.viewport, line, col);
+                line = nl;
+                col = nc;
+            },
+            CopyMotion::WordEnd => {
+                let (nl, nc) = next_word_end(&self.viewport, line, col);
+                line = nl;
+                col = nc;
+            },
+            CopyMotion::WordBackward => {
+                let (nl, nc) = prev_word_start(&self.viewport, line, col);
+                line = nl;
+                col = nc;
+            },
+            // Multi-line vertical jumps. Walk one line at a time so the existing
+            // edge-scroll behaviour (scroll_up/down_one_line) carries the cursor
+            // past the viewport into scrollback, exactly like single-step j/k.
+            CopyMotion::HalfPageUp | CopyMotion::PageUp => {
+                let n = match motion {
+                    CopyMotion::HalfPageUp => (height / 2).max(1),
+                    _ => (height - 1).max(1),
+                };
+                for _ in 0..n {
+                    if line > 0 {
+                        line -= 1;
+                    } else {
+                        self.scroll_up_one_line();
+                    }
+                }
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::HalfPageDown | CopyMotion::PageDown => {
+                let n = match motion {
+                    CopyMotion::HalfPageDown => (height / 2).max(1),
+                    _ => (height - 1).max(1),
+                };
+                for _ in 0..n {
+                    if line < last_line {
+                        line += 1;
+                    } else {
+                        self.scroll_down_one_line();
+                    }
+                }
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            // Reposition within the visible viewport, no scroll (vim H/M/L).
+            CopyMotion::ScreenTop => {
+                line = 0;
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::ScreenMiddle => {
+                line = last_line / 2;
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            CopyMotion::ScreenBottom => {
+                line = last_line;
+                col = col.min(row_len(self, line).saturating_sub(1));
+            },
+            // Step (scrolling at the edge) to the next/previous blank line. The
+            // first step always moves, so starting on a blank line skips it.
+            // `lines_above.len()` not advancing past a scroll means we hit the
+            // buffer edge with no blank found — stop there.
+            CopyMotion::ParagraphForward => {
+                loop {
+                    if line < last_line {
+                        line += 1;
+                    } else {
+                        let prev_above = self.lines_above.len();
+                        self.scroll_down_one_line();
+                        if self.lines_above.len() == prev_above {
+                            break;
+                        }
+                    }
+                    if is_blank(self, line) {
+                        break;
+                    }
+                }
+                col = 0;
+            },
+            CopyMotion::ParagraphBackward => {
+                loop {
+                    if line > 0 {
+                        line -= 1;
+                    } else {
+                        let prev_above = self.lines_above.len();
+                        self.scroll_up_one_line();
+                        if self.lines_above.len() == prev_above {
+                            break;
+                        }
+                    }
+                    if is_blank(self, line) {
+                        break;
+                    }
+                }
+                col = 0;
+            },
+            // Land on the search hit the user just navigated to and pre-select
+            // the whole match as a charwise visual selection: cursor on the first
+            // char, anchor on the last cell (the search selection's end is
+            // exclusive, so back up one). `active` is the n/p-selected hit; before
+            // any navigation we fall back to the first match in view. The search
+            // has already scrolled the hit into the viewport, so its coordinates
+            // are valid as-is. No matches → leave the cursor where entering copy
+            // mode put it.
+            CopyMotion::SearchResult => {
+                let target = self
+                    .search_results
+                    .active
+                    .or_else(|| self.search_results.selections.first().copied());
+                if let Some(sel) = target {
+                    line = sel.start.line().min(last_line).max(0);
+                    col = sel.start.column().min(row_len(self, line).saturating_sub(1));
+                    let anchor_line = sel.end.line().min(last_line).max(0);
+                    let anchor_col = sel
+                        .end
+                        .column()
+                        .saturating_sub(1)
+                        .min(row_len(self, anchor_line).saturating_sub(1));
+                    if let Some(state) = self.copy_mode.as_mut() {
+                        state.anchor = Some(Position::new(anchor_line as i32, anchor_col as u16));
+                        state.linewise = false;
+                    }
+                }
+            },
+        }
+
+        if let Some(state) = self.copy_mode.as_mut() {
+            state.cursor.change_line(line);
+            state.cursor.change_column(col);
+        }
+        self.sync_selection_to_copy_cursor();
+        self.mark_for_rerender();
+    }
+
+    /// A single-cell, reverse-video highlight marking the copy-mode cursor.
+    /// Rendered on top of (and pushed before) the selection highlight so the
+    /// cursor stays visible against both normal text and the selection block.
+    fn copy_mode_cursor_highlight(&self, style: &Style) -> Option<HighlightSelection> {
+        let state = self.copy_mode?;
+        let cursor = state.cursor;
+        let mut selection = Selection::default();
+        selection.set_start_and_end_positions(cursor, end_inclusive(cursor));
+        let to_ansi = |c: PaletteColor| -> AnsiCode {
+            match c {
+                PaletteColor::Rgb(rgb) => AnsiCode::RgbCode(rgb),
+                PaletteColor::EightBit(col) => AnsiCode::ColorIndex(col),
+            }
+        };
+        // Reverse video relative to normal text: the normal foreground becomes
+        // the cursor block, the normal background becomes the glyph on top.
+        Some(HighlightSelection {
+            selection,
+            bg: Some(to_ansi(style.colors.text_unselected.base)),
+            fg: Some(to_ansi(style.colors.text_unselected.background)),
+            bold: false,
+            italic: false,
+            underline: false,
+            layer: HighlightLayer::ActionFeedback,
+        })
+    }
+
+    fn sync_selection_to_copy_cursor(&mut self) {
+        let old_selection = self.selection;
+        let Some(state) = self.copy_mode else {
+            return;
+        };
+        let cursor = state.cursor;
+        match state.anchor {
+            Some(anchor) if state.linewise => {
+                // Whole-line span: from column 0 of the topmost line to one past
+                // the last column of the bottommost line. `get_selected_text` and
+                // the highlight both read an end column of `width` as "full row".
+                let top = anchor.line.0.min(cursor.line.0);
+                let bottom = anchor.line.0.max(cursor.line.0);
+                let start = Position::new(top as i32, 0);
+                let end = Position::new(bottom as i32, self.width as u16);
+                self.selection.set_start_and_end_positions(start, end);
+            },
+            Some(anchor) => {
+                let (start, end) = if (anchor.line, anchor.column) <= (cursor.line, cursor.column) {
+                    (anchor, end_inclusive(cursor))
+                } else {
+                    (cursor, end_inclusive(anchor))
+                };
+                self.selection.set_start_and_end_positions(start, end);
+            },
+            None => {
+                let start = cursor;
+                let end = end_inclusive(cursor);
+                self.selection.set_start_and_end_positions(start, end);
+            },
+        }
+        self.update_selected_lines(&old_selection, &self.selection.clone());
+    }
+}
+
+fn end_inclusive(p: Position) -> Position {
+    Position::new(p.line.0 as i32, (p.column.0 + 1) as u16)
+}
+
+fn next_word_start(
+    viewport: &std::collections::VecDeque<Row>,
+    mut line: isize,
+    mut col: usize,
+) -> (isize, usize) {
+    let height = viewport.len() as isize;
+    if height == 0 {
+        return (line, col);
+    }
+    let cell = |l: isize, c: usize| -> Option<char> {
+        viewport
+            .get(l.max(0) as usize)
+            .and_then(|r| r.columns.get(c))
+            .map(|tc| tc.character)
+    };
+    let start_class = cell(line, col).map(classify).unwrap_or(WordClass::Whitespace);
+    let mut saw_break = matches!(start_class, WordClass::Whitespace);
+    loop {
+        let row_len = viewport
+            .get(line.max(0) as usize)
+            .map(|r| r.columns.len())
+            .unwrap_or(0);
+        if col + 1 < row_len {
+            col += 1;
+        } else if line + 1 < height {
+            line += 1;
+            col = 0;
+        } else {
+            return (line, col);
+        }
+        let class = cell(line, col).map(classify).unwrap_or(WordClass::Whitespace);
+        if matches!(class, WordClass::Whitespace) {
+            saw_break = true;
+        } else if saw_break || class != start_class {
+            return (line, col);
+        }
+    }
+}
+
+fn next_word_end(
+    viewport: &std::collections::VecDeque<Row>,
+    mut line: isize,
+    mut col: usize,
+) -> (isize, usize) {
+    let height = viewport.len() as isize;
+    if height == 0 {
+        return (line, col);
+    }
+    let cell = |l: isize, c: usize| -> Option<char> {
+        viewport
+            .get(l.max(0) as usize)
+            .and_then(|r| r.columns.get(c))
+            .map(|tc| tc.character)
+    };
+    let advance = |line: &mut isize, col: &mut usize| -> bool {
+        let row_len = viewport
+            .get((*line).max(0) as usize)
+            .map(|r| r.columns.len())
+            .unwrap_or(0);
+        if *col + 1 < row_len {
+            *col += 1;
+            true
+        } else if *line + 1 < height {
+            *line += 1;
+            *col = 0;
+            true
+        } else {
+            false
+        }
+    };
+    if !advance(&mut line, &mut col) {
+        return (line, col);
+    }
+    while matches!(
+        cell(line, col).map(classify).unwrap_or(WordClass::Whitespace),
+        WordClass::Whitespace
+    ) {
+        if !advance(&mut line, &mut col) {
+            return (line, col);
+        }
+    }
+    let cur_class = cell(line, col).map(classify).unwrap_or(WordClass::Whitespace);
+    loop {
+        let mut peek_line = line;
+        let mut peek_col = col;
+        if !advance(&mut peek_line, &mut peek_col) {
+            return (line, col);
+        }
+        let next_class = cell(peek_line, peek_col)
+            .map(classify)
+            .unwrap_or(WordClass::Whitespace);
+        if next_class != cur_class {
+            return (line, col);
+        }
+        line = peek_line;
+        col = peek_col;
+    }
+}
+
+fn prev_word_start(
+    viewport: &std::collections::VecDeque<Row>,
+    mut line: isize,
+    mut col: usize,
+) -> (isize, usize) {
+    if viewport.is_empty() {
+        return (line, col);
+    }
+    let cell = |l: isize, c: usize| -> Option<char> {
+        viewport
+            .get(l.max(0) as usize)
+            .and_then(|r| r.columns.get(c))
+            .map(|tc| tc.character)
+    };
+    let retreat = |line: &mut isize, col: &mut usize| -> bool {
+        if *col > 0 {
+            *col -= 1;
+            true
+        } else if *line > 0 {
+            *line -= 1;
+            let row_len = viewport
+                .get((*line).max(0) as usize)
+                .map(|r| r.columns.len())
+                .unwrap_or(0);
+            *col = row_len.saturating_sub(1);
+            true
+        } else {
+            false
+        }
+    };
+    if !retreat(&mut line, &mut col) {
+        return (line, col);
+    }
+    while matches!(
+        cell(line, col).map(classify).unwrap_or(WordClass::Whitespace),
+        WordClass::Whitespace
+    ) {
+        if !retreat(&mut line, &mut col) {
+            return (line, col);
+        }
+    }
+    let cur_class = cell(line, col).map(classify).unwrap_or(WordClass::Whitespace);
+    loop {
+        let mut peek_line = line;
+        let mut peek_col = col;
+        if !retreat(&mut peek_line, &mut peek_col) {
+            return (line, col);
+        }
+        let prev_class = cell(peek_line, peek_col)
+            .map(classify)
+            .unwrap_or(WordClass::Whitespace);
+        if prev_class != cur_class {
+            return (line, col);
+        }
+        line = peek_line;
+        col = peek_col;
+    }
 }
 
 #[cfg(test)]
