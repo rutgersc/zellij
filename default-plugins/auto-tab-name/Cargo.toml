@@ -1,0 +1,9 @@
+[package]
+name = "auto-tab-name"
+version = "0.1.0"
+authors = ["Rutger Schoorstra <r.schoorstra@scisure.com>"]
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zellij-tile = { path = "../../zellij-tile" }
