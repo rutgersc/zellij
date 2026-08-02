@@ -64,6 +64,7 @@ members = [
     "zellij-tile",
     "zellij-tile-utils",
     "xtask",
+    "zellijctl",
     ".",
 ]
 
@@ -126,6 +127,7 @@ opt-level = 3
 [profile.release]
 lto = true
 strip = true
+debug = "line-tables-only"
 codegen-units = 1
 
 [package.metadata.deb]
@@ -150,7 +152,7 @@ pkg-fmt = "tgz"
 
 [features]
 # See remarks in zellij_utils/Cargo.toml
-default = ["plugins_from_target", "vendored_curl", "web_server_capability"]
+default = ["plugins_from_target"]
 plugins_from_target = ["zellij-utils/plugins_from_target"]
 disable_automatic_asset_installation = ["zellij-utils/disable_automatic_asset_installation"]
 vendored_curl = ["zellij-utils/vendored_curl"]
