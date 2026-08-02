@@ -47,7 +47,7 @@ use zellij_utils::data::{
     ResizeStrategy, SessionInfo, Styling, TabInfo, ThemeHue, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
-use zellij_utils::input::actions::Action;
+use zellij_utils::input::actions::{Action, CopyMotion};
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::config::Config;
 use zellij_utils::input::keybinds::{shortcut_for_action, Keybinds};
@@ -418,6 +418,11 @@ pub enum ScreenInstruction {
         response_channel: crossbeam::channel::Sender<Option<TabInfo>>,
     },
     EditScrollback(ClientId, bool, Option<NotificationEnd>),
+    MoveCopyCursor(ClientId, CopyMotion, Option<NotificationEnd>),
+    ToggleCopyVisual(ClientId, Option<NotificationEnd>),
+    ToggleCopyVisualLine(ClientId, Option<NotificationEnd>),
+    CopyModeEscape(ClientId, InputMode, Option<NotificationEnd>),
+    CopyAndExitCopyMode(ClientId, Option<NotificationEnd>),
     GetPaneScrollback {
         pane_id: PaneId,
         client_id: ClientId,
@@ -1000,6 +1005,11 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::GetPaneInfo { .. } => ScreenContext::GetPaneInfo,
             ScreenInstruction::GetTabInfo { .. } => ScreenContext::GetTabInfo,
             ScreenInstruction::EditScrollback(..) => ScreenContext::EditScrollback,
+            ScreenInstruction::MoveCopyCursor(..) => ScreenContext::MoveCopyCursor,
+            ScreenInstruction::ToggleCopyVisual(..) => ScreenContext::ToggleCopyVisual,
+            ScreenInstruction::ToggleCopyVisualLine(..) => ScreenContext::ToggleCopyVisualLine,
+            ScreenInstruction::CopyModeEscape(..) => ScreenContext::CopyModeEscape,
+            ScreenInstruction::CopyAndExitCopyMode(..) => ScreenContext::CopyAndExitCopyMode,
             ScreenInstruction::GetPaneScrollback { .. } => ScreenContext::GetPaneScrollback,
             ScreenInstruction::ScrollUp(..) => ScreenContext::ScrollUp,
             ScreenInstruction::ScrollDown(..) => ScreenContext::ScrollDown,
@@ -5562,8 +5572,15 @@ impl Screen {
             )
         };
 
-        // If we leave the Search-related modes, we need to clear all previous searches
-        let search_related_modes = [InputMode::EnterSearch, InputMode::Search, InputMode::Scroll];
+        // If we leave the Search-related modes, we need to clear all previous searches.
+        // CopyMode counts as search-related so a Search/Scroll -> CopyMode jump keeps the
+        // hits (copy mode lands the cursor on the active one); they're cleared on the way out.
+        let search_related_modes = [
+            InputMode::EnterSearch,
+            InputMode::Search,
+            InputMode::Scroll,
+            InputMode::CopyMode,
+        ];
         if search_related_modes.contains(&previous_mode)
             && !search_related_modes.contains(&mode_info.mode)
         {
@@ -5583,6 +5600,22 @@ impl Screen {
         if mode_info.mode == InputMode::RenameTab {
             if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
                 active_tab.prev_name = active_tab.name.clone();
+            }
+        }
+
+        if mode_info.mode == InputMode::CopyMode && previous_mode != InputMode::CopyMode {
+            if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
+                active_tab.enter_copy_mode_in_active_pane(client_id);
+            }
+        } else if previous_mode == InputMode::CopyMode && mode_info.mode != InputMode::CopyMode {
+            if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
+                // Leaving copy mode for search: an active visual selection becomes the
+                // new search query. With nothing selected this is a no-op, so any prior
+                // search survives intact — a plain trip back to where the jump came from.
+                if mode_info.mode == InputMode::Search {
+                    active_tab.search_copy_mode_selection_in_active_pane(client_id);
+                }
+                active_tab.exit_copy_mode_in_active_pane(client_id);
             }
         }
 
@@ -8580,6 +8613,61 @@ pub(crate) fn screen_thread_main(
                 );
                 screen.render(None)?;
                 screen.log_and_report_session_state()?;
+            },
+            ScreenInstruction::MoveCopyCursor(client_id, motion, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .move_copy_mode_cursor(motion, client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::ToggleCopyVisual(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab.toggle_copy_mode_visual(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::ToggleCopyVisualLine(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .toggle_copy_mode_visual_line(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::CopyModeEscape(client_id, default_mode, _completion_tx) => {
+                // First Esc cancels an active visual selection; a second Esc (no
+                // selection left) leaves copy mode for the client's default mode.
+                let cleared_visual = match screen.get_active_tab_mut(client_id) {
+                    Ok(tab) => tab.copy_mode_escape(client_id),
+                    Err(_) => false,
+                };
+                if cleared_visual {
+                    screen.render(None)?;
+                } else {
+                    // Mirror SwitchToMode: update the server-side keybind mode
+                    // registry as well as the rendered mode_info, or they desync.
+                    screen
+                        .bus
+                        .senders
+                        .send_to_server(ServerInstruction::ChangeMode(client_id, default_mode, None))?;
+                    screen.change_mode(default_mode, Some(default_mode), client_id)?;
+                    screen.render(None)?;
+                }
+            },
+            ScreenInstruction::CopyAndExitCopyMode(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab.copy_mode_yank(client_id),
+                    ?
+                );
+                screen.render(None)?;
             },
             ScreenInstruction::GetPaneScrollback {
                 pane_id,
