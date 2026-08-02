@@ -53,7 +53,7 @@ fn validate_session(name: &str) -> Result<String, String> {
 
 #[derive(Parser, Default, Debug, Clone, Serialize, Deserialize)]
 #[clap(
-    version,
+    version = crate::consts::VERSION_AND_SHA,
     name = "zellij",
     about = "A terminal workspace with batteries included",
     styles = CLI_STYLES,

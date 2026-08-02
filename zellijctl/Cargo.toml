@@ -1,0 +1,17 @@
+[package]
+name = "zellijctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Minimal client-only zellij CLI dispatcher (fork-only; used by mux)"
+
+# Links only the client + shared utils — no zellij-server, no embedded wasm
+# plugins. The resulting binary is a few MB instead of ~40MB, so on-access AV
+# (which hashes the whole file on every exec, ~ms/MB) taxes each spawn far less.
+# `mux` shells out to this instead of `zellij` for its switch/focus actions.
+[dependencies]
+zellij-client = { path = "../zellij-client", version = "0.45.0" }
+zellij-utils = { workspace = true }
+clap = { workspace = true }

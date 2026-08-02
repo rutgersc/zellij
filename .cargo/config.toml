@@ -5,6 +5,11 @@ xtask = "run --package xtask --"
 x = "xtask"
 q = "x run --quick-run"
 make = "xtask deprecated"
+# FORK: `cargo bake` builds every default plugin as wasm and copies each
+# into zellij-utils/assets/plugins/. Run before committing a default-
+# plugin source change; the pre-commit hook expects the matching .wasm
+# to be staged alongside the source.
+bake = "x build --plugins-only --release"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
