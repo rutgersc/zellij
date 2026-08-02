@@ -69,6 +69,7 @@ impl PluginConfig {
                     || tag == "multiple-select"
                     || tag == "layout-manager"
                     || tag == "link"
+                    || tag == "auto-tab-name"
                 {
                     Some(PluginConfig {
                         path: PathBuf::from(&tag),
