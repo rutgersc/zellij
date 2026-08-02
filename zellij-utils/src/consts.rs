@@ -11,6 +11,13 @@ pub const ZELLIJ_CONFIG_FILE_ENV: &str = "ZELLIJ_CONFIG_FILE";
 pub const ZELLIJ_CONFIG_DIR_ENV: &str = "ZELLIJ_CONFIG_DIR";
 pub const ZELLIJ_LAYOUT_DIR_ENV: &str = "ZELLIJ_LAYOUT_DIR";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Short git SHA of the commit this binary was built from. Set by `zellij-utils/build.rs`.
+/// Falls back to "unknown" when the build happens outside a git checkout.
+pub const BUILD_SHA: &str = env!("ZELLIJ_BUILD_SHA");
+
+/// `VERSION (BUILD_SHA)` — used as the `--version` string so binaries self-identify.
+pub const VERSION_AND_SHA: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ZELLIJ_BUILD_SHA"), ")");
 pub const DEFAULT_SCROLL_BUFFER_SIZE: usize = 10_000;
 pub static SCROLL_BUFFER_SIZE: OnceLock<usize> = OnceLock::new();
 pub static DEBUG_MODE: OnceLock<bool> = OnceLock::new();
