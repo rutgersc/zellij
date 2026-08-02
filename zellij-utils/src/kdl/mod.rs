@@ -52,6 +52,8 @@ macro_rules! parse_kdl_action_arguments {
                 "FocusHostSession" => Ok(Action::FocusHostSession),
                 "FocusGuestSession" => Ok(Action::FocusGuestSession),
                 "ToggleHostFullscreen" => Ok(Action::ToggleHostFullscreen),
+                "FocusPrevJump" => Ok(Action::FocusPrevJump),
+                "FocusNextJump" => Ok(Action::FocusNextJump),
                 "SwitchFocus" => Ok(Action::SwitchFocus),
                 "EditScrollback" => Ok(Action::EditScrollback { ansi: false }),
                 "ScrollUp" => Ok(Action::ScrollUp),
@@ -690,6 +692,8 @@ impl Action {
             Action::FocusNextPane => Some(KdlNode::new("FocusNextPane")),
             Action::FocusPreviousPane => Some(KdlNode::new("FocusPreviousPane")),
             Action::FocusLastPane => Some(KdlNode::new("FocusLastPane")),
+            Action::FocusPrevJump => Some(KdlNode::new("FocusPrevJump")),
+            Action::FocusNextJump => Some(KdlNode::new("FocusNextJump")),
             Action::SwitchFocus => Some(KdlNode::new("SwitchFocus")),
             Action::MoveFocus { direction } => {
                 let mut node = KdlNode::new("MoveFocus");
@@ -1565,6 +1569,12 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
             },
             "FocusGuestSession" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "FocusPrevJump" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "FocusNextJump" => {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
             },
             "ToggleHostFullscreen" => {
