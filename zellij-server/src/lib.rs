@@ -15,6 +15,7 @@ pub mod background_jobs;
 mod global_async_runtime;
 mod logging_pipe;
 mod pane_groups;
+mod pane_nav;
 mod plugins;
 mod pty;
 mod pty_writer;
@@ -807,8 +808,251 @@ mod session_state_tests {
     }
 }
 
+/// Windows accept loop with PID-paired handshake.
+///
+/// Windows zellij uses two named pipes per session: a main pipe for
+/// client→server and a reply pipe for server→client. Historically the
+/// accept loop pairs them positionally on a single thread — accept main,
+/// then synchronously accept reply, then loop. That breaks in two ways:
+///
+/// - A client that connects to main but not reply (a probe, a process
+///   killed mid-`setup_ipc`, etc.) wedges the thread at `reply.accept()`,
+///   which then can't service any other client. ALL future cli action /
+///   attach calls block at `CreateFile` on the main pipe.
+/// - Two real clients connecting concurrently can mispair: client A's main
+///   followed by client B's reply gets stitched together.
+///
+/// Pair by client PID instead. Each accept loop runs on its own thread.
+/// `GetNamedPipeClientProcessId` gives us the connecting process's PID;
+/// when one half is queued and its sibling shows up with the same PID, we
+/// have a complete pair and spawn the router. A GC thread periodically
+/// drops half-connects older than 10s so a client that died between its
+/// main and reply connect can't leak indefinitely.
+#[cfg(windows)]
+fn run_windows_dual_pipe_accept(
+    listener: interprocess::local_socket::Listener,
+    reply_listener: interprocess::local_socket::Listener,
+    os_input: Box<dyn ServerOsApi>,
+    session_data: Arc<RwLock<Option<SessionMetaData>>>,
+    session_state: Arc<RwLock<SessionState>>,
+    to_server: SenderWithContext<ServerInstruction>,
+) {
+    use interprocess::local_socket::prelude::*;
+    use std::collections::HashMap;
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+
+    type Stream = interprocess::local_socket::Stream;
+    type Pending = HashMap<u32, (Stream, Instant)>;
+
+    fn pipe_client_pid(stream: &Stream) -> Option<u32> {
+        // Outer `local_socket::Stream` is a platform-agnostic enum; on Windows
+        // its only variant wraps the named-pipe stream, whose inner concrete
+        // type implements `AsHandle`.
+        let np = match stream {
+            interprocess::local_socket::Stream::NamedPipe(np) => np,
+        };
+        let borrowed = np.inner().as_handle();
+        let raw: HANDLE = borrowed.as_raw_handle() as HANDLE;
+        let mut pid: u32 = 0;
+        let ok = unsafe { GetNamedPipeClientProcessId(raw, &mut pid) };
+        if ok != 0 {
+            Some(pid)
+        } else {
+            log::error!(
+                "GetNamedPipeClientProcessId failed: {:?}",
+                std::io::Error::last_os_error()
+            );
+            None
+        }
+    }
+
+    let pending_mains: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending_replies: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Pair-complete: spawn the per-client router thread.
+    let spawn_router = {
+        let os_input = os_input.clone();
+        let session_data = session_data.clone();
+        let session_state = session_state.clone();
+        let to_server = to_server.clone();
+        Arc::new(move |main: Stream, reply: Stream, pid: u32| {
+            let mut os_input = os_input.clone();
+            let client_id = session_state.write().unwrap().new_client();
+            log::info!(
+                "server_accept: pair complete pid={} client_id={}, spawning router",
+                pid,
+                client_id
+            );
+            let receiver = match os_input.new_client_with_reply(client_id, main, reply) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!(
+                        "server_accept: new_client_with_reply failed for pid={}: {:?}",
+                        pid,
+                        e
+                    );
+                    return;
+                },
+            };
+            let session_data = session_data.clone();
+            let session_state = session_state.clone();
+            let to_server = to_server.clone();
+            let _ = thread::Builder::new()
+                .name("server_router".to_string())
+                .spawn(move || {
+                    route_thread_main(
+                        session_data,
+                        session_state,
+                        os_input,
+                        to_server,
+                        receiver,
+                        client_id,
+                    )
+                    .fatal()
+                });
+        })
+    };
+
+    // Main accept thread.
+    {
+        let pending_mains = pending_mains.clone();
+        let pending_replies = pending_replies.clone();
+        let spawn_router = spawn_router.clone();
+        let _ = thread::Builder::new()
+            .name("server_accept_main".to_string())
+            .spawn(move || {
+                log::info!("server_accept_main: entering loop");
+                for stream in listener.incoming() {
+                    let stream = match stream {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("server_accept_main: accept error: {:?}", e);
+                            continue;
+                        },
+                    };
+                    let pid = match pipe_client_pid(&stream) {
+                        Some(p) => p,
+                        None => {
+                            log::warn!(
+                                "server_accept_main: dropping connect with no client pid"
+                            );
+                            drop(stream);
+                            continue;
+                        },
+                    };
+                    log::info!("server_accept_main: accepted main from pid={}", pid);
+                    let paired = pending_replies.lock().unwrap().remove(&pid).map(|(s, _)| s);
+                    match paired {
+                        Some(reply) => spawn_router(stream, reply, pid),
+                        None => {
+                            pending_mains
+                                .lock()
+                                .unwrap()
+                                .insert(pid, (stream, Instant::now()));
+                        },
+                    }
+                }
+                log::warn!("server_accept_main: loop exited");
+            });
+    }
+
+    // Reply accept thread.
+    {
+        let pending_mains = pending_mains.clone();
+        let pending_replies = pending_replies.clone();
+        let spawn_router = spawn_router.clone();
+        let _ = thread::Builder::new()
+            .name("server_accept_reply".to_string())
+            .spawn(move || {
+                log::info!("server_accept_reply: entering loop");
+                for stream in reply_listener.incoming() {
+                    let stream = match stream {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("server_accept_reply: accept error: {:?}", e);
+                            continue;
+                        },
+                    };
+                    let pid = match pipe_client_pid(&stream) {
+                        Some(p) => p,
+                        None => {
+                            log::warn!(
+                                "server_accept_reply: dropping connect with no client pid"
+                            );
+                            drop(stream);
+                            continue;
+                        },
+                    };
+                    log::info!("server_accept_reply: accepted reply from pid={}", pid);
+                    let paired = pending_mains.lock().unwrap().remove(&pid).map(|(s, _)| s);
+                    match paired {
+                        Some(main) => spawn_router(main, stream, pid),
+                        None => {
+                            pending_replies
+                                .lock()
+                                .unwrap()
+                                .insert(pid, (stream, Instant::now()));
+                        },
+                    }
+                }
+                log::warn!("server_accept_reply: loop exited");
+            });
+    }
+
+    // GC thread: drop half-connects older than 10s.
+    {
+        let pending_mains = pending_mains.clone();
+        let pending_replies = pending_replies.clone();
+        let _ = thread::Builder::new()
+            .name("server_accept_gc".to_string())
+            .spawn(move || {
+                let stale = Duration::from_secs(10);
+                loop {
+                    thread::sleep(Duration::from_secs(5));
+                    pending_mains.lock().unwrap().retain(|pid, (_, t)| {
+                        let dropping = t.elapsed() > stale;
+                        if dropping {
+                            log::warn!(
+                                "server_accept_gc: dropping stale main for pid={} (age={:?})",
+                                pid,
+                                t.elapsed()
+                            );
+                        }
+                        !dropping
+                    });
+                    pending_replies.lock().unwrap().retain(|pid, (_, t)| {
+                        let dropping = t.elapsed() > stale;
+                        if dropping {
+                            log::warn!(
+                                "server_accept_gc: dropping stale reply for pid={} (age={:?})",
+                                pid,
+                                t.elapsed()
+                            );
+                        }
+                        !dropping
+                    });
+                }
+            });
+    }
+
+    // The two accept threads and the GC thread run independently for the
+    // lifetime of the server. Park here so the listener thread doesn't
+    // unwind and drop the listeners.
+    log::info!("server_accept: dual-pipe accept system online, parking listener thread");
+    thread::park();
+}
+
 pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     info!("Starting Zellij server!");
+
+    let session_id = socket_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     #[cfg(unix)]
     {
@@ -816,11 +1060,13 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
         // preserve the current umask: read current value by setting to another mode, and then restoring it
         let current_umask = umask(Mode::all());
         umask(current_umask);
-        daemonize::Daemonize::new()
-            .working_directory(std::env::current_dir().unwrap())
-            .umask(current_umask.bits() as u32)
-            .start()
-            .expect("could not daemonize the server process");
+        if std::env::var("ZELLIJ_NO_DAEMONIZE").is_err() {
+            daemonize::Daemonize::new()
+                .working_directory(std::env::current_dir().unwrap())
+                .umask(current_umask.bits() as u32)
+                .start()
+                .expect("could not daemonize the server process");
+        }
     }
 
     #[cfg(windows)]
@@ -855,6 +1101,7 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     let _ = thread::Builder::new()
         .name("server_listener".to_string())
         .spawn({
+            #[cfg(not(windows))]
             use interprocess::local_socket::prelude::*;
             use zellij_utils::consts::ipc_bind;
             #[cfg(unix)]
@@ -875,51 +1122,59 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                 #[cfg(unix)]
                 drop(set_permissions(&socket_path, 0o1700));
 
-                // On Windows, named pipes are half-duplex, so we need a separate
-                // reply pipe for server→client messages.
                 #[cfg(windows)]
-                let reply_listener = zellij_utils::consts::ipc_bind_reply(&socket_path).unwrap();
+                run_windows_dual_pipe_accept(
+                    listener,
+                    zellij_utils::consts::ipc_bind_reply(&socket_path).unwrap(),
+                    os_input,
+                    session_data,
+                    session_state,
+                    to_server,
+                );
 
-                for stream in listener.incoming() {
-                    match stream {
-                        Ok(stream) => {
-                            let mut os_input = os_input.clone();
-                            let client_id = session_state.write().unwrap().new_client();
+                #[cfg(not(windows))]
+                {
+                    log::info!("server_accept: entering incoming() loop");
+                    for stream in listener.incoming() {
+                        log::info!("server_accept: main listener.incoming() returned");
+                        match stream {
+                            Ok(stream) => {
+                                log::info!("server_accept: accepted main stream");
+                                let mut os_input = os_input.clone();
+                                let client_id = session_state.write().unwrap().new_client();
+                                log::info!(
+                                    "server_accept: assigned client_id={}, spawning router",
+                                    client_id
+                                );
 
-                            #[cfg(windows)]
-                            let reply_stream = reply_listener
-                                .accept()
-                                .expect("failed to accept reply connection");
+                                let receiver =
+                                    os_input.new_client(client_id, stream).unwrap();
 
-                            #[cfg(windows)]
-                            let receiver = os_input
-                                .new_client_with_reply(client_id, stream, reply_stream)
-                                .unwrap();
-                            #[cfg(not(windows))]
-                            let receiver = os_input.new_client(client_id, stream).unwrap();
-
-                            let session_data = session_data.clone();
-                            let session_state = session_state.clone();
-                            let to_server = to_server.clone();
-                            thread::Builder::new()
-                                .name("server_router".to_string())
-                                .spawn(move || {
-                                    route_thread_main(
-                                        session_data,
-                                        session_state,
-                                        os_input,
-                                        to_server,
-                                        receiver,
-                                        client_id,
-                                    )
-                                    .fatal()
-                                })
-                                .unwrap();
-                        },
-                        Err(err) => {
-                            panic!("err {:?}", err);
-                        },
+                                let session_data = session_data.clone();
+                                let session_state = session_state.clone();
+                                let to_server = to_server.clone();
+                                thread::Builder::new()
+                                    .name("server_router".to_string())
+                                    .spawn(move || {
+                                        route_thread_main(
+                                            session_data,
+                                            session_state,
+                                            os_input,
+                                            to_server,
+                                            receiver,
+                                            client_id,
+                                        )
+                                        .fatal()
+                                    })
+                                    .unwrap();
+                            },
+                            Err(err) => {
+                                log::error!("server_accept: main listener error: {:?}", err);
+                                panic!("err {:?}", err);
+                            },
+                        }
                     }
+                    log::warn!("server_accept: incoming() loop exited");
                 }
             }
         });
@@ -975,6 +1230,7 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                     config.clone(),
                     config.plugins.clone(),
                     client_id,
+                    session_id.clone(),
                 );
                 info!("FirstClientConnected: session initialized, spawning tabs");
                 let mut runtime_configuration = config.clone();
@@ -1860,6 +2116,16 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     // Drop cached session data before exit.
     *session_data.write().unwrap() = None;
 
+    // Update session registry: mark as exited.
+    if let Err(e) = zellij_utils::sessions::with_registry(|reg| {
+        if let Some(entry) = reg.find_by_id_mut(&session_id) {
+            entry.state = zellij_utils::sessions::SessionState::Exited;
+            entry.exited_at = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
+    }) {
+        log::error!("Failed to update session registry on exit: {:?}", e);
+    }
+
     drop(std::fs::remove_file(&socket_path));
 }
 
@@ -1873,6 +2139,7 @@ fn init_session(
     mut config: Config,
     plugin_aliases: PluginAliases,
     client_id: ClientId,
+    session_id: String,
 ) -> SessionMetaData {
     config.options = config.options.merge(*config_options.clone());
 
@@ -1974,6 +2241,7 @@ fn init_session(
             let debug = cli_assets.is_debug;
             let layout = layout.clone();
             let config = config.clone();
+            let session_id = session_id.clone();
             move || {
                 screen_thread_main(
                     screen_bus,
@@ -1982,6 +2250,7 @@ fn init_session(
                     config,
                     debug,
                     layout,
+                    session_id,
                 )
                 .fatal();
             }
@@ -2359,3 +2628,7 @@ fn get_available_layouts(config_options: &Options) -> (Vec<LayoutInfo>, Vec<Layo
         .map(|l| format!("{}", l.display()));
     Layout::list_available_layouts(layout_dir, &default_layout_name)
 }
+
+#[cfg(test)]
+#[path = "./unit/session_registry_tests.rs"]
+mod session_registry_tests;
