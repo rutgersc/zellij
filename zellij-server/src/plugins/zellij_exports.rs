@@ -3006,19 +3006,13 @@ fn delete_dead_session(session_name: String) -> Result<()> {
 }
 
 fn delete_all_dead_sessions() -> Result<()> {
-    use zellij_utils::consts::is_ipc_socket;
-    let mut live_sessions = vec![];
-    if let Ok(files) = std::fs::read_dir(&*ZELLIJ_SOCK_DIR) {
-        files.for_each(|file| {
-            if let Ok(file) = file {
-                if let Ok(file_name) = file.file_name().into_string() {
-                    if is_ipc_socket(&file.file_type().unwrap()) {
-                        live_sessions.push(file_name);
-                    }
-                }
-            }
-        });
-    }
+    let registry = zellij_utils::sessions::ensure_registry();
+    let live_sessions: Vec<String> = registry
+        .running_sessions()
+        .iter()
+        .map(|e| e.display_name.clone())
+        .collect();
+
     let dead_sessions: Vec<String> = match std::fs::read_dir(&*ZELLIJ_SESSION_INFO_CACHE_DIR) {
         Ok(files_in_session_info_folder) => {
             let files_that_are_folders = files_in_session_info_folder
@@ -3028,7 +3022,6 @@ fn delete_all_dead_sessions() -> Result<()> {
                 .filter_map(|folder_name| {
                     let session_name = folder_name.file_name()?.to_str()?.to_owned();
                     if live_sessions.contains(&session_name) {
-                        // this is not a dead session...
                         return None;
                     }
                     Some(session_name)
@@ -3400,7 +3393,9 @@ fn disconnect_other_clients(env: &PluginEnv) {
 
 fn kill_sessions(session_names: Vec<String>) {
     for session_name in session_names {
-        let path = &*ZELLIJ_SOCK_DIR.join(&session_name);
+        let resolved = zellij_utils::sessions::resolve_session_socket_path(&session_name)
+            .unwrap_or_else(|| ZELLIJ_SOCK_DIR.join(&session_name));
+        let path = &*resolved;
         match ipc_connect(path) {
             Ok(stream) => {
                 #[cfg(windows)]
@@ -3443,7 +3438,12 @@ fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
     let result: Result<(), String> = runtime.block_on(async {
         let mut set: JoinSet<(String, std::io::Result<()>)> = JoinSet::new();
         for name in session_names {
-            let path = ZELLIJ_SOCK_DIR.join(&name);
+            // The socket/named-pipe is keyed by the generated session id, not
+            // the display_name the session manager kills by. Resolve via the
+            // registry (mirrors `kill_sessions`); the raw-name fallback only
+            // ever hits for a legacy session whose id == display_name.
+            let path = zellij_utils::sessions::resolve_session_socket_path(&name)
+                .unwrap_or_else(|| ZELLIJ_SOCK_DIR.join(&name));
             set.spawn(async move {
                 let res = zellij_utils::ipc::async_send_kill_and_await(&path).await;
                 (name, res)
