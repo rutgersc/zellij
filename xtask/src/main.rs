@@ -35,6 +35,10 @@ fn workspace_members() -> &'static Vec<WorkspaceMember> {
     WORKSPACE_MEMBERS.get_or_init(|| {
         vec![
             WorkspaceMember {
+                crate_name: "default-plugins/agent-bar",
+                build: true,
+            },
+            WorkspaceMember {
                 crate_name: "default-plugins/compact-bar",
                 build: true,
             },
