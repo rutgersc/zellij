@@ -321,6 +321,7 @@ pub fn migrate_legacy_sessions() -> SessionRegistry {
     let mut registry = SessionRegistry::new();
 
     // Migrate live sessions from socket/marker files.
+    let probe = LivenessProbe::new();
     if let Ok(files) = fs::read_dir(&*ZELLIJ_SOCK_DIR) {
         for file in files.flatten() {
             let file_name = match file.file_name().into_string() {
@@ -337,7 +338,7 @@ pub fn migrate_legacy_sessions() -> SessionRegistry {
             if !is_ipc_socket(&file_type) {
                 continue;
             }
-            if !matches!(check_session_state(&file_name), SessionLiveness::Alive) {
+            if !probe.is_alive(&file_name) {
                 continue;
             }
             // This is a live legacy session — the filename IS the session name.
@@ -447,10 +448,11 @@ fn reap_dead_registry_entries_where(
     keep: impl Fn(&SessionEntry) -> bool,
 ) -> io::Result<Vec<(String, String)>> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let dead: Vec<(String, String)> = registry
         .running_sessions()
         .into_iter()
-        .filter(|s| keep(s) && matches!(check_session_state(&s.id), SessionLiveness::Dead))
+        .filter(|s| keep(s) && matches!(probe.check(&s.id), SessionLiveness::Dead))
         .map(|s| (s.id.clone(), s.display_name.clone()))
         .collect();
     if dead.is_empty() {
@@ -521,16 +523,18 @@ pub fn register_session(display_name: &str) -> io::Result<String> {
 /// the reap and this lookup.)
 pub fn resolve_session_socket_path(name: &str) -> Option<PathBuf> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     registry
         .sessions
         .iter()
         .filter(|s| s.display_name == name && s.state == SessionState::Running)
-        .find(|s| matches!(check_session_state(&s.id), SessionLiveness::Alive))
+        .find(|s| probe.is_alive(&s.id))
         .map(|s| ZELLIJ_SOCK_DIR.join(&s.id))
 }
 
 pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let mut sessions = Vec::new();
     for entry in registry.running_sessions() {
         let sock_path = ZELLIJ_SOCK_DIR.join(&entry.id);
@@ -540,7 +544,7 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
             .and_then(|d| d.elapsed().ok())
             .unwrap_or_default();
         let duration = Duration::from_secs(ctime.as_secs());
-        if matches!(check_session_state(&entry.id), SessionLiveness::Alive) {
+        if probe.is_alive(&entry.id) {
             sessions.push((entry.display_name.clone(), duration));
         }
     }
@@ -623,12 +627,13 @@ pub fn get_resurrectable_session_names() -> Vec<String> {
 
 pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let mut sessions_with_mtime: Vec<(String, SystemTime)> = Vec::new();
     for entry in registry.running_sessions() {
         let sock_path = ZELLIJ_SOCK_DIR.join(&entry.id);
         if let Ok(meta) = std::fs::metadata(&sock_path) {
             if let Ok(mtime) = meta.modified() {
-                if matches!(check_session_state(&entry.id), SessionLiveness::Alive) {
+                if probe.is_alive(&entry.id) {
                     sessions_with_mtime.push((entry.display_name.clone(), mtime));
                 }
             }
@@ -649,14 +654,62 @@ pub enum SessionLiveness {
 
 /// Fallback probe, used only when the pipe namespace cannot be listed.
 ///
-/// Probe a session's socket to decide whether a server is answering on it.
-///
 /// Ambiguity resolves to `Alive`: hiding a session that is actually running is
 /// worse than briefly listing one that isn't, and the client's own connect is
 /// time-bounded (3s, `os_input_output_windows`) so an unresponsive server
 /// surfaces as a connect failure rather than a hang.
+/// A liveness snapshot shared across a batch of sessions.
+///
+/// On Windows the pipe-namespace listing settles `Dead` for *every* session at
+/// once, and it costs the same single directory scan whether it answers for one
+/// session or twenty. Scans that walk the registry should take one of these and
+/// reuse it; `check_session_state` is the one-shot form and takes a fresh
+/// snapshot per call.
+pub struct LivenessProbe {
+    #[cfg(windows)]
+    bound: Option<HashSet<String>>,
+}
+
+impl LivenessProbe {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            bound: crate::session_pipes::live_session_ids(),
+        }
+    }
+
+    pub fn check(&self, name: &str) -> SessionLiveness {
+        // Settle Dead from the pipe namespace before touching IPC. A pipe exists
+        // only while a server holds it bound, so its absence is conclusive. This
+        // matters beyond speed: the handshake reaches into the *target* server's
+        // accept loop, which is sequential, so probing dead entries the
+        // expensive way puts avoidable traffic on every healthy server.
+        //
+        // `None` = the namespace itself was unreadable. Fall through to the
+        // handshake rather than declaring everything dead on a transient failure.
+        #[cfg(windows)]
+        if let Some(bound) = &self.bound {
+            if !bound.contains(name) {
+                return SessionLiveness::Dead;
+            }
+        }
+        probe_socket(name)
+    }
+
+    /// Convenience predicate for the common case.
+    pub fn is_alive(&self, name: &str) -> bool {
+        matches!(self.check(name), SessionLiveness::Alive)
+    }
+}
+
+impl Default for LivenessProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn check_session_state(name: &str) -> SessionLiveness {
-    probe_socket(name)
+    LivenessProbe::new().check(name)
 }
 
 #[cfg(unix)]
@@ -924,10 +977,11 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
     // rows instead of printing a leak they would have to clear by hand.
     // `delete-session` and `delete-all-sessions` still reap them from the kdl.
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let mut output: Vec<(String, Duration, SessionDisplayStatus)> = Vec::new();
     let mut running_names: HashSet<String> = HashSet::new();
     for entry in registry.running_sessions() {
-        if !matches!(check_session_state(&entry.id), SessionLiveness::Alive) {
+        if !probe.is_alive(&entry.id) {
             continue;
         }
         running_names.insert(entry.display_name.clone());
@@ -1164,8 +1218,14 @@ pub fn read_live_session_states(
     // Socket filenames are UUIDs under the registry, so the display name has
     // to come from the registry row rather than from the socket's file name.
     let mut session_infos_on_machine = BTreeMap::new();
+    // `running_sessions()` filters on the registry's recorded state word, not on
+    // whether a server is there — a session that died without updating the
+    // registry stays "running" forever. Derive liveness the way `zellij ls` does.
+    let probe = LivenessProbe::new();
     let other_session_names: Vec<(String, Duration)> = ensure_registry()
         .running_sessions()
+        .into_iter()
+        .filter(|entry| probe.is_alive(&entry.id))
         .map(|entry| {
             let creation_time = std::fs::metadata(sock_dir.join(&entry.id))
                 .ok()
