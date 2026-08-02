@@ -228,6 +228,12 @@ pub struct Options {
     #[serde(default)]
     pub auto_layout: Option<bool>,
 
+    /// Use the basename of the current working directory as the session name instead of generating
+    /// a random name, default is false
+    #[clap(long, value_parser)]
+    #[serde(default)]
+    pub session_name_from_cwd: Option<bool>,
+
     /// Whether sessions should be serialized to the HD so that they can be later resurrected,
     /// default is true
     #[clap(long, value_parser)]
@@ -467,6 +473,7 @@ impl Options {
         let attach_to_session = other
             .attach_to_session
             .or_else(|| self.attach_to_session.clone());
+        let session_name_from_cwd = other.session_name_from_cwd.or(self.session_name_from_cwd);
         let session_serialization = other.session_serialization.or(self.session_serialization);
         let serialize_pane_viewport = other
             .serialize_pane_viewport
@@ -547,6 +554,7 @@ impl Options {
             session_name,
             attach_to_session,
             auto_layout,
+            session_name_from_cwd,
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
@@ -601,6 +609,8 @@ impl Options {
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let auto_layout = merge_bool(other.auto_layout, self.auto_layout);
         let mirror_session = merge_bool(other.mirror_session, self.mirror_session);
+        let session_name_from_cwd =
+            merge_bool(other.session_name_from_cwd, self.session_name_from_cwd);
         let session_serialization =
             merge_bool(other.session_serialization, self.session_serialization);
         let serialize_pane_viewport =
@@ -704,6 +714,7 @@ impl Options {
             session_name,
             attach_to_session,
             auto_layout,
+            session_name_from_cwd,
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,

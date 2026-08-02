@@ -469,6 +469,7 @@ fn test_client_messages() {
                 session_name: Some("session_name".to_owned()),
                 attach_to_session: Some(true),
                 auto_layout: Some(true),
+                session_name_from_cwd: Some(false),
                 session_serialization: Some(true),
                 serialize_pane_viewport: Some(true),
                 scrollback_lines_to_serialize: Some(10000),
