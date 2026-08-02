@@ -74,6 +74,7 @@ keybinds {
         bind "Ctrl s" { SwitchToMode "Normal"; }
         bind "e" { EditScrollback; SwitchToMode "Normal"; }
         bind "s" { SwitchToMode "EnterSearch"; SearchInput 0; }
+        bind "c" { SwitchToMode "CopyMode"; }
         bind "Ctrl c" { ScrollToBottom; SwitchToMode "Normal"; }
         bind "j" "Down" { ScrollDown; }
         bind "k" "Up" { ScrollUp; }
@@ -95,7 +96,9 @@ keybinds {
         bind "u" { HalfPageScrollUp; }
         bind "n" { Search "down"; }
         bind "p" { Search "up"; }
-        bind "c" { SearchToggleOption "CaseSensitivity"; }
+        // `c` enters copy mode landed on the active hit; case sensitivity moves to `i`.
+        bind "c" { SwitchToMode "CopyMode"; MoveCopyCursor "searchresult"; }
+        bind "i" { SearchToggleOption "CaseSensitivity"; }
         bind "w" { SearchToggleOption "Wrap"; }
         bind "o" { SearchToggleOption "WholeWord"; }
     }
@@ -157,6 +160,36 @@ keybinds {
             };
             SwitchToMode "Normal"
         }
+    }
+    copymode {
+        bind "Esc" { CopyModeEscape; }
+        bind "q" { SwitchToMode "Normal"; }
+        bind "h" "Left" { MoveCopyCursor "left"; }
+        bind "j" "Down" { MoveCopyCursor "down"; }
+        bind "k" "Up" { MoveCopyCursor "up"; }
+        bind "l" "Right" { MoveCopyCursor "right"; }
+        bind "w" { MoveCopyCursor "wordforward"; }
+        bind "e" { MoveCopyCursor "wordend"; }
+        bind "b" { MoveCopyCursor "wordbackward"; }
+        bind "0" { MoveCopyCursor "linestart"; }
+        bind "^" { MoveCopyCursor "linefirstnonblank"; }
+        bind "$" { MoveCopyCursor "lineend"; }
+        bind "g" { MoveCopyCursor "buffertop"; }
+        bind "G" { MoveCopyCursor "bufferbottom"; }
+        bind "Ctrl u" { MoveCopyCursor "halfpageup"; }
+        bind "Ctrl d" { MoveCopyCursor "halfpagedown"; }
+        bind "Ctrl b" { MoveCopyCursor "pageup"; }
+        bind "Ctrl f" { MoveCopyCursor "pagedown"; }
+        bind "H" { MoveCopyCursor "screentop"; }
+        bind "M" { MoveCopyCursor "screenmiddle"; }
+        bind "L" { MoveCopyCursor "screenbottom"; }
+        bind "{" { MoveCopyCursor "paragraphbackward"; }
+        bind "}" { MoveCopyCursor "paragraphforward"; }
+        bind "v" { ToggleCopyVisual; }
+        bind "V" { ToggleCopyVisualLine; }
+        bind "y" { CopyAndExitCopyMode; SwitchToMode "Normal"; }
+        // Back to search: a visual selection seeds a new search, else the prior search is kept.
+        bind "s" { SwitchToMode "Search"; }
     }
     tmux {
         bind "[" { SwitchToMode "Scroll"; }
