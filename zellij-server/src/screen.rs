@@ -8990,6 +8990,20 @@ pub(crate) fn screen_thread_main(
             } => {
                 screen.host_theme_dark_styling = host_theme_dark;
                 screen.host_theme_light_styling = host_theme_light;
+                // A config reload resolves `theme` statically; when the host's
+                // mode is known and auto-switch is armed (both themes set), the
+                // mode's styling must win or the reload stomps the switched
+                // palette — and the mode-dedupe in
+                // `update_host_terminal_theme_mode` then blocks re-applying it.
+                let theme = match (
+                    screen.host_terminal_theme_mode,
+                    host_theme_dark,
+                    host_theme_light,
+                ) {
+                    (Some(HostTerminalThemeMode::Dark), Some(dark), Some(_)) => dark,
+                    (Some(HostTerminalThemeMode::Light), Some(_), Some(light)) => light,
+                    _ => theme,
+                };
                 screen
                     .reconfigure(
                         keybinds,
