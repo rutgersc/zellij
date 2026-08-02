@@ -661,6 +661,7 @@ pub struct Grid {
     pub supports_kitty_keyboard_protocol: bool, // has the app requested kitty keyboard support?
     explicitly_disable_kitty_keyboard_protocol: bool, // has kitty keyboard support been explicitly
     // disabled by user config?
+    pub supports_win32_input_mode: bool, // ConPTY (or a child inside it) requested \x1b[?9001h
     click: Click,
     hyperlink_tracker: HyperlinkTracker,
     /// Pane-scoped override for the default foreground colour. Narrow
@@ -980,6 +981,7 @@ impl Grid {
             lock_renders: false,
             supports_kitty_keyboard_protocol: false,
             explicitly_disable_kitty_keyboard_protocol,
+            supports_win32_input_mode: false,
             click: Click::default(),
             hyperlink_tracker: HyperlinkTracker::new(),
             pane_default_fg: None,
@@ -2277,6 +2279,7 @@ impl Grid {
         self.focus_event_tracking = false;
         self.cursor_is_hidden = false;
         self.supports_kitty_keyboard_protocol = false;
+        self.supports_win32_input_mode = false;
         self.set_scroll_region_to_viewport_size();
         self.pane_default_fg = None;
         self.pane_default_bg = None;
@@ -3876,6 +3879,9 @@ impl Perform for Grid {
                         2026 => {
                             self.unlock_renders();
                         },
+                        9001 => {
+                            self.supports_win32_input_mode = false;
+                        },
                         2004 => {
                             self.bracketed_paste_mode = false;
                         },
@@ -3977,6 +3983,9 @@ impl Perform for Grid {
                         },
                         2026 => {
                             self.lock_renders();
+                        },
+                        9001 => {
+                            self.supports_win32_input_mode = true;
                         },
                         2004 => {
                             self.bracketed_paste_mode = true;
