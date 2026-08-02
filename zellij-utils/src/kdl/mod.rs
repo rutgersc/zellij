@@ -2805,6 +2805,9 @@ impl Options {
         let attach_to_session =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "attach_to_session")
                 .map(|(v, _)| v);
+        let session_name_from_cwd =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "session_name_from_cwd")
+                .map(|(v, _)| v);
         let session_serialization =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "session_serialization")
                 .map(|(v, _)| v);
@@ -2952,6 +2955,7 @@ impl Options {
             session_name,
             attach_to_session,
             auto_layout,
+            session_name_from_cwd,
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
@@ -3692,6 +3696,35 @@ impl Options {
         };
         if let Some(auto_layout) = self.auto_layout {
             let mut node = create_node(auto_layout);
+            if add_comments {
+                node.set_leading(format!("{}\n", comment_text));
+            }
+            Some(node)
+        } else if add_comments {
+            let mut node = create_node(false);
+            node.set_leading(format!("{}\n// ", comment_text));
+            Some(node)
+        } else {
+            None
+        }
+    }
+    fn session_name_from_cwd_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        let comment_text = format!("{}\n{}\n{}\n{}\n{}\n{}",
+            " ",
+            "// Use the basename of the current working directory as the session name",
+            "// Options:",
+            "//   - true",
+            "//   - false (default)",
+            "// ",
+        );
+
+        let create_node = |node_value: bool| -> KdlNode {
+            let mut node = KdlNode::new("session_name_from_cwd");
+            node.push(KdlValue::Bool(node_value));
+            node
+        };
+        if let Some(session_name_from_cwd) = self.session_name_from_cwd {
+            let mut node = create_node(session_name_from_cwd);
             if add_comments {
                 node.set_leading(format!("{}\n", comment_text));
             }
@@ -4581,6 +4614,9 @@ impl Options {
         }
         if let Some(auto_layout) = self.auto_layout_to_kdl(add_comments) {
             nodes.push(auto_layout);
+        }
+        if let Some(session_name_from_cwd) = self.session_name_from_cwd_to_kdl(add_comments) {
+            nodes.push(session_name_from_cwd);
         }
         if let Some(session_serialization) = self.session_serialization_to_kdl(add_comments) {
             nodes.push(session_serialization);
