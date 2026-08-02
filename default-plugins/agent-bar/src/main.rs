@@ -66,6 +66,11 @@ use zellij_tile_utils::style;
 use crate::agents::{Agent, AgentStatus, ReadResult};
 
 const POLL_SECS: f64 = 1.5;
+/// Cadence for the zellij session list, deliberately slower than the agent poll.
+/// `get_session_list` derives each session's liveness rather than reading a
+/// recorded flag, so it isn't free; sessions also come and go far less often
+/// than agents change status.
+const SESSION_POLL_SECS: f64 = 6.0;
 /// Fast tick used only while a click's `mux focus-agent` is in flight, so the
 /// per-row spinner animates. We never stack timers — the single Timer handler
 /// re-arms at this rate while `in_flight` is non-empty and reverts to
@@ -270,6 +275,7 @@ struct State {
     /// armed at, and elapsed time accumulated toward the next readmodel poll.
     cur_timeout: f64,
     since_poll: f64,
+    since_session_poll: f64,
 }
 
 register_plugin!(State);
@@ -388,6 +394,16 @@ impl ZellijPlugin for State {
                     if self.refresh_seen_disk() {
                         changed = true;
                     }
+                }
+
+                // Sessions refresh on their own, slower clock. `get_session_list`
+                // now derives liveness per session rather than trusting the
+                // registry's state word, so it is no longer a free read — and
+                // sessions appear and vanish far less often than agents change
+                // status.
+                self.since_session_poll += self.cur_timeout;
+                if self.since_session_poll + 1e-9 >= SESSION_POLL_SECS {
+                    self.since_session_poll = 0.0;
                     if self.refresh_sessions() {
                         changed = true;
                     }

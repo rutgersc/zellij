@@ -24,7 +24,6 @@ fn registry_register_and_read_back() {
         reg.sessions.push(SessionEntry {
             id: id.clone(),
             display_name: display_name.clone(),
-            pid: Some(99999),
             state: SessionState::Running,
             created_at: "2024-01-15T10:00:00Z".to_string(),
             exited_at: None,
@@ -33,7 +32,6 @@ fn registry_register_and_read_back() {
         let entry = reg.find_by_id(&id).expect("session not found after insert");
         assert_eq!(entry.display_name, display_name);
         assert_eq!(entry.state, SessionState::Running);
-        assert_eq!(entry.pid, Some(99999));
 
         // Clean up within the same transaction.
         reg.remove_by_id(&id);
@@ -52,7 +50,6 @@ fn registry_rename_session() {
         reg.sessions.push(SessionEntry {
             id: id.clone(),
             display_name: original_name.clone(),
-            pid: Some(99999),
             state: SessionState::Running,
             created_at: "2024-01-15T10:00:00Z".to_string(),
             exited_at: None,
@@ -85,7 +82,6 @@ fn registry_mark_session_exited() {
         reg.sessions.push(SessionEntry {
             id: id.clone(),
             display_name: name.clone(),
-            pid: Some(99999),
             state: SessionState::Running,
             created_at: "2024-01-15T10:00:00Z".to_string(),
             exited_at: None,
@@ -94,13 +90,11 @@ fn registry_mark_session_exited() {
         // Simulate server exit.
         let entry = reg.find_by_id_mut(&id).expect("session not found");
         entry.state = SessionState::Exited;
-        entry.pid = None;
         entry.exited_at = Some("2024-01-15T18:00:00Z".to_string());
 
         // Verify.
         let entry = reg.find_by_id(&id).expect("session not found after exit");
         assert_eq!(entry.state, SessionState::Exited);
-        assert!(entry.pid.is_none());
         assert!(entry.exited_at.is_some());
         assert!(
             reg.find_running_by_name(&name).is_none(),

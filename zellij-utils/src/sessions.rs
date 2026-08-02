@@ -24,8 +24,6 @@ pub struct SessionEntry {
     pub id: String,
     /// User-visible session name.
     pub display_name: String,
-    /// Server PID (only meaningful while state == Running).
-    pub pid: Option<u32>,
     /// Running or exited.
     pub state: SessionState,
     /// When the session was created.
@@ -104,11 +102,6 @@ impl SessionRegistry {
                 .and_then(|e| e.value().as_string())
                 .unwrap_or("")
                 .to_string();
-            let pid = children
-                .get("pid")
-                .and_then(|n| n.entries().iter().next())
-                .and_then(|e| e.value().as_i64())
-                .map(|v| v as u32);
             let state_str = children
                 .get("state")
                 .and_then(|n| n.entries().iter().next())
@@ -130,7 +123,6 @@ impl SessionRegistry {
             sessions.push(SessionEntry {
                 id,
                 display_name,
-                pid,
                 state,
                 created_at,
                 exited_at,
@@ -151,12 +143,6 @@ impl SessionRegistry {
             let mut dn = KdlNode::new("display_name");
             dn.push(KdlValue::String(entry.display_name.clone()));
             children.nodes_mut().push(dn);
-
-            if let Some(pid) = entry.pid {
-                let mut pn = KdlNode::new("pid");
-                pn.push(KdlValue::Base10(pid as i64));
-                children.nodes_mut().push(pn);
-            }
 
             let mut sn = KdlNode::new("state");
             sn.push(KdlValue::String(entry.state.as_str().to_string()));
@@ -208,14 +194,6 @@ impl SessionRegistry {
         self.sessions
             .iter()
             .filter(|s| s.state == SessionState::Running)
-            .collect()
-    }
-
-    /// Get all exited sessions.
-    pub fn exited_sessions(&self) -> Vec<&SessionEntry> {
-        self.sessions
-            .iter()
-            .filter(|s| s.state == SessionState::Exited)
             .collect()
     }
 
@@ -342,6 +320,7 @@ pub fn migrate_legacy_sessions() -> SessionRegistry {
     let mut registry = SessionRegistry::new();
 
     // Migrate live sessions from socket/marker files.
+    let probe = LivenessProbe::new();
     if let Ok(files) = fs::read_dir(&*ZELLIJ_SOCK_DIR) {
         for file in files.flatten() {
             let file_name = match file.file_name().into_string() {
@@ -358,7 +337,7 @@ pub fn migrate_legacy_sessions() -> SessionRegistry {
             if !is_ipc_socket(&file_type) {
                 continue;
             }
-            if !assert_socket(&file_name) {
+            if !probe.is_alive(&file_name) {
                 continue;
             }
             // This is a live legacy session — the filename IS the session name.
@@ -377,20 +356,9 @@ pub fn migrate_legacy_sessions() -> SessionRegistry {
                 then.format("%Y-%m-%dT%H:%M:%SZ").to_string()
             };
 
-            #[cfg(windows)]
-            let pid = {
-                // Read PID from marker file content (first line).
-                fs::read_to_string(file.path())
-                    .ok()
-                    .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u32>().ok()))
-            };
-            #[cfg(not(windows))]
-            let pid: Option<u32> = None;
-
             registry.sessions.push(SessionEntry {
                 id: file_name.clone(),
                 display_name: file_name,
-                pid,
                 state: SessionState::Running,
                 created_at,
                 exited_at: None,
@@ -431,7 +399,6 @@ pub fn migrate_legacy_sessions() -> SessionRegistry {
             registry.sessions.push(SessionEntry {
                 id: generate_session_id(),
                 display_name: session_name,
-                pid: None,
                 state: SessionState::Exited,
                 exited_at: Some(created_at.clone()),
                 created_at,
@@ -456,52 +423,11 @@ pub fn ensure_registry() -> SessionRegistry {
     }
 }
 
-/// Probe every `Running` entry's socket; mark unreachable ones as `Exited`.
-///
-/// `state "exited"` is only written on graceful shutdown — a crashed or
-/// force-killed server leaves its entry stuck as `running`. Stale entries
-/// don't break attach (`resolve_session_socket_path` already iterates all
-/// candidates and picks the first whose socket responds), but they confuse
-/// external readers like the session picker that read `sessions.kdl` directly.
-///
-/// **Run on demand only.** Calling this from a hot read path (e.g.
-/// `ensure_registry`) is a footgun: `assert_socket` racing against a server
-/// startup or pipe transient flips a live session to `Exited`, and once the
-/// marker file goes with it, recovery requires manual repair.
-///
-/// Persists via `with_registry` so the kdl on disk stays in sync.
-pub fn reap_stale_running_entries() -> io::Result<usize> {
-    let registry = ensure_registry();
-    let stale_ids: Vec<String> = registry
-        .running_sessions()
-        .iter()
-        .filter(|s| !assert_socket(&s.id))
-        .map(|s| s.id.clone())
-        .collect();
-    if stale_ids.is_empty() {
-        return Ok(0);
-    }
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    with_registry(|reg| {
-        for id in &stale_ids {
-            if let Some(entry) = reg.find_by_id_mut(id) {
-                if entry.state == SessionState::Running {
-                    entry.state = SessionState::Exited;
-                    entry.exited_at = Some(now.clone());
-                    entry.pid = None;
-                }
-            }
-        }
-    })?;
-    Ok(stale_ids.len())
-}
-
 /// Remove registry entries whose process is gone (Dead). Returns the
 /// removed entries' (id, name) pairs. Use this from `delete-all-sessions`
 /// — `reap_stale_running_entries` only marks them Exited, which leaves
 /// them as phantom resurrectable rows with no cache directory to restore.
 ///
-/// Stuck entries (server unresponsive but socket exists) are *not* touched
 /// — removing them would orphan a possibly-still-running zellij server.
 /// The user clears those explicitly via `delete-session --force <name>`.
 pub fn reap_dead_registry_entries() -> io::Result<Vec<(String, String)>> {
@@ -510,8 +436,8 @@ pub fn reap_dead_registry_entries() -> io::Result<Vec<(String, String)>> {
 
 /// Like [`reap_dead_registry_entries`] but scoped to a single display name, so
 /// `delete-session <name>` can clear one stale row without the blast radius of
-/// `delete-all-sessions`. Same Dead-only liveness filter — a live or stuck
-/// namesake is never removed.
+/// `delete-all-sessions`. Same Dead-only filter — a live namesake is never
+/// removed.
 pub fn reap_dead_registry_entries_named(name: &str) -> io::Result<Vec<(String, String)>> {
     reap_dead_registry_entries_where(|entry| entry.display_name == name)
 }
@@ -520,10 +446,11 @@ fn reap_dead_registry_entries_where(
     keep: impl Fn(&SessionEntry) -> bool,
 ) -> io::Result<Vec<(String, String)>> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let dead: Vec<(String, String)> = registry
         .running_sessions()
         .into_iter()
-        .filter(|s| keep(s) && matches!(check_session_state(&s.id), SessionLiveness::Dead))
+        .filter(|s| keep(s) && matches!(probe.check(&s.id), SessionLiveness::Dead))
         .map(|s| (s.id.clone(), s.display_name.clone()))
         .collect();
     if dead.is_empty() {
@@ -573,7 +500,6 @@ pub fn register_session(display_name: &str) -> io::Result<String> {
     let entry = SessionEntry {
         id: id.clone(),
         display_name: display_name.to_string(),
-        pid: None,
         state: SessionState::Running,
         created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         exited_at: None,
@@ -595,16 +521,18 @@ pub fn register_session(display_name: &str) -> io::Result<String> {
 /// the reap and this lookup.)
 pub fn resolve_session_socket_path(name: &str) -> Option<PathBuf> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     registry
         .sessions
         .iter()
         .filter(|s| s.display_name == name && s.state == SessionState::Running)
-        .find(|s| assert_socket(&s.id))
+        .find(|s| probe.is_alive(&s.id))
         .map(|s| ZELLIJ_SOCK_DIR.join(&s.id))
 }
 
 pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let mut sessions = Vec::new();
     for entry in registry.running_sessions() {
         let sock_path = ZELLIJ_SOCK_DIR.join(&entry.id);
@@ -614,7 +542,7 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
             .and_then(|d| d.elapsed().ok())
             .unwrap_or_default();
         let duration = Duration::from_secs(ctime.as_secs());
-        if assert_socket(&entry.id) {
+        if probe.is_alive(&entry.id) {
             sessions.push((entry.display_name.clone(), duration));
         }
     }
@@ -697,12 +625,13 @@ pub fn get_resurrectable_session_names() -> Vec<String> {
 
 pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let mut sessions_with_mtime: Vec<(String, SystemTime)> = Vec::new();
     for entry in registry.running_sessions() {
         let sock_path = ZELLIJ_SOCK_DIR.join(&entry.id);
         if let Ok(meta) = std::fs::metadata(&sock_path) {
             if let Ok(mtime) = meta.modified() {
-                if assert_socket(&entry.id) {
+                if probe.is_alive(&entry.id) {
                     sessions_with_mtime.push((entry.display_name.clone(), mtime));
                 }
             }
@@ -715,32 +644,74 @@ pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
 /// Liveness signal for a registered session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionLiveness {
-    /// Server's socket connects successfully (and on Unix, replies to `ConnStatus`).
+    /// A server is bound and serving this session.
     Alive,
-    /// Pipe exists but the server didn't accept/respond within the deadline.
-    /// Either the accept loop is stuck or some thread is holding a lock the
-    /// router needs. Visible to the user but not safe to attach to.
-    Stuck,
-    /// No socket / pipe — server is gone.
+    /// No socket / pipe — the registry row is stale and the server is gone.
     Dead,
 }
 
-/// Probe a session socket to determine its liveness.
+/// Fallback probe, used only when the pipe namespace cannot be listed.
 ///
-/// On Unix: connect, send `ConnStatus`, look for a `Connected` reply. No
-/// reply within the OS read timeout means stuck; refused connection means
-/// dead.
+/// Ambiguity resolves to `Alive`: hiding a session that is actually running is
+/// worse than briefly listing one that isn't, and the client's own connect is
+/// time-bounded (3s, `os_input_output_windows`) so an unresponsive server
+/// surfaces as a connect failure rather than a hang.
+/// A liveness snapshot shared across a batch of sessions.
 ///
-/// On Windows: dispatch `ipc_connect` to a worker thread and time out at
-/// 500ms. The pipe is the source of truth (only exists while a server is
-/// bound), but `ipc_connect` blocks indefinitely if the server's accept
-/// loop is stuck. Timeout means stuck; `NotFound` means dead.
-///
-/// Trade-off on Windows: a hung connect leaves its worker thread blocked
-/// until the OS eventually fails the connect. Acceptable for the read-path
-/// call rate; revisit if it shows up in a profile.
-#[cfg(unix)]
+/// On Windows the pipe-namespace listing settles `Dead` for *every* session at
+/// once, and it costs the same single directory scan whether it answers for one
+/// session or twenty. Scans that walk the registry should take one of these and
+/// reuse it; `check_session_state` is the one-shot form and takes a fresh
+/// snapshot per call.
+pub struct LivenessProbe {
+    #[cfg(windows)]
+    bound: Option<HashSet<String>>,
+}
+
+impl LivenessProbe {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            bound: crate::session_pipes::live_session_ids(),
+        }
+    }
+
+    pub fn check(&self, name: &str) -> SessionLiveness {
+        // Settle Dead from the pipe namespace before touching IPC. A pipe exists
+        // only while a server holds it bound, so its absence is conclusive. This
+        // matters beyond speed: the handshake reaches into the *target* server's
+        // accept loop, which is sequential, so probing dead entries the
+        // expensive way puts avoidable traffic on every healthy server.
+        //
+        // `None` = the namespace itself was unreadable. Fall through to the
+        // handshake rather than declaring everything dead on a transient failure.
+        #[cfg(windows)]
+        if let Some(bound) = &self.bound {
+            if !bound.contains(name) {
+                return SessionLiveness::Dead;
+            }
+        }
+        probe_socket(name)
+    }
+
+    /// Convenience predicate for the common case.
+    pub fn is_alive(&self, name: &str) -> bool {
+        matches!(self.check(name), SessionLiveness::Alive)
+    }
+}
+
+impl Default for LivenessProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn check_session_state(name: &str) -> SessionLiveness {
+    LivenessProbe::new().check(name)
+}
+
+#[cfg(unix)]
+fn probe_socket(name: &str) -> SessionLiveness {
     use crate::consts::ipc_connect;
     let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
@@ -751,7 +722,9 @@ pub fn check_session_state(name: &str) -> SessionLiveness {
             let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
             match receiver.recv_server_msg() {
                 Some((ServerToClientMsg::Connected, _)) => SessionLiveness::Alive,
-                _ => SessionLiveness::Stuck,
+                // Connected but no/unexpected reply: a server is on the other
+                // end, so treat it as alive.
+                _ => SessionLiveness::Alive,
             }
         },
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
@@ -763,7 +736,7 @@ pub fn check_session_state(name: &str) -> SessionLiveness {
 }
 
 #[cfg(windows)]
-pub fn check_session_state(name: &str) -> SessionLiveness {
+fn probe_socket(name: &str) -> SessionLiveness {
     use crate::consts::{ipc_connect, ipc_connect_reply};
     use std::sync::mpsc;
     use std::thread;
@@ -795,32 +768,23 @@ pub fn check_session_state(name: &str) -> SessionLiveness {
         // Ambiguous transient errors (busy, access denied) — be conservative,
         // assume alive rather than tearing down state.
         Ok(Err(_)) => SessionLiveness::Alive,
-        Err(_) => SessionLiveness::Stuck,
+        // Slow handshake, not a verdict. A loaded machine can miss the deadline
+        // on a healthy server, and the pipe was bound when we looked.
+        Err(_) => SessionLiveness::Alive,
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn check_session_state(_name: &str) -> SessionLiveness {
+fn probe_socket(_name: &str) -> SessionLiveness {
     SessionLiveness::Alive
 }
 
-/// Thin wrapper for callers that don't care about the stuck distinction —
-/// e.g. `get_sessions` (used to populate suggestions/auto-attach lists).
-/// Stuck sessions are filtered out so attach paths skip them; ls handles
-/// stuck display via `check_session_state` directly.
-fn assert_socket(name: &str) -> bool {
-    matches!(check_session_state(name), SessionLiveness::Alive)
-}
-
 /// Display category for `print_sessions`. Beyond live/exited, distinguishes
-/// `Stuck` so the user can see when a session is registered but its server
-/// is unresponsive (and `attach` would refuse it). `Dead` surfaces stale
-/// `running` registry entries whose server process is gone — useful for
-/// debugging registry leaks without hiding them from `ls`.
+/// `Dead`, which surfaces stale `running` registry entries whose server process
+/// is gone — useful for debugging registry leaks without hiding them from `ls`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDisplayStatus {
     Alive,
-    Stuck,
     Dead,
     Resurrectable,
 }
@@ -854,10 +818,6 @@ pub fn print_sessions(
                 } else {
                     match status {
                         SessionDisplayStatus::Alive => String::new(),
-                        SessionDisplayStatus::Stuck => {
-                            "(STUCK - server not responding, run `zellij delete-session` to clear)"
-                                .to_string()
-                        },
                         SessionDisplayStatus::Dead => {
                             "(DEAD - stale registry entry, run `zellij delete-session` to clear)"
                                 .to_string()
@@ -872,11 +832,6 @@ pub fn print_sessions(
             } else {
                 match status {
                     SessionDisplayStatus::Alive => String::new(),
-                    SessionDisplayStatus::Stuck => {
-                        "(\u{1b}[33;1mSTUCK\u{1b}[m - server not responding, run \
-                         `zellij delete-session` to clear)"
-                            .to_string()
-                    },
                     SessionDisplayStatus::Dead => {
                         "(\u{1b}[31;1mDEAD\u{1b}[m - stale registry entry, run \
                          `zellij delete-session` to clear)"
@@ -1004,7 +959,7 @@ pub fn delete_session(name: &str, force: bool) {
     // gone. The Dead hint in `list_sessions` ("run `zellij delete-session` to
     // clear") promised this; without it the row outlived the cache folder and
     // a folderless Dead entry only ever produced "not found" below. Dead-only,
-    // so a live/stuck namesake is never touched.
+    // so a live namesake is never touched.
     let reaped = reap_dead_registry_entries_named(name).unwrap_or_else(|e| {
         log::error!("Failed to reap dead registry entries for {:?}: {:?}", name, e);
         Vec::new()
@@ -1025,18 +980,17 @@ pub fn delete_session(name: &str, force: bool) {
 
 pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
     // Iterate the registry directly so every entry is visible — including Dead
-    // ones (stale "running" entries whose server process is gone) and Stuck
-    // ones (server registered but unresponsive). `get_sessions()` filters both
-    // because attach paths can't use them, but `ls` exists to *show* state so
-    // the user can spot and clear registry leaks.
+    // ones (stale "running" entries whose server process is gone).
+    // `get_sessions()` filters those out because attach paths can't use them,
+    // but `ls` exists to *show* state so the user can spot registry leaks.
     let registry = ensure_registry();
+    let probe = LivenessProbe::new();
     let mut output: Vec<(String, Duration, SessionDisplayStatus)> = Vec::new();
     let mut running_names: HashSet<String> = HashSet::new();
     for entry in registry.running_sessions() {
         running_names.insert(entry.display_name.clone());
-        let status = match check_session_state(&entry.id) {
+        let status = match probe.check(&entry.id) {
             SessionLiveness::Alive => SessionDisplayStatus::Alive,
-            SessionLiveness::Stuck => SessionDisplayStatus::Stuck,
             SessionLiveness::Dead => SessionDisplayStatus::Dead,
         };
         // Prefer the socket's ctime/mtime (reflects when the server actually
@@ -1437,11 +1391,10 @@ mod tests {
     const UUID_2: &str = "550e8400-e29b-41d4-a716-446655440002";
     const UUID_3: &str = "6ba7b810-9dad-41d4-80b4-00c04fd430c3";
 
-    fn make_running_entry(id: &str, name: &str, pid: u32) -> SessionEntry {
+    fn make_running_entry(id: &str, name: &str) -> SessionEntry {
         SessionEntry {
             id: id.to_string(),
             display_name: name.to_string(),
-            pid: Some(pid),
             state: SessionState::Running,
             created_at: "2024-01-15T10:00:00Z".to_string(),
             exited_at: None,
@@ -1452,7 +1405,6 @@ mod tests {
         SessionEntry {
             id: id.to_string(),
             display_name: name.to_string(),
-            pid: None,
             state: SessionState::Exited,
             created_at: "2024-01-14T09:00:00Z".to_string(),
             exited_at: Some("2024-01-14T18:00:00Z".to_string()),
@@ -1463,7 +1415,7 @@ mod tests {
     fn kdl_roundtrip() {
         let registry = SessionRegistry {
             sessions: vec![
-                make_running_entry(UUID_1, "my-session", 12345),
+                make_running_entry(UUID_1, "my-session"),
                 make_exited_entry(UUID_2, "old-session"),
             ],
         };
@@ -1474,7 +1426,6 @@ mod tests {
         let running = &parsed.sessions[0];
         assert_eq!(running.id, UUID_1);
         assert_eq!(running.display_name, "my-session");
-        assert_eq!(running.pid, Some(12345));
         assert_eq!(running.state, SessionState::Running);
         assert_eq!(running.created_at, "2024-01-15T10:00:00Z");
         assert!(running.exited_at.is_none());
@@ -1482,32 +1433,17 @@ mod tests {
         let exited = &parsed.sessions[1];
         assert_eq!(exited.id, UUID_2);
         assert_eq!(exited.display_name, "old-session");
-        assert!(exited.pid.is_none());
         assert_eq!(exited.state, SessionState::Exited);
         assert_eq!(exited.exited_at.as_deref(), Some("2024-01-14T18:00:00Z"));
-    }
-
-    #[test]
-    fn kdl_roundtrip_no_pid_for_exited() {
-        let registry = SessionRegistry {
-            sessions: vec![make_exited_entry(UUID_1, "dead-session")],
-        };
-        let kdl = registry.to_kdl();
-        assert!(
-            !kdl.contains("pid"),
-            "exited session should not have pid node"
-        );
-        let parsed = SessionRegistry::from_kdl(&kdl).unwrap();
-        assert!(parsed.sessions[0].pid.is_none());
     }
 
     #[test]
     fn find_running_by_name_returns_running_not_exited() {
         let registry = SessionRegistry {
             sessions: vec![
-                make_running_entry(UUID_1, "foo", 100),
+                make_running_entry(UUID_1, "foo"),
                 make_exited_entry(UUID_2, "foo"),
-                make_running_entry(UUID_3, "bar", 200),
+                make_running_entry(UUID_3, "bar"),
             ],
         };
         let found = registry.find_running_by_name("foo").unwrap();
@@ -1518,7 +1454,7 @@ mod tests {
     #[test]
     fn find_running_by_name_returns_none_for_nonexistent() {
         let registry = SessionRegistry {
-            sessions: vec![make_running_entry(UUID_1, "foo", 100)],
+            sessions: vec![make_running_entry(UUID_1, "foo")],
         };
         assert!(registry.find_running_by_name("nonexistent").is_none());
     }
@@ -1526,7 +1462,7 @@ mod tests {
     #[test]
     fn resolve_socket_path_uses_id() {
         let registry = SessionRegistry {
-            sessions: vec![make_running_entry(UUID_1, "my-session", 100)],
+            sessions: vec![make_running_entry(UUID_1, "my-session")],
         };
         let path = registry.resolve_socket_path("my-session").unwrap();
         assert!(path.ends_with(UUID_1));
@@ -1536,9 +1472,9 @@ mod tests {
     fn remove_by_id() {
         let mut registry = SessionRegistry {
             sessions: vec![
-                make_running_entry(UUID_1, "a", 1),
-                make_running_entry(UUID_2, "b", 2),
-                make_running_entry(UUID_3, "c", 3),
+                make_running_entry(UUID_1, "a"),
+                make_running_entry(UUID_2, "b"),
+                make_running_entry(UUID_3, "c"),
             ],
         };
         registry.remove_by_id(UUID_2);

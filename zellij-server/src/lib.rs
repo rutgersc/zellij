@@ -1085,15 +1085,6 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
 
     envs::set_zellij("0".to_string());
 
-    // Update PID in session registry (post-daemonize on Unix, so this is the real PID).
-    if let Err(e) = zellij_utils::sessions::with_registry(|reg| {
-        if let Some(entry) = reg.find_by_id_mut(&session_id) {
-            entry.pid = Some(std::process::id());
-        }
-    }) {
-        log::error!("Failed to update PID in session registry: {:?}", e);
-    }
-
     let (to_server, server_receiver): ChannelWithContext<ServerInstruction> = channels::bounded(50);
     let to_server = SenderWithContext::new(to_server);
     let session_data: Arc<RwLock<Option<SessionMetaData>>> = Arc::new(RwLock::new(None));
@@ -2125,11 +2116,10 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     // Drop cached session data before exit.
     *session_data.write().unwrap() = None;
 
-    // Update session registry: mark as exited, clear PID.
+    // Update session registry: mark as exited.
     if let Err(e) = zellij_utils::sessions::with_registry(|reg| {
         if let Some(entry) = reg.find_by_id_mut(&session_id) {
             entry.state = zellij_utils::sessions::SessionState::Exited;
-            entry.pid = None;
             entry.exited_at = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
         }
     }) {
