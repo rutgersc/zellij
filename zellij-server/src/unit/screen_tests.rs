@@ -316,6 +316,7 @@ fn create_new_screen(
         false, // mouse_click_through
         web_server_ip,
         web_server_port,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     screen
 }
@@ -378,6 +379,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
                 )
                 .expect("TEST")
             })
@@ -464,6 +466,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
                 )
                 .expect("TEST")
             })
@@ -5379,6 +5382,7 @@ fn create_new_screen_with_message_capture(
         false, // mouse_click_through
         web_server_ip,
         web_server_port,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (screen, messages)
 }
@@ -8455,6 +8459,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         false, // mouse_click_through
         web_server_ip,
         web_server_port,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (
         screen,
@@ -9038,6 +9043,7 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
         false,
         web_server_ip,
         web_server_port,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     );
     (
         screen,
@@ -9528,6 +9534,7 @@ fn create_non_mirrored_screen(size: Size) -> Screen {
         false, // mouse_click_through
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         8080,
+        "a3f7b9c1-e29b-41d4-a716-446655440000".to_string(),
     )
 }
 
