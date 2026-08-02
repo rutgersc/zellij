@@ -383,38 +383,51 @@ git worktree add -q --detach /tmp/wt <sha> && ( cd /tmp/wt && cargo check ) ; gi
 
 Keep both backup refs until the diff is verified empty.
 
-## 9. Decisions deferred to after a verified-empty diff
+## 9. Deferred — changes content, so outside the reconstruction
 
-Each of these changes content, so none belong in the reconstruction.
+The reconstruction ran under strict diff-equivalence (§1), so anything that changes code was
+parked here. Work below this line is post-reconstruction and deliberately diverges;
+`backup/minimal3-verified` pins the last byte-identical commit.
 
-- **#14 `debug logging for floating panes`** — debug logging in `stdin_handler.rs`,
-  `floating_panes/mod.rs`, `tab/mod.rs`. Behaviour-equivalent to drop, but *not*
-  diff-equivalent. Listed as **U11** so the diff stays clean; drop it in a follow-up if the
-  logging has served its purpose.
-- **Junk subjects** — `wfwf`, `c`, `naav`, `w`, `bg agents`, `clear stale sessions`,
-  `agentbar loading indication`, `fix kill by tab`. All fold into anchors, so most vanish;
-  #13 survives as **U5** and needs a real message.
-- **Collapse the DEAD machinery** — `Dead` is *not* obsolete: it means "a registry row whose
-  uuid has no bound pipe", and the registry is still the enumeration source (only it knows
-  uuid→name). Stale rows stay representable until something prunes on read. An earlier draft
-  of this file claimed `Dead` becomes unrepresentable under S5 — that was wrong. What S5
-  changed is that detecting it became cheap, not that the concept went away.
-- **Registry / kdl schema reshape** — deliberately deferred. Old state can be wiped, so
-  back-compat is not a constraint: `SessionState::Exited` degrades to a "don't bother
-  probing" hint, and the legacy socket-file migration that manufactures Exited rows can go
-  with it.
-- **Marker file removal** — its path duplicates its own filename and its mtime duplicates the
-  registry's `created_at`. *(Its PID field is already gone — commit 65.)*
+**Open**
 
-**Done since the first draft** — struck from this list, now reflected in §3.1:
+- **Registry / kdl schema reshape** — the substantial one. Old state can be wiped, so
+  back-compat is not a constraint: `SessionState::Exited` degrades to a "don't bother probing"
+  hint, and the legacy socket-file migration that manufactures Exited rows goes with it. End
+  state is `sessions.kdl` as a pure name→uuid index.
+- **Marker file removal** *(Windows)* — `ipc_bind` writes `PID
+pipe_path`. The PID is gone
+  (nothing read it), the path duplicates the file's own name, and the mtime duplicates
+  `created_at`. The file has no remaining job. Touches `ipc_bind` / `resolve_pipe_name` in
+  `consts.rs`, i.e. core IPC.
+- **Drop the debug logging** — `94db0479`, isolated as its own commit precisely so this is a
+  `git rebase --onto`. Behaviour-neutral.
+- **Rebase onto `0ed2edea`** — 40 upstream commits; 24 conflicting source files by trial merge,
+  none in the session stack. Orthogonal to everything above, and cheap now the object store is
+  packed.
 
-- ~~unreachable `reap_stale_running_entries` / `exited_sessions`~~ → `01925df3`
-- ~~unread `SessionEntry.pid`~~ → `e066f12a`
-- ~~`check_session_state` enumerating the namespace per call~~ → `041e3edc`
-- ~~the `Stuck` state~~ → `52da69cc` (its causes were fixed by `08fe52d8` / `962ac334` /
-  `e46ca68f`; all it produced by then were false positives that hard-failed attach)
-- **TH1 ordering** — #54 (*keep palette across reload*) precedes #55 (*follow Windows app
-  theme*) in branch order, i.e. the fix lands before the feature it fixes. Confirm which
-  order actually compiles before folding.
-- **Rebase onto `0ed2edea`** — 40 upstream commits ahead; 24 real source conflicts by trial
-  merge, none in the session stack. Independent of this reconstruction.
+**Not doing: prune stale rows on read.** It would make `Dead` unrepresentable and delete the
+reaping entirely, but `register_session` runs in the *client* (`zellij-client/src/lib.rs`)
+before it spawns the server that binds the pipe. In that window the row exists and the pipe
+does not, so a concurrent `zellij ls` would prune a session that is starting. The codebase
+already carried a warning about this exact footgun on the old `reap_stale_running_entries`.
+
+**Done**
+
+| | |
+|---|---|
+| unreachable `reap_stale_running_entries` / `exited_sessions` | `01925df3` |
+| unread `SessionEntry.pid` | `e066f12a` |
+| `check_session_state` enumerating the namespace per call | `041e3edc` |
+| the `Stuck` state — its causes were fixed by `08fe52d8` / `962ac334` / `e46ca68f`; by then it only produced false positives that hard-failed attach | `52da69cc` |
+| surfacing DEAD rows in `ls` | `9375a485` |
+| junk subjects (`wfwf`, `c`, `naav`, `w`, `bg agents`, `clear stale sessions`) | folded into cluster commits |
+| `fix kill by tab` — actually a Job Object fix | reworded, `6baaf03c` |
+| TH1 ordering — moot, both themes commits squash into one | — |
+
+**Correction.** An earlier draft claimed `Dead` becomes unrepresentable once liveness is
+derived. Wrong: `Dead` means *a registry row whose uuid has no bound pipe*, and the registry is
+still the enumeration source because only it maps uuid→name. Stale rows stay representable
+until something prunes them — which, per above, is not safe to do on a read path. What
+deriving liveness changed is that detecting `Dead` became cheap and non-misleading, not that
+the concept went away.
