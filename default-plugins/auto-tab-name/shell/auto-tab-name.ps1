@@ -23,7 +23,7 @@ function global:Set-ZellijTabTitle {
 $script:__ZellijOriginalPrompt = $function:prompt
 
 function global:prompt {
-    Set-ZellijTabTitle -Title (Split-Path -Leaf $PWD)
+    Set-ZellijTabTitle -Title "pwsh $(Split-Path -Leaf $PWD)"
     if ($script:__ZellijOriginalPrompt) {
         & $script:__ZellijOriginalPrompt
     } else {

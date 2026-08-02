@@ -2155,6 +2155,11 @@ impl From<crate::input::actions::Action>
             | crate::input::actions::Action::CopyAndExitCopyMode => {
                 ActionType::NoOp(NoOpAction {})
             },
+            // Keybind-only cross-session pane jumplist actions; not exposed over
+            // the plugin/protobuf API. Map to NoOp (this From conversion is
+            // infallible, so we can't error here).
+            crate::input::actions::Action::FocusPrevJump
+            | crate::input::actions::Action::FocusNextJump => ActionType::NoOp(NoOpAction {}),
         };
 
         Self {
