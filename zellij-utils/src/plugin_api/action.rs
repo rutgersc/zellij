@@ -2037,7 +2037,12 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::SaveSession
             | Action::ListTabs { .. }
             | Action::CurrentTabInfo { .. }
-            | Action::SetPaneColor { .. } => Err("Unsupported action"),
+            | Action::SetPaneColor { .. }
+            | Action::MoveCopyCursor { .. }
+            | Action::ToggleCopyVisual
+            | Action::ToggleCopyVisualLine
+            | Action::CopyModeEscape
+            | Action::CopyAndExitCopyMode => Err("Unsupported action"),
         }
     }
 }
