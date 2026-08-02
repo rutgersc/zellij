@@ -14,6 +14,8 @@ mod keyboard_parser;
 mod nested_reannounce;
 #[cfg(feature = "web_server_capability")]
 pub mod remote_attach;
+#[cfg(windows)]
+mod host_theme_watcher;
 mod stdin_ansi_parser;
 mod stdin_handler;
 #[cfg(windows)]
@@ -1175,6 +1177,9 @@ pub fn start_client(
 
     os_input.connect_to_server(&*ipc_pipe);
     os_input.send_to_server(first_msg);
+
+    #[cfg(windows)]
+    host_theme_watcher::spawn(os_input.clone());
 
     let mut command_is_executing = CommandIsExecuting::new();
 
