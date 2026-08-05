@@ -16,14 +16,16 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::net::windows::named_pipe::NamedPipeServer;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, HMODULE, INVALID_HANDLE_VALUE, S_OK,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent, ResizePseudoConsole, COORD,
-    CTRL_C_EVENT, HPCON,
+    GenerateConsoleCtrlEvent, COORD, CTRL_C_EVENT, HPCON,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -50,6 +52,59 @@ const GENERIC_WRITE: u32 = 0x40000000;
 /// the previous pipe handle).
 static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// ConPTY function loader
+// ---------------------------------------------------------------------------
+//
+// Windows 10 1809+ exposes Create/Resize/ClosePseudoConsole from kernel32, but
+// the shipping system conhost backing those entry points has a null-pointer
+// write in OpenConsole!WriteCharsLegacy on Win11 23H2 that crashes the whole
+// process tree when nested TUIs spawn or exit (see wezterm/wezterm#7520). To
+// dodge it we prefer a sideloaded `conpty.dll` v1.24+ placed next to the
+// zellij binary (paired with an `OpenConsole.exe` of the same version),
+// falling back to kernel32 if absent. Mirrors wezterm's
+// pty/src/win/psuedocon.rs:load_conpty.
+
+// HRESULT in windows-sys 0.52 is just `i32`; we use it directly to avoid
+// hunting it across Foundation/IPC module reshuffles between minor versions.
+type CreatePseudoConsoleFn =
+    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
+type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
+type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
+
+struct ConPtyFns {
+    create: CreatePseudoConsoleFn,
+    resize: ResizePseudoConsoleFn,
+    close: ClosePseudoConsoleFn,
+}
+unsafe impl Send for ConPtyFns {}
+unsafe impl Sync for ConPtyFns {}
+
+static CONPTY: std::sync::OnceLock<ConPtyFns> = std::sync::OnceLock::new();
+
+fn conpty() -> &'static ConPtyFns {
+    CONPTY.get_or_init(|| unsafe {
+        for dll in ["conpty.dll", "kernel32.dll"] {
+            let wide: Vec<u16> = dll.encode_utf16().chain(std::iter::once(0)).collect();
+            let module: HMODULE = LoadLibraryW(wide.as_ptr());
+            if module.is_null() {
+                continue;
+            }
+            let create = GetProcAddress(module, b"CreatePseudoConsole\0".as_ptr());
+            let resize = GetProcAddress(module, b"ResizePseudoConsole\0".as_ptr());
+            let close = GetProcAddress(module, b"ClosePseudoConsole\0".as_ptr());
+            if let (Some(c), Some(r), Some(cl)) = (create, resize, close) {
+                return ConPtyFns {
+                    create: std::mem::transmute::<_, CreatePseudoConsoleFn>(c),
+                    resize: std::mem::transmute::<_, ResizePseudoConsoleFn>(r),
+                    close: std::mem::transmute::<_, ClosePseudoConsoleFn>(cl),
+                };
+            }
+        }
+        panic!("ConPTY unavailable (Windows 10 1809+ required)");
+    })
+}
+
 /// Per-terminal ConPTY state.
 struct ConPtyTerminal {
     hpcon: HPCON,
@@ -67,7 +122,7 @@ impl Drop for ConPtyTerminal {
             // Close the pseudo console first — it may write a final VT frame
             // to the output pipe. The async reader task (if still alive) will
             // drain it. Then close the remaining handle.
-            ClosePseudoConsole(self.hpcon);
+            (conpty().close)(self.hpcon);
             CloseHandle(self.input_write_handle);
         }
     }
@@ -270,7 +325,7 @@ fn create_conpty(
         Y: rows as i16,
     };
     let mut hpcon: HPCON = 0;
-    let hr = unsafe { CreatePseudoConsole(size, input_read, output_write, 0, &mut hpcon) };
+    let hr = unsafe { (conpty().create)(size, input_read, output_write, 0, &mut hpcon) };
     if hr != S_OK {
         Err(io::Error::from_raw_os_error(hr))
     } else {
@@ -478,7 +533,7 @@ impl WindowsPtyBackend {
                 Ok(r) => r,
                 Err(e) => {
                     unsafe {
-                        ClosePseudoConsole(hpcon);
+                        (conpty().close)(hpcon);
                         CloseHandle(input_write);
                         CloseHandle(output_read);
                     }
@@ -578,7 +633,7 @@ impl WindowsPtyBackend {
                         X: cols as i16,
                         Y: rows as i16,
                     };
-                    let hr = unsafe { ResizePseudoConsole(term.hpcon, size) };
+                    let hr = unsafe { (conpty().resize)(term.hpcon, size) };
                     if hr != S_OK {
                         Err::<(), _>(anyhow!("ResizePseudoConsole failed: HRESULT 0x{:08x}", hr))
                             .with_context(err_context)
