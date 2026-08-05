@@ -206,6 +206,7 @@ fn pipe_client(
                         process::exit(0);
                     },
                 },
+                None => return,
                 _ => {},
             }
         }
@@ -274,10 +275,12 @@ fn individual_messages_client(
                     return None;
                 },
             },
+            None => break,
             _ => {},
         }
     }
     log::info!("cli_client::individual_messages: exited recv loop");
+    None
 }
 
 pub fn start_subscribe_client(
