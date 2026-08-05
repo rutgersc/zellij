@@ -21,13 +21,21 @@ pub fn start_cli_client(
     session_name: &str,
     actions: Vec<Action>,
 ) -> i32 {
+    log::info!(
+        "cli_client: start session={} actions={}",
+        session_name,
+        actions.len()
+    );
     let zellij_ipc_pipe: PathBuf = crate::resolve_session_ipc_pipe(session_name);
+    log::info!("cli_client: resolved ipc pipe {:?}", zellij_ipc_pipe);
     os_input.connect_to_server(&*zellij_ipc_pipe);
+    log::info!("cli_client: connected to server");
     let pane_id = os_input
         .env_variable("ZELLIJ_PANE_ID")
         .and_then(|e| e.trim().parse().ok());
 
     for action in actions {
+        log::info!("cli_client: dispatching action {:?}", action);
         match action {
             Action::CliPipe {
                 pipe_id,
@@ -69,7 +77,9 @@ pub fn start_cli_client(
             },
         }
     }
+    log::info!("cli_client: actions complete, sending ClientExited");
     os_input.send_to_server(ClientToServerMsg::ClientExited);
+    log::info!("cli_client: ClientExited sent, returning from start_cli_client");
     0
 }
 
@@ -220,9 +230,27 @@ fn individual_messages_client(
         client_id: None,
         is_cli_client: true,
     };
+    log::info!(
+        "cli_client::individual_messages: send_to_server is_blocking={}",
+        is_blocking
+    );
     os_input.send_to_server(msg);
+    log::info!("cli_client::individual_messages: send done, entering recv loop");
     loop {
-        match os_input.recv_from_server() {
+        log::info!("cli_client::individual_messages: awaiting recv_from_server");
+        let received = os_input.recv_from_server();
+        log::info!(
+            "cli_client::individual_messages: recv returned variant={}",
+            match &received {
+                None => "None",
+                Some((ServerToClientMsg::UnblockInputThread, _)) => "UnblockInputThread",
+                Some((ServerToClientMsg::Log { .. }, _)) => "Log",
+                Some((ServerToClientMsg::LogError { .. }, _)) => "LogError",
+                Some((ServerToClientMsg::Exit { .. }, _)) => "Exit",
+                Some(_) => "other",
+            }
+        );
+        match received {
             Some((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
                 return None;
             },
@@ -249,6 +277,7 @@ fn individual_messages_client(
             _ => {},
         }
     }
+    log::info!("cli_client::individual_messages: exited recv loop");
 }
 
 pub fn start_subscribe_client(
