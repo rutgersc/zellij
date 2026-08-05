@@ -191,14 +191,30 @@ pub(crate) fn setup_ipc(
     IpcSenderWithContext<zellij_utils::ipc::ClientToServerMsg>,
     IpcReceiverWithContext<zellij_utils::ipc::ServerToClientMsg>,
 ) {
+    let timeout = std::time::Duration::from_secs(3);
+    let started = std::time::Instant::now();
     let reply_socket;
     loop {
-        match zellij_utils::consts::ipc_connect_reply(path) {
+        match crate::os_input_output::ipc_connect_reply_with_timeout(
+            path,
+            timeout.saturating_sub(started.elapsed()),
+        ) {
             Ok(sock) => {
                 reply_socket = sock;
                 break;
             },
             Err(_) => {
+                if started.elapsed() > timeout {
+                    eprintln!(
+                        "Session server is not responding (reply pipe). \
+                         The session may be in a broken state.\n\
+                         You can try: zellij delete-session {}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    );
+                    std::process::exit(1);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             },
         }
@@ -271,3 +287,7 @@ pub(crate) fn disable_mouse_support(stdout: &mut dyn Write) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "os_input_output_windows_connect_tests.rs"]
+mod connect_tests;
