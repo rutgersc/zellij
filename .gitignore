@@ -4,3 +4,4 @@ target/
 .vim
 .idea
 .DS_Store
+.claude
