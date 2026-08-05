@@ -442,6 +442,19 @@ impl Pane for TerminalPane {
                     raw_input_bytes,
                     raw_input_bytes_are_kitty,
                 )
+            } else if cfg!(windows) && self.grid.supports_win32_input_mode {
+                #[cfg(windows)]
+                {
+                    self.adjust_input_to_terminal_with_win32_input_mode(
+                        key_with_modifier,
+                        raw_input_bytes,
+                        raw_input_bytes_are_kitty,
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    unreachable!()
+                }
             } else {
                 self.adjust_input_to_terminal_without_kitty_keyboard_protocol(
                     key_with_modifier,
@@ -1468,6 +1481,27 @@ impl TerminalPane {
             self.banner = None;
         }
     }
+    #[cfg(windows)]
+    fn adjust_input_to_terminal_with_win32_input_mode(
+        &self,
+        key: &Option<KeyWithModifier>,
+        raw_input_bytes: Vec<u8>,
+        _raw_input_bytes_are_kitty: bool,
+    ) -> Option<AdjustedInput> {
+        use crate::panes::win32_input_mode::encode_key_for_child;
+        // The child's ConPTY expects WIN32 input records on its input pipe.
+        // Always transcode from the parsed key — never pass the upstream
+        // bytes through, because they're typically kitty CSI-u (from wezterm)
+        // which ConPTY can't decode and would fall through as a per-byte
+        // keypress storm.
+        match key.as_ref() {
+            Some(k) => Some(AdjustedInput::WriteBytesToTerminal(encode_key_for_child(k))),
+            // Non-key input (mouse, paste, raw bytes from a non-keyboard
+            // source) stays as-is — ConPTY passes it on without translation.
+            None => Some(AdjustedInput::WriteBytesToTerminal(raw_input_bytes)),
+        }
+    }
+
     fn adjust_input_to_terminal_with_kitty_keyboard_protocol(
         &self,
         key: &Option<KeyWithModifier>,
