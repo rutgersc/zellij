@@ -21,6 +21,7 @@ use crate::client_server_contract::client_server_contract::{
 use prost::Message;
 
 mod enum_conversions;
+mod peer_closed;
 mod protobuf_conversion;
 
 #[cfg(test)]
@@ -410,6 +411,7 @@ impl<T: Serialize> IpcSenderWithContext<T> {
 /// Receives messages on a stream socket, along with an [`ErrorContext`].
 pub struct IpcReceiverWithContext<T> {
     receiver: io::BufReader<Box<dyn IpcStream>>,
+    last_recv_error: Option<String>,
     _phantom: PhantomData<T>,
 }
 
@@ -421,6 +423,7 @@ where
     pub fn new(receiver: LocalSocketStream) -> Self {
         Self {
             receiver: io::BufReader::new(Box::new(receiver)),
+            last_recv_error: None,
             _phantom: PhantomData,
         }
     }
@@ -428,8 +431,13 @@ where
     fn from_boxed(receiver: Box<dyn IpcStream>) -> Self {
         Self {
             receiver: io::BufReader::new(receiver),
+            last_recv_error: None,
             _phantom: PhantomData,
         }
+    }
+
+    pub fn last_recv_error(&self) -> Option<&str> {
+        self.last_recv_error.as_deref()
     }
 
     pub fn recv_client_msg(&mut self) -> Option<(ClientToServerMsg, ErrorContext)> {
@@ -438,10 +446,14 @@ where
                 Ok(rust_msg) => Some((rust_msg, ErrorContext::default())),
                 Err(e) => {
                     warn!("Error converting protobuf to ClientToServerMsg: {:?}", e);
+                    self.last_recv_error = Some(format!("decode: {e:?}"));
                     None
                 },
             },
-            Err(_e) => None,
+            Err(e) => {
+                self.last_recv_error = Some(format!("{e:#}"));
+                None
+            },
         }
     }
 
@@ -451,10 +463,14 @@ where
                 Ok(rust_msg) => Some((rust_msg, ErrorContext::default())),
                 Err(e) => {
                     warn!("Error converting protobuf to ServerToClientMsg: {:?}", e);
+                    self.last_recv_error = Some(format!("decode: {e:?}"));
                     None
                 },
             },
-            Err(_e) => None,
+            Err(e) => {
+                self.last_recv_error = Some(format!("{e:#}"));
+                None
+            },
         }
     }
 

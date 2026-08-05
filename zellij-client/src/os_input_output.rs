@@ -182,6 +182,11 @@ pub trait ClientOsApi: Send + Sync + std::fmt::Debug {
     /// Receives a message on client-side IPC channel
     // This should be called from the client-side router thread only.
     fn recv_from_server(&self) -> Option<(ServerToClientMsg, ErrorContext)>;
+    /// After `recv_from_server` returned `None`: the server hung up, with the
+    /// read error that was swallowed. `None` while the pipe is still open.
+    fn server_hung_up(&self) -> Option<String> {
+        None
+    }
     fn handle_signals(
         &self,
         sigwinch_cb: Box<dyn Fn()>,
@@ -308,6 +313,16 @@ impl ClientOsApi for ClientOsInputOutput {
             .as_mut()
             .unwrap()
             .recv_server_msg()
+    }
+    fn server_hung_up(&self) -> Option<String> {
+        let mut guard = self.receive_instructions_from_server.lock().unwrap();
+        let receiver = guard.as_mut()?;
+        receiver.peer_closed().then(|| {
+            receiver
+                .last_recv_error()
+                .unwrap_or("no error recorded")
+                .to_owned()
+        })
     }
     fn handle_signals(
         &self,

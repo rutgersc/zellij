@@ -1343,6 +1343,14 @@ pub fn start_client(
                         }
                     },
                     None => {
+                        if let Some(error) = os_input.server_hung_up() {
+                            let reason = format!("Server closed the connection: {error}");
+                            log::error!("{reason}");
+                            send_client_instructions
+                                .send(ClientInstruction::Error(reason))
+                                .unwrap();
+                            break;
+                        }
                         consecutive_unknown_messages_received += 1;
                         send_client_instructions
                             .send(ClientInstruction::UnblockInputThread)
@@ -1392,6 +1400,7 @@ pub fn start_client(
 
         match client_instruction {
             ClientInstruction::Exit(reason) => {
+                log::info!("client exit: {reason}");
                 os_input.send_to_server(ClientToServerMsg::ClientExited);
 
                 if let ExitReason::Error(_) = reason {
@@ -1401,6 +1410,7 @@ pub fn start_client(
                 break;
             },
             ClientInstruction::Error(backtrace) => {
+                log::error!("client error exit: {backtrace}");
                 handle_error(backtrace);
             },
             ClientInstruction::Render(output) => {
