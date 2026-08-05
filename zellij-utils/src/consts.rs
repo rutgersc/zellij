@@ -277,10 +277,15 @@ pub fn ipc_bind(path: &std::path::Path) -> std::io::Result<interprocess::local_s
 #[cfg(windows)]
 pub fn ipc_bind(path: &std::path::Path) -> std::io::Result<interprocess::local_socket::Listener> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
     let name = path.to_string_lossy().to_string();
     let marker = format!("{}\n{}", std::process::id(), name);
     let ns_name = name.to_ns_name::<GenericNamespaced>()?;
-    let listener = ListenerOptions::new().name(ns_name).create_sync()?;
+    let sd = crate::pipe_security_windows::user_pipe_security_descriptor()?;
+    let listener = ListenerOptions::new()
+        .name(ns_name)
+        .security_descriptor(sd)
+        .create_sync()?;
     std::fs::write(path, marker)?;
     Ok(listener)
 }
@@ -304,10 +309,15 @@ pub fn ipc_bind_async(
     path: &std::path::Path,
 ) -> std::io::Result<interprocess::local_socket::tokio::Listener> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
     let name = path.to_string_lossy().to_string();
     let marker = format!("{}\n{}", std::process::id(), name);
     let ns_name = name.to_ns_name::<GenericNamespaced>()?;
-    let listener = ListenerOptions::new().name(ns_name).create_tokio()?;
+    let sd = crate::pipe_security_windows::user_pipe_security_descriptor()?;
+    let listener = ListenerOptions::new()
+        .name(ns_name)
+        .security_descriptor(sd)
+        .create_tokio()?;
     std::fs::write(path, marker)?;
     Ok(listener)
 }
@@ -333,9 +343,14 @@ pub fn ipc_bind_reply(
     path: &std::path::Path,
 ) -> std::io::Result<interprocess::local_socket::Listener> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
     let name = format!("{}-reply", path.to_string_lossy());
     let ns_name = name.to_ns_name::<GenericNamespaced>()?;
-    ListenerOptions::new().name(ns_name).create_sync()
+    let sd = crate::pipe_security_windows::user_pipe_security_descriptor()?;
+    ListenerOptions::new()
+        .name(ns_name)
+        .security_descriptor(sd)
+        .create_sync()
 }
 
 #[cfg(unix)]
