@@ -1,7 +1,6 @@
 use crate::keyboard_parser::{KittyKeyboardParser, KittyParseOutcome};
 use crate::os_input_output::ClientOsApi;
 #[cfg(windows)]
-use crate::os_input_output_windows::use_vt_path;
 use crate::stdin_ansi_parser::{HostReply, PendingPartial, StdinAnsiParser};
 #[cfg(windows)]
 use crate::stdin_handler_windows::enable_vt_input;
@@ -24,11 +23,19 @@ pub(crate) fn stdin_loop(
     support_kitty_graphics_protocol: bool,
     resize_sender: Option<std::sync::mpsc::Sender<()>>,
 ) {
-    // On Windows we choose between the VT byte path (termwiz/kitty parsing)
-    // and the native-console path (crossterm INPUT_RECORDs) early, before the
-    // startup ANSI query below. See `use_vt_path()` for the trigger conditions.
+    // On Windows, choose between two input strategies early — we need this
+    // decision before the startup ANSI query below.
+    //
+    // 1. VT reader (preferred): Enable ENABLE_VIRTUAL_TERMINAL_INPUT so
+    //    ReadFile on stdin returns raw VT bytes. Uses the termwiz byte parser
+    //    (same as Unix) plus the kitty keyboard parser so CSI u sequences
+    //    (e.g. `ESC[102;6u` for Ctrl+Shift+F) are correctly parsed.
+    //
+    // 2. Native console (fallback): Use crossterm's event::read() which reads
+    //    INPUT_RECORDs via ReadConsoleInput. Only used when enable_vt_input()
+    //    fails (e.g. no valid console handle).
     #[cfg(windows)]
-    let use_vt_reader = use_vt_path() && enable_vt_input();
+    let use_vt_reader = enable_vt_input();
 
     // Send the startup host query string so the host terminal replies
     // with its live pixel dimensions, fg/bg, sync-output support, and
