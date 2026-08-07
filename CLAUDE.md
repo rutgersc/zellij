@@ -6,7 +6,7 @@ Long-lived fork of upstream zellij with additional features and fixes. See `git 
 
 Two orthogonal concerns: **fork vs upstream** (where did this commit come from?) and **Claude traceability** (which conversation produced it?). Don't conflate them.
 
-### Fork vs upstream — encoded in the branch name
+### Fork vs upstream
 
 **Topology invariant:** the branch is always exactly one linear chain of fork commits stacked on top of one upstream commit.
 
@@ -14,15 +14,9 @@ Two orthogonal concerns: **fork vs upstream** (where did this commit come from?)
 
 We never cherry-pick, never merge upstream into the middle, never interleave. When upstream advances, we rebase the whole fork onto the new tip — that's the only way upstream commits enter the branch.
 
-Because the topology is always this shape, **branches encode the upstream commit they sit on top of as a prefix**:
+Because the topology is always this shape, the merge-base with upstream *is* the divide — no branch-name convention or per-commit marker needed. Every commit reachable from it is upstream; everything past it is fork-original.
 
-    <upstream-short-sha>-<branch-name>
-
-e.g. `abc1234-latest`, `abc1234-feat-something`. Reading rule: every commit reachable from `abc1234` is upstream; everything past it on the branch is fork-original. No per-commit marker needed.
-
-When you rebase onto a new upstream tip `def5678`, rename the branch to `def5678-latest`. The branch name *is* the merge-base pointer.
-
-    git log $(git symbolic-ref --short HEAD | cut -d- -f1)..HEAD    # fork-original commits on this branch
+    git log $(git merge-base HEAD origin/main)..HEAD    # fork-original commits on this branch
 
 ### Claude traceability
 
