@@ -9685,6 +9685,12 @@ pub(crate) fn screen_thread_main(
                 pane_id_to_focus,
             ) => {
                 screen.set_client_size(client_id, client_size);
+                // Client ids are handed out smallest-free, so an attach almost
+                // always reuses the id of the client that just left, carrying a
+                // jumplist memo that predates every hop made elsewhere in the
+                // meantime. Drop it, or landing back on the tab we left looks
+                // like "no change" and the session hop is never recorded.
+                screen.last_nav_recorded.remove(&client_id);
                 screen.add_client(client_id, is_web_client)?;
                 let pane_id = pane_id_to_focus.map(|(pane_id, is_plugin)| {
                     if is_plugin {
