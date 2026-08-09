@@ -425,7 +425,10 @@ impl Grid {
         }
         // We still don't want to pre-select anything at this stage
         self.search_results.active = None;
-        self.is_scrolled = true;
+        // Fork addition: a "scrolled" pane parks its pty output in Tab::pending_vte_events. The
+        // alternate screen has no scrollback to hold still, so that only freezes the pane for as
+        // long as the search lives — including the scroll we forward to the app itself.
+        self.is_scrolled = !self.is_alternate_mode_active();
     }
 
     pub fn search_viewport(&mut self) {
