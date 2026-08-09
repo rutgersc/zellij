@@ -4374,6 +4374,46 @@ fn enter_search_floating_pane() {
 }
 
 #[test]
+fn search_does_not_freeze_an_alternate_screen_pane() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mode_info = ModeInfo {
+        mode: InputMode::Search,
+        ..Default::default()
+    };
+    let mut tab = create_new_tab(size, mode_info);
+    let mut output = Output::default();
+
+    tab.handle_pty_bytes(1, "\u{1b}[?1049hbefore_search".as_bytes().to_vec())
+        .unwrap();
+    tab.update_search_term("before".as_bytes().to_vec(), client_id)
+        .unwrap();
+    tab.handle_pty_bytes(1, "\u{1b}[3;1Hafter_search".as_bytes().to_vec())
+        .unwrap();
+
+    tab.render(&mut output, None).unwrap();
+    let snapshot = take_snapshot(
+        output.serialize().unwrap().get(&client_id).unwrap(),
+        size.rows,
+        size.cols,
+        Palette::default(),
+    );
+    assert!(
+        snapshot.contains("after_search"),
+        "output written while a search was active never reached the pane - it is parked in \
+         pending_vte_events ({} buffered), so an alternate-screen app looks frozen for as long \
+         as the search lives\n{snapshot}",
+        tab.pending_vte_events
+            .get(&1)
+            .map(|e| e.len())
+            .unwrap_or(0),
+    );
+}
+
+#[test]
 fn pane_in_sgr_button_event_tracking_mouse_mode() {
     let size = Size {
         cols: 121,
