@@ -133,14 +133,15 @@ fn remove_node(state: &mut NavState, id: usize) {
 }
 
 /// Re-sync this session's nodes against its live tabs: drop the closed ones,
-/// refresh position + name on the rest.
-fn refresh_session(state: &mut NavState, session: &str, tabs: &[TabSnapshot]) {
+/// refresh position + name on the rest. Reports whether anything moved.
+fn refresh_session(state: &mut NavState, session: &str, tabs: &[TabSnapshot]) -> bool {
     let closed: Vec<usize> = state
         .nodes
         .iter()
         .filter(|n| n.session == session && !tabs.iter().any(|(id, _, _)| *id == n.tab_id))
         .map(|n| n.id)
         .collect();
+    let mut changed = !closed.is_empty();
     closed.into_iter().for_each(|id| remove_node(state, id));
 
     state
@@ -149,10 +150,14 @@ fn refresh_session(state: &mut NavState, session: &str, tabs: &[TabSnapshot]) {
         .filter(|n| n.session == session)
         .for_each(|n| {
             if let Some((_, position, name)) = tabs.iter().find(|(id, _, _)| *id == n.tab_id) {
-                n.tab_position = *position;
-                n.tab_name = name.clone();
+                if n.tab_position != *position || n.tab_name != *name {
+                    n.tab_position = *position;
+                    n.tab_name = name.clone();
+                    changed = true;
+                }
             }
         });
+    changed
 }
 
 /// Trim to `MAX_NODES` by dropping the oldest leaves. Never touches the cursor
@@ -182,22 +187,25 @@ fn prune(state: &mut NavState) {
 
 pub fn record(session: &str, tab_id: usize, tabs: &[TabSnapshot]) {
     let mut state = load();
-    apply(&mut state, session, tab_id, tabs);
-    store(&state);
+    // The funnel fires on every session-state report, so most calls are a
+    // no-op echo; writing regardless would churn the file all day.
+    if apply(&mut state, session, tab_id, tabs) {
+        store(&state);
+    }
 }
 
 /// Record a tab change. Revisiting the cursor's parent or one of its children
 /// only moves the cursor — otherwise ping-ponging between two tabs would grow a
 /// node per hop, and vim likewise adds nothing when you redo into a state that
 /// already exists. Anything else is genuinely new and branches off the cursor.
-fn apply(state: &mut NavState, session: &str, tab_id: usize, tabs: &[TabSnapshot]) {
-    refresh_session(state, session, tabs);
+fn apply(state: &mut NavState, session: &str, tab_id: usize, tabs: &[TabSnapshot]) -> bool {
+    let refreshed = refresh_session(state, session, tabs);
 
     if state.node(state.cursor).is_some_and(|n| n.is(session, tab_id)) {
-        return;
+        return refreshed;
     }
     let Some((_, tab_position, tab_name)) = tabs.iter().find(|(id, _, _)| *id == tab_id) else {
-        return;
+        return refreshed;
     };
 
     let adjacent = state
@@ -231,6 +239,7 @@ fn apply(state: &mut NavState, session: &str, tab_id: usize, tabs: &[TabSnapshot
         },
     }
     prune(state);
+    true
 }
 
 /// Step the cursor one place along the tree; returns the (session, tab id, tab
@@ -356,6 +365,16 @@ mod tests {
         let root = state.nodes.iter().find(|n| n.tab_id == 1).unwrap().id;
         let orphan = state.nodes.iter().find(|n| n.tab_id == 3).unwrap();
         assert_eq!(orphan.parent, Some(root));
+    }
+
+    #[test]
+    fn only_a_real_move_reports_a_change_worth_writing() {
+        let live = tabs(&[1, 2]);
+        let mut state = NavState::default();
+
+        assert!(apply(&mut state, S, 1, &live), "first visit creates the root");
+        assert!(!apply(&mut state, S, 1, &live), "echo of the cursor changes nothing");
+        assert!(apply(&mut state, S, 2, &live), "a genuine move changes the tree");
     }
 
     #[test]
