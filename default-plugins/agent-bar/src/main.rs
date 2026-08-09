@@ -51,7 +51,10 @@
 //! children) only select. While that `mux` command is in flight a braille
 //! spinner replaces the row's `>` marker (col 1), so a slow focus shows work
 //! happening right where you clicked; it clears on the matching
-//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS). The wheel moves
+//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS). If that result
+//! carries a non-zero exit, `mux`'s own stderr becomes a red banner on the last
+//! row until the next dispatch succeeds — a cleared spinner alone looks
+//! identical whether the focus worked or not. The wheel moves
 //! the viewport without moving the cursor — load-bearing now that agentless
 //! sessions each cost two rows: a header below the fold has no agent row near it
 //! to navigate to, so without the wheel it would be unreachable.
@@ -258,6 +261,13 @@ struct State {
     /// Optimistic mark-seen overlay; effective = max(disk, overlay).
     seen_overlay: HashMap<String, i64>,
     seen_events_dir: Option<PathBuf>,
+    /// Last failed dispatch, rendered as a banner until the next one succeeds.
+    /// Without it a failed `mux focus-agent` is indistinguishable from a working
+    /// one — the spinner clears either way — so a click that silently does
+    /// nothing reads as the bar being broken rather than as `mux` reporting a
+    /// reason. That happened: a stale `mux` couldn't read a new readmodel field
+    /// and every click no-opped with the explanation sitting unread in stderr.
+    dispatch_error: Option<String>,
     /// Sids the user dismissed this session — hidden optimistically until the
     /// daemon drops them from the readmodel (or they go active again on resume).
     dismissed_overlay: HashSet<String>,
@@ -599,8 +609,19 @@ impl ZellijPlugin for State {
                 }
                 false
             },
-            Event::RunCommandResult(_, _, _, ctx) => {
+            Event::RunCommandResult(exit_code, _stdout, stderr, ctx) => {
                 // The dispatched `mux focus-agent` finished — stop its spinner.
+                // A non-zero exit means the focus didn't happen; surface `mux`'s
+                // own reason rather than dropping it, since the cleared spinner
+                // otherwise looks exactly like success.
+                self.dispatch_error = (exit_code != Some(0)).then(|| {
+                    let msg = String::from_utf8_lossy(&stderr);
+                    let msg = msg.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
+                    match msg.trim() {
+                        "" => format!("focus failed (exit {})", exit_code.unwrap_or(-1)),
+                        m => m.to_owned(),
+                    }
+                });
                 match ctx.get("session_id") {
                     Some(sid) => self.in_flight.remove(sid).is_some(),
                     None => false,
@@ -657,7 +678,24 @@ impl ZellijPlugin for State {
         let frame: Vec<String> = match action {
             Action::Diag(fg, msg) => diag_frame(&msg, fg, colors.bar_bg, rows, cols),
             Action::Attention(msg) => attention_frame(&msg, colors, rows, cols),
-            Action::Cells => self.cells_frame(rows, cols, &colors),
+            Action::Cells => {
+                // Appended, never prepended: `cells_frame` fills `row_ranges` with
+                // indices counted from the top, so a banner above the rows would
+                // shift every click target by one. It also can't replace the panel
+                // like the other diagnostics do — the rows you'd click to retry
+                // would be the ones it hid.
+                match &self.dispatch_error {
+                    None => self.cells_frame(rows, cols, &colors),
+                    Some(msg) => {
+                        let line = wrap_text(&format!("✗ {msg}"), cols.saturating_sub(1), 1)
+                            .pop()
+                            .unwrap_or_default();
+                        let mut frame = self.cells_frame(rows.saturating_sub(1), cols, &colors);
+                        frame.push(style!(colors.error, colors.bar_bg).paint(line).to_string());
+                        frame
+                    },
+                }
+            },
         };
 
         emit_frame(&frame, rows);
@@ -748,6 +786,10 @@ impl State {
             return;
         }
         if let Some(target) = self.focus_targets.get(sid).cloned() {
+            // Drop the previous failure as the new attempt starts, so a stale
+            // reason is never shown beside a live spinner. It comes back from
+            // this attempt's own result if this one fails too.
+            self.dispatch_error = None;
             self.in_flight.insert(sid.to_string(), 0);
             let _ = self.dispatch_focus_agent(&target, sid);
         }
