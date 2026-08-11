@@ -269,7 +269,7 @@ macro_rules! active_tab_and_connected_client_id_with_first_tab_fallback {
                         Err(err) => Err::<(), _>(err).non_fatal(),
                     }
                 } else {
-                    match $screen.get_indexed_tab_mut(0) {
+                    match $screen.first_tab_mut() {
                         Some(first_tab) => {
                             $closure(first_tab, None);
                         },
@@ -296,7 +296,7 @@ macro_rules! active_tab_and_connected_client_id_with_first_tab_fallback {
                         Err(err) => Err::<(), _>(err).non_fatal(),
                     }
                 } else {
-                    match $screen.get_indexed_tab_mut(0) {
+                    match $screen.first_tab_mut() {
                         Some(first_tab) => {
                             $closure(first_tab, None)?;
                         },
