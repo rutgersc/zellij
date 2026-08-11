@@ -691,6 +691,14 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
+    /// Paste text (using bracketed paste mode) and submit it with ENTER, in one round trip so
+    /// that nothing can be drawn or typed between the two.
+    Prompt {
+        chars: String,
+        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
     /// Send one or more keys to the terminal (e.g., "Ctrl a", "F1", "Alt Shift b")
     SendKeys {
         /// Keys to send as space-separated strings

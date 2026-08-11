@@ -1158,6 +1158,7 @@ impl TryFrom<Action> for ProtobufAction {
             Action::WriteToPaneId { .. }
             | Action::WriteCharsToPaneId { .. }
             | Action::Paste { .. }
+            | Action::Prompt { .. }
             | Action::GoToTabById { .. }
             | Action::CloseTabById { .. }
             | Action::RenameTabById { .. }

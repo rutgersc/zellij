@@ -286,6 +286,7 @@ message Action {
     ToggleHostFullscreenAction toggle_host_fullscreen = 146;
     FocusGuestSessionAction focus_guest_session = 147;
     PaneNameInputAction rename_active_pane = 148;
+    PromptAction prompt = 149;
   }
 }
 
@@ -416,6 +417,11 @@ message WriteCharsToPaneIdAction {
 }
 
 message PasteAction {
+  string chars = 1;
+  optional PaneId pane_id = 2;
+}
+
+message PromptAction {
   string chars = 1;
   optional PaneId pane_id = 2;
 }

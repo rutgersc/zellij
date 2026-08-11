@@ -203,6 +203,12 @@ pub enum Action {
         chars: String,
         pane_id: Option<PaneId>,
     },
+    /// Paste text using bracketed paste mode and submit it with ENTER, without yielding the
+    /// screen thread in between.
+    Prompt {
+        chars: String,
+        pane_id: Option<PaneId>,
+    },
     /// Switch to the specified input mode.
     SwitchToMode {
         input_mode: InputMode,
@@ -852,6 +858,22 @@ impl Action {
                     }
                 },
                 None => Ok(vec![Action::Paste {
+                    chars,
+                    pane_id: None,
+                }]),
+            },
+            CliAction::Prompt { chars, pane_id } => match pane_id {
+                Some(pane_id_str) => match PaneId::from_str(&pane_id_str) {
+                    Ok(parsed_pane_id) => Ok(vec![Action::Prompt {
+                        chars,
+                        pane_id: Some(parsed_pane_id),
+                    }]),
+                    Err(_e) => Err(format!(
+                        "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                        pane_id_str
+                    )),
+                },
+                None => Ok(vec![Action::Prompt {
                     chars,
                     pane_id: None,
                 }]),
