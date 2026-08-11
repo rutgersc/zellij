@@ -17,6 +17,7 @@ mod logging_pipe;
 mod mobile_web;
 pub mod nested_guest;
 mod pane_groups;
+mod first_tab;
 mod pane_nav;
 mod prompt;
 mod plugins;

@@ -11581,3 +11581,28 @@ fn attaching_web_watcher_follows_the_host_tab() {
         "watcher client mirrors the host tab"
     );
 }
+
+#[test]
+fn first_tab_is_resolved_when_no_tab_has_id_zero() {
+    // Requests with no client to answer them fall back to "the first tab". Tab ids are stable
+    // identifiers, not positions, so a session that has closed its leftmost tab has no tab with
+    // id 0 - asking for that id found nothing and the request was silently dropped.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+
+    new_tab(&mut screen, 1, 1);
+    new_tab(&mut screen, 2, 2);
+
+    assert!(
+        screen.get_indexed_tab_mut(0).is_none(),
+        "precondition: this session has no tab with id 0"
+    );
+    assert_eq!(
+        screen.first_tab_mut().map(|tab| tab.position),
+        Some(0),
+        "the leftmost tab that exists must still be resolvable"
+    );
+}
