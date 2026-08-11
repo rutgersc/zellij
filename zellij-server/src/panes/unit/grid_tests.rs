@@ -8674,3 +8674,39 @@ fn xtsmgraphics_geometry_reports_failure_when_host_does_not_support_sixel() {
     vte_parser.advance(&mut grid, b"\x1b[?2;1S");
     assert_eq!(grid.pending_messages_to_pty, vec![b"\x1b[?2;3;0S".to_vec()]);
 }
+
+#[test]
+fn dump_screen_joins_soft_wrapped_lines() {
+    // Reading a pane is how an agent gets a path or a JSON blob back out of it, and those are
+    // routinely longer than the pane is wide. The dump has to hand back one logical line, not
+    // one line per terminal row.
+    let mut vte_parser = vte::Parser::new();
+    let mut grid = Grid::new(
+        10,
+        20,
+        Rc::new(RefCell::new(Palette::default())),
+        Rc::new(RefCell::new(HashMap::new())),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(SixelImageStore::default())),
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        Style::default(),
+        false,
+        true,
+        true,
+        true,
+        false,
+    );
+    let long_line = "/very/long/path/segment".repeat(3); // 69 chars over a 20 column grid
+    vte_parser.advance(&mut grid, long_line.as_bytes());
+
+    let dump = grid.dump_screen(false);
+
+    assert_eq!(
+        dump.lines().count(),
+        1,
+        "expected one logical line, got {:?}",
+        dump
+    );
+    assert_eq!(dump, long_line);
+}
