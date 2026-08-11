@@ -7814,7 +7814,11 @@ pub(crate) fn screen_thread_main(
             ) => {
                 completion_tx.as_mut().map(|c| c.set_affected_pane_id(pid));
 
-                let blocking_notification = if set_blocking { completion_tx } else { None };
+                let blocking_notification = if set_blocking {
+                    completion_tx.take()
+                } else {
+                    None
+                };
 
                 match client_or_tab_index {
                     ClientTabIndexOrPaneId::ClientId(client_id)
@@ -7954,6 +7958,22 @@ pub(crate) fn screen_thread_main(
                         }
                     },
                 };
+                // Every placement path above gives up quietly when it cannot place the
+                // pane - an unknown tab or pane target, no client to split relative to, or
+                // a relayout the tab geometry cannot satisfy. The pty has already minted an
+                // id by then, so without this the CLI is handed the id of a pane that does
+                // not exist.
+                if !screen
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_pane_with_pid(&pid))
+                {
+                    log::error!("Failed to place new pane {:?}", pid);
+                    if let Some(ref mut c) = completion_tx {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Failed to place new pane {}", pid));
+                    }
+                }
                 if let Some(pending_events) = pending_events_waiting_for_pane.remove(&pid) {
                     for event in pending_events {
                         screen.bus.senders.send_to_screen(event).non_fatal();
@@ -8438,7 +8458,7 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 full,
                 pane_id,
-                completion_tx,
+                mut completion_tx,
                 cli_client_id,
                 ansi,
             ) => {
@@ -8447,8 +8467,10 @@ pub(crate) fn screen_thread_main(
                         // Write dump to file (existing behavior)
                         match pane_id {
                             Some(pane_id) => {
+                                let mut found = false;
                                 for tab in screen.get_tabs_mut().values_mut() {
                                     if tab.has_pane_with_pid(&pane_id) {
+                                        found = true;
                                         if ansi {
                                             tab.dump_with_ansi_terminal_screen(
                                                 Some(file_path.clone()),
@@ -8463,6 +8485,16 @@ pub(crate) fn screen_thread_main(
                                             )?;
                                         }
                                         break;
+                                    }
+                                }
+                                if !found {
+                                    log::error!("Pane with id {:?} not found", pane_id);
+                                    if let Some(ref mut c) = completion_tx {
+                                        c.set_exit_status(1);
+                                        c.set_error_message(format!(
+                                            "Pane with id {} not found",
+                                            pane_id
+                                        ));
                                     }
                                 }
                             },
@@ -8497,11 +8529,14 @@ pub(crate) fn screen_thread_main(
                     },
                     None => {
                         // Dump to STDOUT via Log
+                        let mut unresolved_pane_id = None;
                         let dump = match pane_id {
                             Some(pane_id) => {
                                 let mut result = String::new();
+                                let mut found = false;
                                 for tab in screen.get_tabs_mut().values_mut() {
                                     if tab.has_pane_with_pid(&pane_id) {
+                                        found = true;
                                         if ansi {
                                             if let Some(dump) = tab
                                                 .get_dump_with_ansi_terminal_screen(pane_id, full)
@@ -8517,6 +8552,9 @@ pub(crate) fn screen_thread_main(
                                         }
                                         break;
                                     }
+                                }
+                                if !found {
+                                    unresolved_pane_id = Some(pane_id);
                                 }
                                 result
                             },
@@ -8546,11 +8584,22 @@ pub(crate) fn screen_thread_main(
                                 result
                             },
                         };
-                        screen.bus.senders.send_to_server(ServerInstruction::Log(
-                            vec![dump],
-                            cli_client_id.unwrap_or(client_id),
-                            completion_tx,
-                        ))?;
+                        // An empty dump is ambiguous - a blank pane and a pane that does not
+                        // exist both look like a successful read of nothing. Only the second
+                        // one is a failure, so it never reaches the Log.
+                        if let Some(pane_id) = unresolved_pane_id {
+                            log::error!("Pane with id {:?} not found", pane_id);
+                            if let Some(ref mut c) = completion_tx {
+                                c.set_exit_status(1);
+                                c.set_error_message(format!("Pane with id {} not found", pane_id));
+                            }
+                        } else {
+                            screen.bus.senders.send_to_server(ServerInstruction::Log(
+                                vec![dump],
+                                cli_client_id.unwrap_or(client_id),
+                                completion_tx,
+                            ))?;
+                        }
                     },
                 }
             },
@@ -11130,26 +11179,44 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+            ScreenInstruction::WriteToPaneId(bytes, pane_id, mut _completion) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
+                        found = true;
                         tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
                             .non_fatal();
                         break;
                     }
                 }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = _completion {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {} not found", pane_id));
+                    }
+                }
                 screen.render(None)?;
             },
-            ScreenInstruction::Paste(bytes, pane_id, client_id, _completion) => {
+            ScreenInstruction::Paste(bytes, pane_id, client_id, mut _completion) => {
                 match pane_id {
                     Some(pane_id) => {
                         let all_tabs = screen.get_tabs_mut();
+                        let mut found = false;
                         for tab in all_tabs.values_mut() {
                             if tab.has_pane_with_pid(&pane_id) {
-                                tab.paste_to_pane_id(bytes, pane_id, _completion)
+                                found = true;
+                                tab.paste_to_pane_id(bytes, pane_id, _completion.take())
                                     .non_fatal();
                                 break;
+                            }
+                        }
+                        if !found {
+                            log::error!("Pane with id {:?} not found", pane_id);
+                            if let Some(ref mut c) = _completion {
+                                c.set_exit_status(1);
+                                c.set_error_message(format!("Pane with id {} not found", pane_id));
                             }
                         }
                     },
@@ -11158,7 +11225,7 @@ pub(crate) fn screen_thread_main(
                             screen,
                             client_id,
                             |tab: &mut Tab, _client_id: ClientId| {
-                                tab.paste_to_active_terminal(bytes, client_id, _completion)
+                                tab.paste_to_active_terminal(bytes, client_id, _completion.take())
                                     .non_fatal();
                             }
                         );
@@ -11181,11 +11248,13 @@ pub(crate) fn screen_thread_main(
                 bytes,
                 is_kitty,
                 pane_id,
-                _completion,
+                mut _completion,
             ) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
+                        found = true;
                         tab.write_to_pane_id(
                             &key_with_modifier,
                             bytes,
@@ -11196,6 +11265,13 @@ pub(crate) fn screen_thread_main(
                         )
                         .non_fatal();
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = _completion {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
