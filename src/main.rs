@@ -29,6 +29,10 @@ fn main() {
             commands::subscribe_to_session(subscribe_cli, opts.session, config);
             std::process::exit(0);
         }
+        if let Some(Command::Wait(wait_cli)) = opts.command {
+            commands::wait_in_session(wait_cli, opts.session, config);
+            std::process::exit(0);
+        }
         if let Some(Command::Sessions(Sessions::Run {
             command,
             direction,

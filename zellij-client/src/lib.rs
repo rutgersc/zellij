@@ -8,6 +8,7 @@ mod os_input_output_unix;
 mod os_input_output_windows;
 
 pub mod cli_client;
+pub mod wait_client;
 mod command_is_executing;
 mod input_handler;
 mod keyboard_parser;
