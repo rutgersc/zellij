@@ -2238,8 +2238,11 @@ pub(crate) fn route_action(
             }
         }
     }
+    // An id is only an answer if the action succeeded - reporting one alongside an error
+    // would have the CLI print an id the caller could then address.
+    let reported_an_error = result.error_message.is_some();
     // Return tab ID to CLI clients as plain text
-    if let Some(tab_id) = result.affected_tab_id {
+    if let Some(tab_id) = result.affected_tab_id.filter(|_| !reported_an_error) {
         if let Some(cli_client_id) = cli_client_id {
             if let Some(ref os_input) = os_input {
                 let _ = os_input.send_to_client(
@@ -2252,7 +2255,7 @@ pub(crate) fn route_action(
         }
     }
     // Return pane ID to CLI clients as plain text
-    if let Some(pane_id) = result.affected_pane_id {
+    if let Some(pane_id) = result.affected_pane_id.filter(|_| !reported_an_error) {
         if let Some(cli_client_id) = cli_client_id {
             if let Some(ref os_input) = os_input {
                 let _ = os_input.send_to_client(
