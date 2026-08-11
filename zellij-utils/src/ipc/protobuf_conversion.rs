@@ -1176,6 +1176,7 @@ impl From<crate::input::actions::Action>
             PaneIdWithPlugin,
             PaneNameInputAction,
             PasteAction,
+            PromptAction,
             PreviousSwapLayoutAction,
             PreviousSwapLayoutByTabIdAction,
             QueryTabNamesAction,
@@ -1278,6 +1279,12 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::Paste { chars, pane_id } => {
                 ActionType::Paste(PasteAction {
+                    chars,
+                    pane_id: pane_id.map(|p| p.into()),
+                })
+            },
+            crate::input::actions::Action::Prompt { chars, pane_id } => {
+                ActionType::Prompt(PromptAction {
                     chars,
                     pane_id: pane_id.map(|p| p.into()),
                 })
@@ -2221,6 +2228,10 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::Paste(paste_action) => Ok(crate::input::actions::Action::Paste {
                 chars: paste_action.chars,
                 pane_id: paste_action.pane_id.map(|p| p.try_into()).transpose()?,
+            }),
+            ActionType::Prompt(prompt_action) => Ok(crate::input::actions::Action::Prompt {
+                chars: prompt_action.chars,
+                pane_id: prompt_action.pane_id.map(|p| p.try_into()).transpose()?,
             }),
             ActionType::SwitchToMode(switch_mode_action) => {
                 Ok(crate::input::actions::Action::SwitchToMode {

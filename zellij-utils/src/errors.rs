@@ -401,6 +401,7 @@ pub enum ScreenContext {
     EditScrollbackForPaneWithId,
     WriteToPaneId,
     Paste,
+    Prompt,
     SetPaneColor,
     WriteKeyToPaneId,
     CopyTextToClipboard,

@@ -803,6 +803,7 @@ pub enum ScreenInstruction {
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
     WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
     Paste(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
+    Prompt(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
     SetPaneColor(
         PaneId,
         Option<String>,
@@ -1178,6 +1179,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             },
             ScreenInstruction::WriteToPaneId(..) => ScreenContext::WriteToPaneId,
             ScreenInstruction::Paste(..) => ScreenContext::Paste,
+            ScreenInstruction::Prompt(..) => ScreenContext::Prompt,
             ScreenInstruction::SetPaneColor(..) => ScreenContext::SetPaneColor,
             ScreenInstruction::WriteKeyToPaneId(..) => ScreenContext::WriteKeyToPaneId,
             ScreenInstruction::CopyTextToClipboard(..) => ScreenContext::CopyTextToClipboard,
@@ -11226,6 +11228,40 @@ pub(crate) fn screen_thread_main(
                             client_id,
                             |tab: &mut Tab, _client_id: ClientId| {
                                 tab.paste_to_active_terminal(bytes, client_id, _completion.take())
+                                    .non_fatal();
+                            }
+                        );
+                    },
+                }
+                screen.render(None)?;
+            },
+            ScreenInstruction::Prompt(bytes, pane_id, client_id, mut _completion) => {
+                match pane_id {
+                    Some(pane_id) => {
+                        let all_tabs = screen.get_tabs_mut();
+                        let mut found = false;
+                        for tab in all_tabs.values_mut() {
+                            if tab.has_pane_with_pid(&pane_id) {
+                                found = true;
+                                tab.prompt_to_pane_id(bytes, pane_id, _completion.take())
+                                    .non_fatal();
+                                break;
+                            }
+                        }
+                        if !found {
+                            log::error!("Pane with id {:?} not found", pane_id);
+                            if let Some(ref mut c) = _completion {
+                                c.set_exit_status(1);
+                                c.set_error_message(format!("Pane with id {} not found", pane_id));
+                            }
+                        }
+                    },
+                    None => {
+                        active_tab_and_connected_client_id!(
+                            screen,
+                            client_id,
+                            |tab: &mut Tab, _client_id: ClientId| {
+                                tab.prompt_to_active_terminal(bytes, client_id, _completion.take())
                                     .non_fatal();
                             }
                         );
