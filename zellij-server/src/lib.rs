@@ -18,6 +18,7 @@ mod mobile_web;
 pub mod nested_guest;
 mod pane_groups;
 mod pane_nav;
+mod prompt;
 mod plugins;
 mod pty;
 mod pty_writer;
