@@ -76,9 +76,14 @@ fn send_action(requested_session: Option<String>, cli_action: CliAction) {
             process::exit(2);
         });
 
+    if !sessions::session_exists(&session).unwrap_or(false) {
+        eprintln!("zellijctl: no live session named '{session}'");
+        process::exit(1);
+    }
+
     let os_input = get_cli_client_os_input().unwrap_or_else(|e| {
         eprintln!("zellijctl: failed to acquire client os input: {e}");
         process::exit(2);
     });
-    start_cli_client(Box::new(os_input), &session, actions);
+    process::exit(start_cli_client(Box::new(os_input), &session, actions));
 }

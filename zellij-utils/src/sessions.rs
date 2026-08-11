@@ -971,6 +971,13 @@ pub fn delete_session(name: &str, force: bool) {
 }
 
 pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
+    process::exit(print_active_sessions(no_formatting, short, reverse));
+}
+
+/// Same listing as [`list_sessions`], but returns the exit code instead of
+/// exiting. Callers that print the listing as *context* for a failure of their
+/// own need to keep their own exit code.
+pub fn print_active_sessions(no_formatting: bool, short: bool, reverse: bool) -> i32 {
     // Liveness is derived from the socket namespace, so a registry row whose
     // server is gone can never be reported as live — it is invisible rather
     // than wrong. There is nothing for the user to act on, so `ls` omits those
@@ -1014,14 +1021,13 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
             output.push((name, duration, SessionDisplayStatus::Resurrectable));
         }
     }
-    let exit_code = if output.is_empty() {
+    if output.is_empty() {
         eprintln!("No active zellij sessions found.");
         1
     } else {
         print_sessions(output, no_formatting, short, reverse);
         0
-    };
-    process::exit(exit_code);
+    }
 }
 
 #[derive(Debug, Clone)]
