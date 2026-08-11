@@ -137,6 +137,34 @@ pub enum Command {
         "zellij [--session <OTHER SESSION NAME>] subscribe [OPTIONS] --pane-id..."
     ))]
     Subscribe(SubscribeCli),
+    /// Block until a pane's output matches a pattern
+    #[clap(override_usage(
+        "zellij [--session <OTHER SESSION NAME>] wait --pane-id <PANE ID> <--regex <REGEX>|--match <TEXT>>"
+    ))]
+    Wait(WaitCli),
+}
+
+#[derive(Debug, Parser, Clone, Serialize, Deserialize)]
+pub struct WaitCli {
+    /// Pane ID to watch (e.g. terminal_1, plugin_2, or bare number like 1)
+    #[clap(short, long, required = true)]
+    pub pane_id: String,
+
+    /// Succeed once this regular expression matches the pane's contents
+    #[clap(short, long, required_unless_present("match_text"))]
+    pub regex: Option<String>,
+
+    /// Succeed once the pane's contents contain this literal text
+    #[clap(short, long = "match", value_name = "TEXT")]
+    pub match_text: Option<String>,
+
+    /// Give up after this many milliseconds. Omit to wait indefinitely.
+    #[clap(short, long)]
+    pub timeout: Option<u64>,
+
+    /// Print the lines that matched
+    #[clap(long)]
+    pub print_match: bool,
 }
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]

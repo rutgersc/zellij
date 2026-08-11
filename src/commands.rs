@@ -466,12 +466,10 @@ pub(crate) fn send_action_to_session(
         },
     };
 }
-pub(crate) fn subscribe_to_session(
-    subscribe_cli: zellij_utils::cli::SubscribeCli,
-    requested_session_name: Option<String>,
-    _config: Option<Config>,
-) {
-    let session_name = match get_active_session() {
+/// Resolves which live session a read-only CLI command should talk to, or exits describing
+/// why it cannot. `purpose` completes the sentence "Please specify the session name to ...".
+fn resolve_target_session(requested_session_name: Option<String>, purpose: &str) -> String {
+    match get_active_session() {
         ActiveSession::None => {
             eprintln!("There is no active session!");
             std::process::exit(1);
@@ -509,12 +507,34 @@ pub(crate) fn subscribe_to_session(
             } else if let Ok(session_name) = envs::get_session_name() {
                 session_name
             } else {
-                eprintln!("Please specify the session name to subscribe to. The following sessions are active:");
+                eprintln!("Please specify the session name to {purpose}. The following sessions are active:");
                 print_active_sessions(false, false, true);
                 std::process::exit(1);
             }
         },
-    };
+    }
+}
+
+pub(crate) fn wait_in_session(
+    wait_cli: zellij_utils::cli::WaitCli,
+    requested_session_name: Option<String>,
+    _config: Option<Config>,
+) {
+    let session_name = resolve_target_session(requested_session_name, "wait in");
+    let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
+    std::process::exit(zellij_client::wait_client::start_wait_client(
+        Box::new(os_input),
+        &session_name,
+        wait_cli,
+    ));
+}
+
+pub(crate) fn subscribe_to_session(
+    subscribe_cli: zellij_utils::cli::SubscribeCli,
+    requested_session_name: Option<String>,
+    _config: Option<Config>,
+) {
+    let session_name = resolve_target_session(requested_session_name, "subscribe to");
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     zellij_client::cli_client::start_subscribe_client(
         Box::new(os_input),
