@@ -194,14 +194,17 @@ fn serialize_tiled_pane(
             .entries_mut()
             .push(KdlEntry::new_prop("default_bg", bg.to_owned()));
     }
+    let env = extract_env(&layout.run);
     let has_child_attributes = !layout.children.is_empty()
         || layout.external_children_index.is_some()
         || !args.is_empty()
+        || !env.is_empty()
         || plugin.is_some()
         || command.is_some();
     if has_child_attributes {
         let mut tiled_pane_node_children = KdlDocument::new();
         serialize_args(args, &mut tiled_pane_node_children);
+        serialize_env(&env, &mut tiled_pane_node_children);
         serialize_start_suspended(&command, &mut tiled_pane_node_children);
         serialize_plugin(plugin, plugin_config, &mut tiled_pane_node_children);
         if layout.children.is_empty() && layout.external_children_index.is_some() {
@@ -319,6 +322,31 @@ fn serialize_pane_title_and_attributes(
 
             pane_contents.insert(file_name, initial_pane_contents.clone());
         }
+    }
+}
+
+fn serialize_env(env: &BTreeMap<String, Option<String>>, pane_node_children: &mut KdlDocument) {
+    if env.is_empty() {
+        return;
+    }
+    let mut env_node = KdlNode::new("env");
+    let mut env_node_children = KdlDocument::new();
+    for (key, value) in env {
+        let mut variable_node = KdlNode::new(key.as_str());
+        variable_node.entries_mut().push(match value {
+            Some(value) => KdlEntry::new(value.to_owned()),
+            None => KdlEntry::new(KdlValue::Null),
+        });
+        env_node_children.nodes_mut().push(variable_node);
+    }
+    env_node.set_children(env_node_children);
+    pane_node_children.nodes_mut().push(env_node);
+}
+
+pub fn extract_env(layout_run: &Option<Run>) -> BTreeMap<String, Option<String>> {
+    match layout_run {
+        Some(Run::Command(run_command)) => run_command.env.clone(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -684,6 +712,7 @@ fn serialize_floating_pane(
     serialize_start_suspended(&command, &mut floating_pane_node_children);
     serialize_floating_layout_attributes(&layout, &mut floating_pane_node_children);
     serialize_args(args, &mut floating_pane_node_children);
+    serialize_env(&extract_env(&layout.run), &mut floating_pane_node_children);
     serialize_plugin(plugin, plugin_config, &mut floating_pane_node_children);
     floating_pane_node.set_children(floating_pane_node_children);
     floating_pane_node

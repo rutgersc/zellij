@@ -74,6 +74,7 @@ impl<'a> KdlLayoutParser<'a> {
             || word == "children"
             || word == "tab"
             || word == "args"
+            || word == "env"
             || word == "close_on_exit"
             || word == "start_suspended"
             || word == "borderless"
@@ -97,6 +98,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "edit"
             || property_name == "cwd"
             || property_name == "args"
+            || property_name == "env"
             || property_name == "close_on_exit"
             || property_name == "start_suspended"
             || property_name == "split_direction"
@@ -118,6 +120,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "edit"
             || property_name == "cwd"
             || property_name == "args"
+            || property_name == "env"
             || property_name == "close_on_exit"
             || property_name == "start_suspended"
             || property_name == "x"
@@ -407,6 +410,41 @@ impl<'a> KdlLayoutParser<'a> {
             None => Ok(None),
         }
     }
+    fn parse_env(
+        &self,
+        pane_node: &KdlNode,
+    ) -> Result<BTreeMap<String, Option<String>>, ConfigError> {
+        let mut env = BTreeMap::new();
+        let Some(kdl_env) = kdl_get_child!(pane_node, "env") else {
+            return Ok(env);
+        };
+        let Some(entries) = kdl_children_nodes!(kdl_env) else {
+            return Err(kdl_parsing_error!(
+                format!("env cannot be empty and should contain one or more variables (eg. env {{ FOO \"bar\"; BAZ null }})"),
+                kdl_env
+            ));
+        };
+        for entry in entries {
+            let name = kdl_name!(entry).to_string();
+            let value = match entry.entries().first().map(|e| e.value()) {
+                // `null` removes the variable rather than setting it empty
+                Some(KdlValue::Null) => None,
+                Some(KdlValue::String(value)) => Some(value.clone()),
+                Some(other) => Some(other.to_string()),
+                None => {
+                    return Err(kdl_parsing_error!(
+                        format!(
+                            "env variable {} needs a value (eg. {} \"bar\") or null to remove it",
+                            name, name
+                        ),
+                        entry
+                    ))
+                },
+            };
+            env.insert(name, value);
+        }
+        Ok(env)
+    }
     fn cwd_prefix(&self, tab_cwd: Option<&PathBuf>) -> Result<Option<PathBuf>, ConfigError> {
         Ok(match (&self.global_cwd, tab_cwd) {
             (Some(global_cwd), Some(tab_cwd)) => Some(global_cwd.join(tab_cwd)),
@@ -437,6 +475,7 @@ impl<'a> KdlLayoutParser<'a> {
         let edit = self.parse_path(pane_node, "edit")?;
         let cwd = self.parse_path(pane_node, "cwd")?;
         let args = self.parse_args(pane_node)?;
+        let env = self.parse_env(pane_node)?;
         let close_on_exit =
             kdl_get_bool_property_or_child_value_with_error!(pane_node, "close_on_exit");
         let start_suspended =
@@ -460,6 +499,7 @@ impl<'a> KdlLayoutParser<'a> {
                 cwd,
                 hold_on_close,
                 hold_on_start,
+                env,
                 ..Default::default()
             }))),
             (None, Some(edit), Some(cwd)) => {
@@ -2457,10 +2497,12 @@ impl<'a> KdlLayoutParser<'a> {
             .filter(|n| kdl_name!(n) == "layout")
             .count()
             > 1;
-        let mut non_layout_nodes_in_root = kdl_layout
-            .nodes()
-            .iter()
-            .filter(|n| kdl_name!(n) != "layout" && self.is_a_reserved_word(kdl_name!(n)));
+        // `env` is reserved so a pane's own env block isn't read as a pane_template,
+        // but it is also a legitimate root node - the session-wide environment
+        let mut non_layout_nodes_in_root = kdl_layout.nodes().iter().filter(|n| {
+            let name = kdl_name!(n);
+            name != "layout" && name != "env" && self.is_a_reserved_word(name)
+        });
         if let Some(first_non_layout_node) = non_layout_nodes_in_root.next() {
             return Err(ConfigError::new_layout_kdl_error(
                 "This node should be inside the main \"layout\" node".into(),

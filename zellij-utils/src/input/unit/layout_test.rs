@@ -451,6 +451,44 @@ fn layout_with_command_panes() {
 }
 
 #[test]
+fn layout_with_command_panes_and_env() {
+    let kdl_layout = r#"
+        layout {
+            pane command="htop" {
+                env {
+                    EDITOR "nvim"
+                    INHERITED_VAR null
+                }
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    let expected_env = std::collections::BTreeMap::from([
+        ("EDITOR".to_owned(), Some("nvim".to_owned())),
+        ("INHERITED_VAR".to_owned(), None),
+    ]);
+    let expected_layout = Layout {
+        template: Some((
+            TiledPaneLayout {
+                children: vec![TiledPaneLayout {
+                    run: Some(Run::Command(RunCommand {
+                        command: PathBuf::from("htop"),
+                        hold_on_close: true,
+                        env: expected_env,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            vec![],
+        )),
+        ..Default::default()
+    };
+    assert_eq!(layout, expected_layout);
+}
+
+#[test]
 fn layout_with_command_panes_and_cwd() {
     let kdl_layout = r#"
         layout {

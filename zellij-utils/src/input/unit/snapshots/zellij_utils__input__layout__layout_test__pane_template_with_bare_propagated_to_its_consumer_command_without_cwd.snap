@@ -1,7 +1,7 @@
 ---
 source: zellij-utils/src/input/./unit/layout_test.rs
-assertion_line: 1668
-expression: "format!(\"{:#?}\", layout)"
+assertion_line: 1719
+expression: "normalize_layout_debug(format!(\"{:#?}\", layout))"
 ---
 Layout {
     tabs: [
@@ -28,6 +28,7 @@ Layout {
                                     hold_on_start: false,
                                     originating_plugin: None,
                                     use_terminal_title: false,
+                                    env: {},
                                 },
                             ),
                         ),
@@ -89,6 +90,7 @@ Layout {
                                     hold_on_start: false,
                                     originating_plugin: None,
                                     use_terminal_title: false,
+                                    env: {},
                                 },
                             ),
                         ),
