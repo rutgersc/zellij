@@ -2004,6 +2004,7 @@ fn test_client_messages() {
                     hold_on_start: false,
                     originating_plugin: None,
                     use_terminal_title: true,
+                    env: Default::default(),
                 })),
                 ..Default::default()
             }),
@@ -2035,6 +2036,7 @@ fn test_client_messages() {
                         context: empty_context.clone(),
                     }),
                     use_terminal_title: true,
+                    env: Default::default(),
                 })),
                 ..Default::default()
             }),

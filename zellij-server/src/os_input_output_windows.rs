@@ -245,19 +245,28 @@ fn build_command_line(cmd: &RunCommand) -> Vec<u16> {
 /// Build a UTF-16 environment block (each entry `KEY=VALUE\0`, terminated by
 /// an extra `\0`) from the current process environment, adding
 /// `ZELLIJ_PANE_ID`.
-fn build_environment_block(terminal_id: u32) -> Vec<u16> {
+fn build_environment_block(
+    terminal_id: u32,
+    overrides: &BTreeMap<String, Option<String>>,
+) -> Vec<u16> {
     let mut block: Vec<u16> = Vec::new();
-    for (key, value) in std::env::vars() {
-        if key == "ZELLIJ_PANE_ID" {
-            continue;
-        }
-        let entry = format!("{}={}", key, value);
+    let mut push = |entry: String| {
         block.extend(OsStr::new(&entry).encode_wide());
         block.push(0);
+    };
+    for (key, value) in std::env::vars() {
+        if key == "ZELLIJ_PANE_ID" || overrides.contains_key(&key) {
+            continue;
+        }
+        push(format!("{}={}", key, value));
     }
-    let pane_entry = format!("ZELLIJ_PANE_ID={}", terminal_id);
-    block.extend(OsStr::new(&pane_entry).encode_wide());
-    block.push(0);
+    for (key, value) in overrides {
+        // a `None` override drops the variable entirely rather than emptying it
+        if let Some(value) = value {
+            push(format!("{}={}", key, value));
+        }
+    }
+    push(format!("ZELLIJ_PANE_ID={}", terminal_id));
     block.push(0); // double-null terminator
     block
 }
@@ -381,7 +390,7 @@ fn spawn_child_process(
 
     // --- command line & environment ---
     let mut cmd_line = build_command_line(cmd);
-    let env_block = build_environment_block(terminal_id);
+    let env_block = build_environment_block(terminal_id, &cmd.env);
 
     let cwd: Option<Vec<u16>> = cmd.cwd.as_ref().and_then(|p| {
         if p.exists() && p.is_dir() {

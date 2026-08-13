@@ -1,6 +1,7 @@
 //! Trigger a command
 use crate::data::{Direction, OriginatingPlugin};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -72,6 +73,11 @@ pub struct RunCommand {
     pub originating_plugin: Option<OriginatingPlugin>,
     #[serde(default)]
     pub use_terminal_title: bool,
+    /// Environment overrides for the spawned process. `None` removes an
+    /// inherited variable, which a plain `KEY=""` cannot express - a child that
+    /// only tests for presence still sees an empty string as set.
+    #[serde(default)]
+    pub env: BTreeMap<String, Option<String>>,
 }
 
 impl std::fmt::Display for RunCommand {
@@ -121,6 +127,8 @@ impl From<RunCommandAction> for RunCommand {
             hold_on_start: action.hold_on_start,
             originating_plugin: action.originating_plugin,
             use_terminal_title: action.use_terminal_title,
+            // env overrides only reach a command through a layout
+            env: Default::default(),
         }
     }
 }
