@@ -221,6 +221,13 @@ fn handle_openpty(
                 );
             }
         }
+        for (key, value) in &cmd.env {
+            // a `None` override drops the variable entirely rather than emptying it
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
         command
             .args(&cmd.args)
             .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
