@@ -16,7 +16,7 @@
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
-//! attention/waiting (yellow, red if unknown), in-view (green), and selection
+//! attention/waiting (yellow, red if unknown and unattended), in-view (green), and selection
 //! (grey) each claim columns by priority, so combinations layer rather than
 //! overwrite (see the palette block below). `✗` after the session header marks
 //! agents missing a `zellij_pane_id`; `⧉` marks a session some *other* terminal
@@ -114,12 +114,14 @@ const SESSIONLESS_LABEL: &str = "sessionless";
 //   col 3 name → selected grey · else alert (yellow/red) · else in-view green
 //                · else neutral.   (selection outranks everything on the body,
 //                so a highlighted row is unmissable even when green/yellow.)
+// Within alert, needs-attention outranks unknown: red is the unattended shade,
+// yellow claims the row the moment it actually wants you.
 //
 // Name fg: selection overrides the status hue (selected-fg on selected-bg is a
 // high-contrast pair); otherwise it encodes status, picking a hue legible on
 // its body bg:
 //   busy    → magenta (reads on neutral/green/yellow alike).
-//   unknown → on-colour (its body is red).
+//   unknown → on-colour (its body is red, or yellow once it needs attention).
 //   idle /  → text on a neutral body, on-colour on a green/yellow body
 //   waiting    (colourless states carry no hue to lose).
 // The `>` marker rides on col 1 (the middle): selection wins first (selected-fg,
@@ -204,8 +206,6 @@ impl AgentColors {
 struct SessionMeta {
     /// Attached clients. Past our own, another terminal window holds it.
     clients: usize,
-    /// Wall-clock creation, derived from the age `get_session_list()` reports.
-    created_ms: i64,
 }
 
 /// What a rendered row routes to when clicked.
@@ -847,23 +847,11 @@ impl State {
     /// Pull the live session list. Also pushes a fresh SessionUpdate to every
     /// plugin as a side effect, so this doubles as the panel's session refresh.
     fn refresh_sessions(&mut self) -> bool {
-        let now = now_ms();
         let new: HashMap<String, SessionMeta> = match get_session_list() {
             Ok(snapshot) => snapshot
                 .live_sessions
                 .into_iter()
-                .map(|s| {
-                    // `creation_time` is an AGE, not an epoch. Derive the absolute
-                    // key once and then keep it: the reported age is truncated to
-                    // whole seconds, so recomputing it every poll would jitter the
-                    // group order and make every poll look like a change.
-                    let created_ms = self
-                        .sessions
-                        .get(&s.name)
-                        .map(|m| m.created_ms)
-                        .unwrap_or_else(|| now - s.creation_time.as_millis() as i64);
-                    (s.name, SessionMeta { clients: s.connected_clients, created_ms })
-                })
+                .map(|s| (s.name, SessionMeta { clients: s.connected_clients }))
                 .collect(),
             // Only fails when the server's session-scan state is missing, which
             // can't recover — drop the list rather than keep asserting stale
@@ -1098,10 +1086,6 @@ impl State {
 struct Group {
     label: GroupLabel,
     rows: Vec<Row>,
-    /// Earliest agent `started_at_ms` in the group — the session's creation
-    /// time. Used as the group's sort key so its slot stays put as later
-    /// agents come and go.
-    created_ms: i64,
     any_unrouted: bool,
 }
 
@@ -1215,16 +1199,6 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
         .into_iter()
         .map(|(key, mut tops)| {
             tops.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
-            // Sort key is the zellij SESSION's creation time, so agentless and
-            // agentful groups compare on one clock. A session that has left the
-            // live list (only tracked-but-inactive agents remain) keeps its slot
-            // from its earliest agent instead.
-            let created_ms = key
-                .as_ref()
-                .and_then(|s| sessions.get(s))
-                .map(|m| m.created_ms)
-                .or_else(|| tops.iter().map(|a| a.started_at_ms).min())
-                .unwrap_or(i64::MAX);
             let any_unrouted = tops.iter().any(|a| a.zellij_pane_id.is_none());
             let label = match &key {
                 Some(s) => GroupLabel::Session(s.clone()),
@@ -1237,23 +1211,28 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
                     Row { agent: t, is_child: false, is_last_child: false, focus_sid: Some(sid) }
                 })
                 .collect();
-            Group { label, rows, created_ms, any_unrouted }
+            Group { label, rows, any_unrouted }
         })
         .collect();
 
-    // Sessionless after named sessions; otherwise oldest-first.
+    // Sessionless after named sessions; otherwise alphabetical by session name.
+    // Ordering on the name and nothing else is what keeps a group's slot fixed:
+    // any time-derived key moves when a session drops out of one poll and gets
+    // re-derived from the second-truncated age zellij reports.
     groups.sort_by(|a, b| match (&a.label, &b.label) {
         (GroupLabel::Sessionless, GroupLabel::Sessionless) => std::cmp::Ordering::Equal,
         (GroupLabel::Sessionless, _) => std::cmp::Ordering::Greater,
         (_, GroupLabel::Sessionless) => std::cmp::Ordering::Less,
-        _ => a.created_ms.cmp(&b.created_ms),
+        _ => {
+            let (a, b) = (a.label.as_str(), b.label.as_str());
+            a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
+        },
     });
 
     // Background agents → one trailing section, flat top-level rows, select-only.
     let mut bg: Vec<Agent> = agents.iter().filter(|a| is_bg(a)).cloned().collect();
     if !bg.is_empty() {
         bg.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
-        let created_ms = bg.iter().map(|a| a.started_at_ms).min().unwrap_or(i64::MAX);
         let rows = bg
             .into_iter()
             .map(|a| Row { agent: a, is_child: false, is_last_child: false, focus_sid: None })
@@ -1261,7 +1240,6 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
         groups.push(Group {
             label: GroupLabel::BackgroundAgents,
             rows,
-            created_ms,
             any_unrouted: false,
         });
     }
@@ -1545,9 +1523,15 @@ fn render_agent_line(
     // Per-column priority stack (see the palette block at the top of this
     // file). `alert` = needs-attention / waiting / unknown; it shows yellow,
     // or red when the status itself is unknown.
+    //
+    // needs-attention outranks unknown-red. A `shell` status is unknown and
+    // never changes while a shell owns the terminal (Claude stops writing the
+    // heartbeat), so an always-red row would swallow the one signal that still
+    // arrives for it — the Stop hook's attention event. Red keeps meaning "not
+    // reporting"; yellow overrides with "and it wants you now".
     let is_unknown = !dead && matches!(status, AgentStatus::Unknown(_));
     let alert = !dead && (needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown);
-    let alert_color = if is_unknown { colors.error } else { colors.yellow };
+    let alert_color = if is_unknown && !needs_attention { colors.error } else { colors.yellow };
     let in_view = is_in_view && !dead;
 
     // Selection is the dominant signal: when a row is selected it claims the
