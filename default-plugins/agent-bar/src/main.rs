@@ -12,11 +12,16 @@
 //! a slot doesn't drift; a session that has left the live list keeps its slot
 //! from its earliest agent's `started_at_ms`. Agents within a group are ordered
 //! by `started_at_ms` asc. Groups are bucketed by host: zellij sessions first,
-//! then herdr workspaces, then "ambiguous host" (both multiplexers claimed the
-//! agent — see `AgentHost::Ambiguous`), then "sessionless" for agents in no
-//! multiplexer at all. Only zellij groups are pre-seeded from the live session
-//! list; a herdr workspace appears only once an agent reports itself in it,
-//! since the plugin can't reach herdr's socket from the wasm sandbox.
+//! then one "herdr" group holding every herdr agent regardless of workspace,
+//! then "ambiguous host" (both multiplexers claimed the agent — see
+//! `AgentHost::Ambiguous`), then "sessionless" for agents in no multiplexer at
+//! all. Only zellij groups are pre-seeded from the live session list; the herdr
+//! group appears only once an agent reports itself there, since the plugin
+//! can't reach herdr's socket from the wasm sandbox.
+//!
+//! Herdr rows never take the yellow attention tint — herdr raises that signal in
+//! its own UI, and this bar can't focus the pane to clear it, so repeating it
+//! would be a second alert for one event with no way to dismiss it here.
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
@@ -110,6 +115,7 @@ const OUTER_PAD: usize = 1;
 const AGENT_INDENT: usize = 2;
 const SESSIONLESS_LABEL: &str = "sessionless";
 const AMBIGUOUS_LABEL: &str = "ambiguous host";
+const HERDR_LABEL: &str = "herdr";
 
 // Agent-state palette — a shared colour vocabulary (agent-bar today, the mux
 // session picker later). Concurrent states are composited as a PER-COLUMN
@@ -958,7 +964,12 @@ impl State {
             // re-raises it with a fresh `attention_at_ms`. Without this the
             // alert lingers when you type on a pane you're already viewing (the
             // done→busy flip has no acknowledge path of its own).
+            // Herdr raises its own attention signal for its agents, so repeating
+            // it here would be a second alert for one event — in a bar that can't
+            // even focus the pane to clear it. Only hosts with no UI of their own
+            // get the yellow. Ambiguous keeps it: no host owns those rows.
             let unseen = agent.active
+                && !matches!(agent.host, AgentHost::Herdr(_))
                 && !matches!(agent.status, AgentStatus::Busy)
                 && agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
@@ -1156,10 +1167,12 @@ struct Row {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum GroupLabel {
     Session(String),
-    /// A herdr workspace. Unlike zellij sessions these are never pre-seeded —
-    /// the plugin can't reach herdr's socket from the wasm sandbox, so a
-    /// workspace only appears once an agent reports itself in it.
-    HerdrWorkspace(String),
+    /// Every herdr agent, in one group regardless of workspace. Splitting by
+    /// workspace would mirror a layout this bar can't navigate to — herdr owns
+    /// that view, and rows here are never zellij-routable — so the workspace is
+    /// noise. Appears only once an agent reports itself in herdr; the plugin
+    /// can't reach herdr's socket from the wasm sandbox to pre-seed it.
+    Herdr,
     /// Agents whose host couldn't be determined because both zellij and herdr
     /// env vars were present. Its own group so the conflict is visible instead
     /// of silently landing in someone's session.
@@ -1176,7 +1189,7 @@ impl GroupLabel {
     fn as_str(&self) -> &str {
         match self {
             GroupLabel::Session(s) => s.as_str(),
-            GroupLabel::HerdrWorkspace(w) => w.as_str(),
+            GroupLabel::Herdr => HERDR_LABEL,
             GroupLabel::Ambiguous => AMBIGUOUS_LABEL,
             GroupLabel::Sessionless => SESSIONLESS_LABEL,
             GroupLabel::BackgroundAgents => "bg agents",
@@ -1189,7 +1202,7 @@ impl GroupLabel {
     fn rank(&self) -> u8 {
         match self {
             GroupLabel::Session(_) => 0,
-            GroupLabel::HerdrWorkspace(_) => 1,
+            GroupLabel::Herdr => 1,
             GroupLabel::Ambiguous => 2,
             GroupLabel::Sessionless => 3,
             GroupLabel::BackgroundAgents => 4,
@@ -1261,7 +1274,7 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
 
     let key_of = |a: &Agent| match &a.host {
         AgentHost::Zellij(z) => GroupLabel::Session(z.session.clone()),
-        AgentHost::Herdr(h) => GroupLabel::HerdrWorkspace(h.workspace.clone()),
+        AgentHost::Herdr(_) => GroupLabel::Herdr,
         AgentHost::Ambiguous { .. } => GroupLabel::Ambiguous,
         AgentHost::Unattached => GroupLabel::Sessionless,
     };
