@@ -905,22 +905,6 @@ impl Pane for PluginPane {
                         Event::Mouse(Mouse::Hover(event.position.line(), event.position.column())),
                     )]));
             },
-            // Fork addition: `handle_right_click` below is the old mouse
-            // pipeline's entry point and has had no callers since the rework
-            // into `mouse_handler`, which routes a right press to the focused
-            // pane as `SendToTerminal` — i.e. through here.
-            MouseEventType::Press if event.right => {
-                let _ = self
-                    .send_plugin_instructions
-                    .send(PluginInstruction::Update(vec![(
-                        Some(self.pid),
-                        Some(client_id),
-                        Event::Mouse(Mouse::RightClick(
-                            event.position.line() as isize,
-                            event.position.column(),
-                        )),
-                    )]));
-            },
             _ => {},
         }
         None

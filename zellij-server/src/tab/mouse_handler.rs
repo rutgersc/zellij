@@ -120,15 +120,6 @@ enum MouseAction {
         pane_id: PaneId,
         position: Position,
     },
-    /// Fork addition: focus a plugin pane and hand it the same right press, so
-    /// its menu opens on one click. Distinct from `FocusPaneAndClickThrough`,
-    /// which is left-press shaped — it routes a non-mouse-grabbing pane through
-    /// `start_selection`, which a plugin receives as a *left* click.
-    FocusPaneAndRightPress {
-        pane_id: PaneId,
-        position: Position,
-        event: MouseEvent,
-    },
     FocusPaneAndClickThrough {
         pane_id: PaneId,
         position: Position,
@@ -775,11 +766,6 @@ impl MouseHandler {
                 pane_id: _,
                 position,
             } => Self::execute_focus_pane(tab, position, client_id),
-            MouseAction::FocusPaneAndRightPress {
-                pane_id: _,
-                position,
-                event,
-            } => Self::execute_focus_pane_and_right_press(tab, position, event, client_id),
             MouseAction::FocusPaneAndClickThrough {
                 pane_id: _,
                 position,
@@ -959,35 +945,6 @@ impl MouseHandler {
         } else {
             Ok(MouseEffect::default())
         }
-    }
-
-    fn execute_focus_pane_and_right_press(
-        tab: &mut Tab,
-        position: Position,
-        event: MouseEvent,
-        client_id: ClientId,
-    ) -> Result<MouseEffect> {
-        let err_context = || "failed to focus pane and deliver right press";
-
-        clear_hover_for_client(tab, client_id);
-        Self::focus_pane_at(tab, &position, client_id).with_context(err_context)?;
-
-        let active_pane_id = tab
-            .get_active_pane_id(client_id)
-            .ok_or_else(|| anyhow!("Failed to find active pane"))
-            .with_context(err_context)?;
-        let pane = tab
-            .get_pane_with_id(active_pane_id)
-            .ok_or_else(|| anyhow!("Failed to find pane {active_pane_id:?}"))
-            .with_context(err_context)?;
-
-        let mut event_for_pane = event;
-        event_for_pane.position = pane.relative_position(&event.position);
-        // A plugin answers None and delivers the event over its own channel;
-        // nothing is written back to a terminal on this path.
-        let _ = pane.mouse_event(&event_for_pane, client_id);
-
-        Ok(MouseEffect::state_changed())
     }
 
     fn execute_focus_pane_and_click_through(
@@ -1542,25 +1499,6 @@ impl MouseHandler {
                     event: *event,
                 });
             }
-            // Fork addition: give an unfocused plugin the same first-click
-            // treatment the left-press path grants, so a right-click menu isn't
-            // dead until the pane happens to be focused. Plugins only — handing
-            // focus to a terminal on right-press would change what the app
-            // underneath sees. `mouse_click_through` means the same thing here as
-            // it does for a left press: deliver the click, don't just focus.
-            if matches!(pane_id, PaneId::Plugin(_)) {
-                if ctx.mouse_click_through {
-                    return Ok(MouseAction::FocusPaneAndRightPress {
-                        pane_id,
-                        position: event.position,
-                        event: *event,
-                    });
-                }
-                return Ok(MouseAction::FocusPane {
-                    pane_id,
-                    position: event.position,
-                });
-            }
             return Ok(MouseAction::NoAction);
         }
 
@@ -1940,62 +1878,5 @@ mod tests {
                 MouseAction::NoAction
             );
         }
-    }
-
-    #[test]
-    fn right_press_focuses_an_unfocused_plugin_pane() {
-        let position = Position::new(3, 3);
-        let mut context = mouse_event_context(true);
-        context.pane_id_at_position = Some(PaneId::Plugin(7));
-
-        assert_eq!(
-            MouseHandler::determine_mouse_action(
-                &MouseEvent::new_right_press_event(position),
-                &context
-            )
-            .unwrap(),
-            MouseAction::FocusPane {
-                pane_id: PaneId::Plugin(7),
-                position
-            },
-            "a plugin's right-click menu is unreachable if the first right press \
-             on an unfocused pane does nothing"
-        );
-    }
-
-    #[test]
-    fn click_through_delivers_the_right_press_that_focused_the_plugin() {
-        let position = Position::new(3, 3);
-        let mut context = mouse_event_context(true);
-        context.pane_id_at_position = Some(PaneId::Plugin(7));
-        context.mouse_click_through = true;
-        let event = MouseEvent::new_right_press_event(position);
-
-        assert_eq!(
-            MouseHandler::determine_mouse_action(&event, &context).unwrap(),
-            MouseAction::FocusPaneAndRightPress {
-                pane_id: PaneId::Plugin(7),
-                position,
-                event
-            },
-            "mouse_click_through exists to spare the focus-then-click two-step; \
-             a right press must honour it the same way a left press does"
-        );
-    }
-
-    #[test]
-    fn right_press_on_an_unfocused_terminal_pane_stays_inert() {
-        let position = Position::new(3, 3);
-        let mut context = mouse_event_context(true);
-        context.pane_id_at_position = Some(PaneId::Terminal(2));
-
-        assert_eq!(
-            MouseHandler::determine_mouse_action(
-                &MouseEvent::new_right_press_event(position),
-                &context
-            )
-            .unwrap(),
-            MouseAction::NoAction
-        );
     }
 }
