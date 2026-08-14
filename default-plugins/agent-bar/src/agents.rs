@@ -4,6 +4,6 @@
 //! readmodel as-is, just sorted.
 
 pub use agent_readmodel::{
-    Agent, AgentStatus, ReadResult, locate_snapshot, read_readmodel as read,
+    Agent, AgentHost, AgentStatus, ReadResult, locate_snapshot, read_readmodel as read,
     read_seen_events,
 };

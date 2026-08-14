@@ -1,9 +1,11 @@
 //! Read-side library for `~/.claude/custom-state/agent-readmodel.json` and
 //! `~/.claude/custom-state/agent-seen-events/<sid>.json`.
 //!
-//! Shared by the `agent-bar` and `compact-bar` zellij plugins so the schema
-//! lives in exactly one place. The daemon (`sessions watch`, in foam/code/
-//! sessions) is the writer; this crate is what consumers parse with.
+//! `agent-bar` is the only plugin that depends on this today — `compact-bar`
+//! no longer does, though `.githooks/pre-commit` still lists it as a reverse-dep
+//! and will demand a compact-bar rebake that changing this crate cannot affect.
+//! The daemon (`sessions watch`, in foam/code/sessions) is the writer; this
+//! crate is what consumers parse with.
 //!
 //! Plugin-specific projection (filter to current zellij session, aggregate
 //! per-tab, etc.) stays in each plugin's own `agents.rs` — those depend on
@@ -42,6 +44,72 @@ impl<'de> Deserialize<'de> for AgentStatus {
     }
 }
 
+/// Which multiplexer pane an agent is displayed in. Hand-mirrored from
+/// `AgentHost` in foam's `code/sessions/src/events.rs` — the daemon writes it,
+/// this crate only reads. The plugins compile to wasm and can't depend on that
+/// crate, so the two definitions are kept in step by hand; there's no
+/// schema-drift test, and a mismatch shows up as an empty bar rather than a
+/// failure. That doc comment lists every reader that moves together.
+///
+/// A closed union rather than nullable `zellij_*` / `herdr_*` pairs: two pairs
+/// make four states representable for three legal ones, and the illegal one
+/// (both hosts claiming one agent) is the one that actually occurs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentHost {
+    Zellij(ZellijRef),
+    Herdr(HerdrRef),
+    /// No multiplexer — a bare terminal, or a background agent, which has no
+    /// pane by construction (`kind` separates those two).
+    Unattached,
+    /// Both hosts' env vars were set and the daemon refused to guess. Env vars
+    /// are inherited, not authoritative: a `herdr server` first launched from a
+    /// zellij pane hands `ZELLIJ_SESSION_NAME` to every pane it later spawns.
+    /// Rendered as its own group in error styling — never routed to.
+    Ambiguous { zellij: ZellijRef, herdr: HerdrRef },
+}
+
+impl Default for AgentHost {
+    fn default() -> Self {
+        AgentHost::Unattached
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ZellijRef {
+    pub session: String,
+    /// `None` when the session is known but the pane id isn't — the agent still
+    /// groups under its session, it just can't be focused.
+    #[serde(default)]
+    pub pane_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HerdrRef {
+    /// Herdr ids are opaque strings, not ints: `"w5"`, `"w5:p1"`.
+    pub workspace: String,
+    pub pane_id: String,
+}
+
+impl AgentHost {
+    /// The zellij session this agent belongs to, and only when unambiguous.
+    pub fn zellij_session(&self) -> Option<&str> {
+        match self {
+            AgentHost::Zellij(z) => Some(z.session.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The pane to focus. `None` for every non-zellij variant — including
+    /// `Ambiguous`, where refusing to route is the whole point.
+    pub fn zellij_pane_id(&self) -> Option<u32> {
+        match self {
+            AgentHost::Zellij(z) => z.pane_id,
+            _ => None,
+        }
+    }
+}
+
 /// One entry in the readmodel. The plugin only needs the fields it renders;
 /// the rest are kept here so consumers can use whatever subset they want
 /// without redeclaring the schema.
@@ -69,10 +137,11 @@ pub struct Agent {
     /// interactive sessions, or when the daemon couldn't resolve the link.
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    /// Which multiplexer pane this agent is displayed in. Defaulted rather than
+    /// required: a row this crate can't deserialize fails the *whole* snapshot,
+    /// so a schema skew would blank the bar instead of costing one field.
     #[serde(default)]
-    pub zellij_session: Option<String>,
-    #[serde(default)]
-    pub zellij_pane_id: Option<u32>,
+    pub host: AgentHost,
     /// Wall-clock millis of session creation. Stable sort key — agents
     /// appear in creation order regardless of activity. Default 0.
     #[serde(default)]
@@ -168,4 +237,75 @@ pub fn read_seen_events(dir: &Path) -> HashMap<String, i64> {
         }
     }
     out
+}
+
+/// The `AgentHost` mirror is hand-maintained against foam's
+/// `code/sessions/src/events.rs`, and a mismatch degrades silently — the whole
+/// snapshot fails to parse and the bar just renders empty. These payloads are
+/// captured verbatim from the daemon's output, so a drift in the tag name, a
+/// variant rename, or a field rename fails here instead.
+#[cfg(test)]
+mod host_wire_format {
+    use super::*;
+
+    fn host(json: &str) -> AgentHost {
+        serde_json::from_str(json).expect("daemon payload must parse")
+    }
+
+    #[test]
+    fn parses_every_variant_the_daemon_emits() {
+        assert_eq!(
+            host(r#"{"kind":"zellij","session":"foam","pane_id":22}"#),
+            AgentHost::Zellij(ZellijRef { session: "foam".into(), pane_id: Some(22) })
+        );
+        assert_eq!(
+            host(r#"{"kind":"herdr","workspace":"w5","pane_id":"w5:p1"}"#),
+            AgentHost::Herdr(HerdrRef { workspace: "w5".into(), pane_id: "w5:p1".into() })
+        );
+        assert_eq!(host(r#"{"kind":"unattached"}"#), AgentHost::Unattached);
+        assert_eq!(
+            host(
+                r#"{"kind":"ambiguous","zellij":{"session":"foam","pane_id":22},
+                    "herdr":{"workspace":"w5","pane_id":"w5:p1"}}"#
+            ),
+            AgentHost::Ambiguous {
+                zellij: ZellijRef { session: "foam".into(), pane_id: Some(22) },
+                herdr: HerdrRef { workspace: "w5".into(), pane_id: "w5:p1".into() },
+            }
+        );
+    }
+
+    /// A zellij session with no resolvable pane id still groups under its
+    /// session — it just can't be focused.
+    #[test]
+    fn zellij_without_a_pane_id_keeps_its_session() {
+        let h = host(r#"{"kind":"zellij","session":"foam"}"#);
+        assert_eq!(h.zellij_session(), Some("foam"));
+        assert_eq!(h.zellij_pane_id(), None);
+    }
+
+    /// The routing guard: an agent both hosts claim must never yield a pane,
+    /// or the bar would focus a coin-flip.
+    #[test]
+    fn ambiguous_never_routes() {
+        let h = host(
+            r#"{"kind":"ambiguous","zellij":{"session":"foam","pane_id":22},
+                "herdr":{"workspace":"w5","pane_id":"w5:p1"}}"#,
+        );
+        assert_eq!(h.zellij_pane_id(), None);
+        assert_eq!(h.zellij_session(), None);
+    }
+
+    #[test]
+    fn agent_row_carries_its_host() {
+        let snap: Snapshot = serde_json::from_str(
+            r#"{"agents":[{"session_id":"a1","status":"busy",
+                 "host":{"kind":"herdr","workspace":"w5","pane_id":"w5:p1"}}]}"#,
+        )
+        .expect("agent row must parse");
+        assert_eq!(
+            snap.agents[0].host,
+            AgentHost::Herdr(HerdrRef { workspace: "w5".into(), pane_id: "w5:p1".into() })
+        );
+    }
 }

@@ -11,16 +11,22 @@
 //! (oldest at the top, new ones append at the bottom), pinned on first sight so
 //! a slot doesn't drift; a session that has left the live list keeps its slot
 //! from its earliest agent's `started_at_ms`. Agents within a group are ordered
-//! by `started_at_ms` asc. Agents without a `zellij_session` collect in a
-//! "sessionless" group pinned to the very bottom.
+//! by `started_at_ms` asc. Groups are bucketed by host: zellij sessions first,
+//! then herdr workspaces, then "ambiguous host" (both multiplexers claimed the
+//! agent — see `AgentHost::Ambiguous`), then "sessionless" for agents in no
+//! multiplexer at all. Only zellij groups are pre-seeded from the live session
+//! list; a herdr workspace appears only once an agent reports itself in it,
+//! since the plugin can't reach herdr's socket from the wasm sandbox.
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
 //! attention/waiting (yellow, red if unknown and unattended), in-view (green), and selection
 //! (grey) each claim columns by priority, so combinations layer rather than
 //! overwrite (see the palette block below). `✗` after the session header marks
-//! agents missing a `zellij_pane_id`; `⧉` marks a session some *other* terminal
-//! window already has attached, so you don't open the same one twice.
+//! agents in that zellij session with no pane to focus; it never appears on a
+//! herdr or ambiguous group, where nothing is zellij-routable by definition.
+//! `⧉` marks a session some *other* terminal window already has attached, so
+//! you don't open the same one twice.
 //!
 //! An agent whose live heartbeat is gone is kept as *tracked-but-not-active*
 //! (the daemon carries it forward as `active: false`): it renders dim with a
@@ -74,7 +80,7 @@ use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
 use zellij_tile_utils::style;
 
-use crate::agents::{Agent, AgentStatus, ReadResult};
+use crate::agents::{Agent, AgentHost, AgentStatus, ReadResult};
 
 const POLL_SECS: f64 = 1.5;
 /// Cadence for the zellij session list, deliberately slower than the agent poll.
@@ -111,6 +117,7 @@ const OUTER_PAD: usize = 1;
 /// per-column state stack; the marker glyph rides on col 1's bg.
 const AGENT_INDENT: usize = 2;
 const SESSIONLESS_LABEL: &str = "sessionless";
+const AMBIGUOUS_LABEL: &str = "ambiguous host";
 
 // Agent-state palette — a shared colour vocabulary (agent-bar today, the mux
 // session picker later). Concurrent states are composited as a PER-COLUMN
@@ -820,7 +827,7 @@ impl State {
             return None;
         }
         if let Some(prev) = self.last_external_focused_pane {
-            if let Some(idx) = agents.iter().position(|a| a.zellij_pane_id == Some(prev)) {
+            if let Some(idx) = agents.iter().position(|a| a.host.zellij_pane_id() == Some(prev)) {
                 return Some(idx);
             }
         }
@@ -1164,7 +1171,7 @@ impl State {
         // Compute flags first; pass into rendering.
         let mut flags: HashMap<String, Flags> = HashMap::new();
         for agent in &raw_agents {
-            let unrouted = agent.zellij_pane_id.is_none();
+            let unrouted = agent.host.zellij_pane_id().is_none();
             // A busy agent is actively working, not waiting on you: going busy
             // again means you gave it new work, which acknowledges the prior
             // completion. Suppress the stale yellow now — the next completion
@@ -1182,8 +1189,8 @@ impl State {
             // falsely light green. (A cross-session agent is on another
             // screen anyway, so it's correctly never in-view.)
             let is_in_view = agent.active
-                && agent.zellij_session.as_deref() == Some(session.as_str())
-                && matches!(agent.zellij_pane_id, Some(pid) if in_view_pane_ids.contains(&pid));
+                && agent.host.zellij_session() == Some(session.as_str())
+                && matches!(agent.host.zellij_pane_id(), Some(pid) if in_view_pane_ids.contains(&pid));
             flags.insert(
                 agent.session_id.clone(),
                 Flags {
@@ -1374,9 +1381,17 @@ struct Row {
     focus_sid: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum GroupLabel {
     Session(String),
+    /// A herdr workspace. Unlike zellij sessions these are never pre-seeded —
+    /// the plugin can't reach herdr's socket from the wasm sandbox, so a
+    /// workspace only appears once an agent reports itself in it.
+    HerdrWorkspace(String),
+    /// Agents whose host couldn't be determined because both zellij and herdr
+    /// env vars were present. Its own group so the conflict is visible instead
+    /// of silently landing in someone's session.
+    Ambiguous,
     Sessionless,
     /// All background (`run_in_background`) agents. They're daemon-owned, have no
     /// pane of their own, and are reached through Claude's agent view rather than
@@ -1389,8 +1404,23 @@ impl GroupLabel {
     fn as_str(&self) -> &str {
         match self {
             GroupLabel::Session(s) => s.as_str(),
+            GroupLabel::HerdrWorkspace(w) => w.as_str(),
+            GroupLabel::Ambiguous => AMBIGUOUS_LABEL,
             GroupLabel::Sessionless => SESSIONLESS_LABEL,
             GroupLabel::BackgroundAgents => "bg agents",
+        }
+    }
+
+    /// Sort bucket. Named hosts first, then the two can't-place buckets, then
+    /// bg agents. Keeps every group's slot fixed — only the name breaks ties
+    /// within a bucket.
+    fn rank(&self) -> u8 {
+        match self {
+            GroupLabel::Session(_) => 0,
+            GroupLabel::HerdrWorkspace(_) => 1,
+            GroupLabel::Ambiguous => 2,
+            GroupLabel::Sessionless => 3,
+            GroupLabel::BackgroundAgents => 4,
         }
     }
 }
@@ -1460,23 +1490,30 @@ enum Line {
 fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Group> {
     let is_bg = |a: &Agent| a.kind == "bg";
 
-    let mut by_key: BTreeMap<Option<String>, Vec<Agent>> = BTreeMap::new();
+    let key_of = |a: &Agent| match &a.host {
+        AgentHost::Zellij(z) => GroupLabel::Session(z.session.clone()),
+        AgentHost::Herdr(h) => GroupLabel::HerdrWorkspace(h.workspace.clone()),
+        AgentHost::Ambiguous { .. } => GroupLabel::Ambiguous,
+        AgentHost::Unattached => GroupLabel::Sessionless,
+    };
+
+    let mut by_key: BTreeMap<GroupLabel, Vec<Agent>> = BTreeMap::new();
     for name in sessions.keys() {
-        by_key.entry(Some(name.clone())).or_default();
+        by_key.entry(GroupLabel::Session(name.clone())).or_default();
     }
     for a in agents.iter().filter(|a| !is_bg(a)) {
-        by_key.entry(a.zellij_session.clone()).or_default().push(a.clone());
+        by_key.entry(key_of(a)).or_default().push(a.clone());
     }
 
     let mut groups: Vec<Group> = by_key
         .into_iter()
-        .map(|(key, mut tops)| {
+        .map(|(label, mut tops)| {
             tops.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
-            let any_unrouted = tops.iter().any(|a| a.zellij_pane_id.is_none());
-            let label = match &key {
-                Some(s) => GroupLabel::Session(s.clone()),
-                None => GroupLabel::Sessionless,
-            };
+            // Only meaningful for a zellij group, where a missing pane id is an
+            // anomaly. In a herdr or ambiguous group *nothing* is zellij-routable
+            // by definition, so flagging it would mark the header permanently.
+            let any_unrouted = matches!(label, GroupLabel::Session(_))
+                && tops.iter().any(|a| a.host.zellij_pane_id().is_none());
             let rows = tops
                 .into_iter()
                 .map(|t| {
@@ -1488,18 +1525,15 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
         })
         .collect();
 
-    // Sessionless after named sessions; otherwise alphabetical by session name.
-    // Ordering on the name and nothing else is what keeps a group's slot fixed:
-    // any time-derived key moves when a session drops out of one poll and gets
-    // re-derived from the second-truncated age zellij reports.
-    groups.sort_by(|a, b| match (&a.label, &b.label) {
-        (GroupLabel::Sessionless, GroupLabel::Sessionless) => std::cmp::Ordering::Equal,
-        (GroupLabel::Sessionless, _) => std::cmp::Ordering::Greater,
-        (_, GroupLabel::Sessionless) => std::cmp::Ordering::Less,
-        _ => {
+    // Named hosts first (zellij, then herdr), then the can't-place buckets.
+    // Ordering on rank and name and nothing else is what keeps a group's slot
+    // fixed: any time-derived key moves when a session drops out of one poll and
+    // gets re-derived from the second-truncated age zellij reports.
+    groups.sort_by(|a, b| {
+        a.label.rank().cmp(&b.label.rank()).then_with(|| {
             let (a, b) = (a.label.as_str(), b.label.as_str());
             a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
-        },
+        })
     });
 
     // Background agents → one trailing section, flat top-level rows, select-only.
@@ -2036,8 +2070,7 @@ fn same_agents(a: &[Agent], b: &[Agent]) -> bool {
         && a.iter().zip(b.iter()).all(|(x, y)| {
             x.session_id == y.session_id
                 && x.status == y.status
-                && x.zellij_pane_id == y.zellij_pane_id
-                && x.zellij_session == y.zellij_session
+                && x.host == y.host
                 && x.name == y.name
                 && x.started_at_ms == y.started_at_ms
                 && x.attention_at_ms == y.attention_at_ms
