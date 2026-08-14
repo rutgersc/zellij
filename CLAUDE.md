@@ -63,3 +63,16 @@ truth** for a second renderer living outside this repo: the fzf session picker
 in the foam vault (`code/sessions/src/pick.rs`, `format_line`).
 They're a coupled pair — **when you change which colour an agent state gets
 here, update the picker to match**.
+
+## The agent readmodel schema is owned outside this repo
+
+`default-plugins/agent-readmodel/src/lib.rs` only *reads*. The writer is foam's
+`sessions` daemon, and the canonical schema — including the full list of readers
+that have to move together, in both repos — is the doc comment on `AgentHost` in
+`C:/Projects/foam/code/sessions/src/events.rs`. **Read that list before changing
+anything in `agent-readmodel`.**
+
+Drift is silent: a field this crate can't deserialize fails the *whole* snapshot,
+so the bar renders empty rather than erroring. The `host_wire_format` tests in
+`agent-readmodel` pin the daemon's exact JSON to catch it — if a schema change
+doesn't turn them red, they're stale.
