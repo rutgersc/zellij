@@ -4,6 +4,8 @@ mod os_input_output_unix;
 #[cfg(windows)]
 #[path = "os_input_output_windows.rs"]
 mod os_input_output_windows;
+#[cfg(windows)]
+mod windows_std_handles;
 
 pub mod host_query;
 pub mod os_input_output;
@@ -1129,6 +1131,8 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
         unsafe {
             SetConsoleCtrlHandler(None, 0);
         }
+
+        crate::windows_std_handles::repoint_std_handles_at_own_console();
     }
 
     start_server_impl(os_input, socket_path, true);
