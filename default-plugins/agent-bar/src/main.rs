@@ -51,21 +51,13 @@
 //! children) only select. While that `mux` command is in flight a braille
 //! spinner replaces the row's `>` marker (col 1), so a slow focus shows work
 //! happening right where you clicked; it clears on the matching
-//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS). The wheel moves
+//! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS). If that result
+//! carries a non-zero exit, `mux`'s own stderr becomes a red banner on the last
+//! row until the next dispatch succeeds — a cleared spinner alone looks
+//! identical whether the focus worked or not. The wheel moves
 //! the viewport without moving the cursor — load-bearing now that agentless
 //! sessions each cost two rows: a header below the fold has no agent row near it
 //! to navigate to, so without the wheel it would be unreachable.
-//!
-//! Right-click opens a small menu under the row. The panel is mouse-first, but
-//! its non-navigation actions were keyboard-only — that is all the menu is for.
-//! An agent row offers `Copy id`, plus `Dismiss` when the row is inactive (a
-//! live agent would return on the next heartbeat, so the item is absent rather
-//! than inert). A session header offers `Copy name`, plus `Kill session` unless
-//! it names the session we're attached to. `Kill session` arms on the first
-//! click and runs on the second, reading `Really kill?` in between; a failed
-//! action keeps the menu open carrying the message. The next left click closes
-//! the menu without falling through to the row beneath it, as does any
-//! keystroke and any scroll.
 //!
 //! Every distinguishable load state — awaiting permission, no $HOME in
 //! env, file missing/unreadable/unparseable, empty snapshot — has its own
@@ -227,60 +219,11 @@ struct SessionMeta {
 }
 
 /// What a rendered row routes to when clicked.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 enum RowTarget {
     Agent(String),
-    /// A session header. `switchable` is false for the session we're already in
-    /// and for readmodel-only names (see `Line::Header::switch_to`) — the row
-    /// still carries a target so a right-click can open its menu.
-    Session { name: String, switchable: bool },
-}
-
-/// Right-click menu verbs. Each is otherwise keyboard-only, which is the whole
-/// reason the menu exists — the bar is mouse-first but half its actions weren't.
-#[derive(Clone, Copy, PartialEq)]
-enum MenuItem {
-    CopyId,
-    Dismiss,
-    CopyName,
-    KillSession,
-}
-
-impl MenuItem {
-    fn label(&self) -> &'static str {
-        match self {
-            MenuItem::CopyId => "Copy id",
-            MenuItem::Dismiss => "Dismiss",
-            MenuItem::CopyName => "Copy name",
-            MenuItem::KillSession => "Kill session",
-        }
-    }
-
-    /// Irreversible — takes a second click, showing `confirm_label` in between.
-    fn is_destructive(&self) -> bool {
-        matches!(self, MenuItem::KillSession)
-    }
-
-    fn confirm_label(&self) -> &'static str {
-        match self {
-            MenuItem::KillSession => "Really kill?",
-            _ => self.label(),
-        }
-    }
-}
-
-/// An open right-click menu. Anchored to the *target*, not to a screen row —
-/// rows shift under it as agents come and go between polls, so the anchor is
-/// re-derived from `row_ranges` on every render and the menu closes when its
-/// row is gone.
-struct Menu {
-    target: RowTarget,
-    items: Vec<MenuItem>,
-    /// Index of the destructive item awaiting its confirming second click.
-    armed: Option<usize>,
-    /// Set when an action failed — replaces the items rather than no-opping
-    /// silently.
-    error: Option<String>,
+    /// A live session's header — switches this client to it.
+    Session(String),
 }
 
 #[derive(Default)]
@@ -301,11 +244,6 @@ struct State {
     /// Click hit-test: rendered_row → what that row routes to. Rebuilt every
     /// render.
     row_ranges: Vec<(usize, RowTarget)>,
-    /// Open right-click menu, if any.
-    menu: Option<Menu>,
-    /// Menu hit-test: rendered_row → the item drawn there. Rebuilt every render
-    /// alongside `row_ranges`, and empty whenever `menu` is None.
-    menu_rows: Vec<(usize, MenuItem)>,
     /// session_id → the session_id to actually focus when this row is clicked.
     /// For a top-level agent it's itself; for a nested bg child it's the parent
     /// (the child has no pane of its own). Absent → no pane to focus (orphan).
@@ -323,6 +261,13 @@ struct State {
     /// Optimistic mark-seen overlay; effective = max(disk, overlay).
     seen_overlay: HashMap<String, i64>,
     seen_events_dir: Option<PathBuf>,
+    /// Last failed dispatch, rendered as a banner until the next one succeeds.
+    /// Without it a failed `mux focus-agent` is indistinguishable from a working
+    /// one — the spinner clears either way — so a click that silently does
+    /// nothing reads as the bar being broken rather than as `mux` reporting a
+    /// reason. That happened: a stale `mux` couldn't read a new readmodel field
+    /// and every click no-opped with the explanation sitting unread in stderr.
+    dispatch_error: Option<String>,
     /// Sids the user dismissed this session — hidden optimistically until the
     /// daemon drops them from the readmodel (or they go active again on resume).
     dismissed_overlay: HashSet<String>,
@@ -496,45 +441,14 @@ impl ZellijPlugin for State {
             Event::Mouse(Mouse::ScrollUp(lines)) => {
                 let before = self.scroll_offset;
                 self.scroll_offset = self.scroll_offset.saturating_sub(lines.max(1));
-                // The menu is drawn relative to its row, so scrolling it away
-                // from under the pointer would leave it floating over an
-                // unrelated agent.
-                self.menu = None;
                 self.scroll_offset != before
             },
             Event::Mouse(Mouse::ScrollDown(lines)) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(lines.max(1));
-                self.menu = None;
                 true
-            },
-            Event::Mouse(Mouse::RightClick(line, _col)) => {
-                let row = if line < 0 { return false } else { line as usize };
-                // Right-clicking the menu itself would otherwise open a second
-                // menu for whatever row it covers.
-                if self.menu_rows.iter().any(|(r, _)| *r == row) {
-                    return false;
-                }
-                self.open_menu_at(row)
             },
             Event::Mouse(Mouse::LeftClick(line, _col)) => {
                 let row = if line < 0 { return false } else { line as usize };
-                // An open menu owns the next left click wherever it lands:
-                // on an item it activates, anywhere else it just closes. Clicking
-                // "through" a menu into the row underneath is never what's meant.
-                if self.menu.is_some() {
-                    let item = self
-                        .menu_rows
-                        .iter()
-                        .find(|(r, _)| *r == row)
-                        .map(|(_, item)| *item);
-                    match item {
-                        Some(item) => {
-                            self.activate_menu_item(item);
-                        },
-                        None => self.menu = None,
-                    }
-                    return true;
-                }
                 let hit = self
                     .row_ranges
                     .iter()
@@ -542,14 +456,13 @@ impl ZellijPlugin for State {
                     .map(|(_, target)| target.clone());
                 match hit {
                     // Header click → attach this client to that session. Only
-                    // headers of live sessions other than our own are switchable
+                    // headers of live sessions other than our own carry a target
                     // (see `Line::Header::switch_to`), so this can't create a
                     // session or pointlessly re-attach the one we're in.
-                    Some(RowTarget::Session { name, switchable: true }) => {
+                    Some(RowTarget::Session(name)) => {
                         switch_session(Some(&name));
                         true
                     },
-                    Some(RowTarget::Session { .. }) => false,
                     Some(RowTarget::Agent(sid)) => {
                         if let Some(idx) = self
                             .display_order()
@@ -588,14 +501,6 @@ impl ZellijPlugin for State {
                 let yank_cmd = matches!(key.bare_key, BareKey::Char('v')) && no_mods;
                 let dismiss = matches!(key.bare_key, BareKey::Char('x')) && no_mods;
                 let cancel = matches!(key.bare_key, BareKey::Esc | BareKey::Char('q')) && no_mods;
-                // Any keystroke closes the menu — it's a mouse mode, and leaving
-                // it open while the keyboard cursor moves under it reads as a
-                // menu attached to the wrong row. Esc closes it and nothing else,
-                // so the first Esc doesn't also throw focus back to the terminal.
-                let closed_menu = self.menu.take().is_some();
-                if closed_menu && cancel {
-                    return true;
-                }
                 if go_up && len > 0 {
                     self.selected_idx = Some(match self.selected_idx {
                         Some(i) if i > 0 => i - 1,
@@ -702,12 +607,21 @@ impl ZellijPlugin for State {
                     move_focus(Direction::Right);
                     return true;
                 }
-                // An unhandled key still repaints when it dismissed the menu,
-                // otherwise the closed menu stays on screen until the next poll.
-                closed_menu
+                false
             },
-            Event::RunCommandResult(_, _, _, ctx) => {
+            Event::RunCommandResult(exit_code, _stdout, stderr, ctx) => {
                 // The dispatched `mux focus-agent` finished — stop its spinner.
+                // A non-zero exit means the focus didn't happen; surface `mux`'s
+                // own reason rather than dropping it, since the cleared spinner
+                // otherwise looks exactly like success.
+                self.dispatch_error = (exit_code != Some(0)).then(|| {
+                    let msg = String::from_utf8_lossy(&stderr);
+                    let msg = msg.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
+                    match msg.trim() {
+                        "" => format!("focus failed (exit {})", exit_code.unwrap_or(-1)),
+                        m => m.to_owned(),
+                    }
+                });
                 match ctx.get("session_id") {
                     Some(sid) => self.in_flight.remove(sid).is_some(),
                     None => false,
@@ -719,7 +633,6 @@ impl ZellijPlugin for State {
 
     fn render(&mut self, rows: usize, cols: usize) {
         self.row_ranges.clear();
-        self.menu_rows.clear();
         let colors = AgentColors::from_palette(&self.mode_info.style.colors);
 
         enum Action {
@@ -765,7 +678,24 @@ impl ZellijPlugin for State {
         let frame: Vec<String> = match action {
             Action::Diag(fg, msg) => diag_frame(&msg, fg, colors.bar_bg, rows, cols),
             Action::Attention(msg) => attention_frame(&msg, colors, rows, cols),
-            Action::Cells => self.cells_frame(rows, cols, &colors),
+            Action::Cells => {
+                // Appended, never prepended: `cells_frame` fills `row_ranges` with
+                // indices counted from the top, so a banner above the rows would
+                // shift every click target by one. It also can't replace the panel
+                // like the other diagnostics do — the rows you'd click to retry
+                // would be the ones it hid.
+                match &self.dispatch_error {
+                    None => self.cells_frame(rows, cols, &colors),
+                    Some(msg) => {
+                        let line = wrap_text(&format!("✗ {msg}"), cols.saturating_sub(1), 1)
+                            .pop()
+                            .unwrap_or_default();
+                        let mut frame = self.cells_frame(rows.saturating_sub(1), cols, &colors);
+                        frame.push(style!(colors.error, colors.bar_bg).paint(line).to_string());
+                        frame
+                    },
+                }
+            },
         };
 
         emit_frame(&frame, rows);
@@ -856,6 +786,10 @@ impl State {
             return;
         }
         if let Some(target) = self.focus_targets.get(sid).cloned() {
+            // Drop the previous failure as the new attempt starts, so a stale
+            // reason is never shown beside a live spinner. It comes back from
+            // this attempt's own result if this one fails too.
+            self.dispatch_error = None;
             self.in_flight.insert(sid.to_string(), 0);
             let _ = self.dispatch_focus_agent(&target, sid);
         }
@@ -990,160 +924,6 @@ impl State {
         true
     }
 
-    /// Open the right-click menu for whatever `row` renders. A row with no
-    /// target, or one whose every action is impossible, closes any open menu
-    /// instead of showing an empty one.
-    fn open_menu_at(&mut self, row: usize) -> bool {
-        let target = self
-            .row_ranges
-            .iter()
-            .find(|(r, _)| *r == row)
-            .map(|(_, t)| t.clone());
-        let Some(target) = target else {
-            return self.menu.take().is_some();
-        };
-        let items = self.menu_items_for(&target);
-        if items.is_empty() {
-            return self.menu.take().is_some();
-        }
-        self.menu = Some(Menu { target, items, armed: None, error: None });
-        true
-    }
-
-    /// Only ever offer an action that can actually run — an item that would
-    /// no-op is worse than an absent one.
-    fn menu_items_for(&self, target: &RowTarget) -> Vec<MenuItem> {
-        match target {
-            RowTarget::Agent(sid) => {
-                // A live agent can't be dismissed: the tombstone is stamped now,
-                // and the next heartbeat lands after it, so the row returns.
-                let dismissable = self
-                    .current_agents()
-                    .iter()
-                    .any(|a| a.session_id == *sid && !a.active);
-                if dismissable {
-                    vec![MenuItem::CopyId, MenuItem::Dismiss]
-                } else {
-                    vec![MenuItem::CopyId]
-                }
-            },
-            RowTarget::Session { name, .. } => {
-                let is_own = self.mode_info.session_name.as_deref() == Some(name.as_str());
-                // Killing the session we're attached to would take this pane down
-                // with it; a readmodel-only name has no live session to kill.
-                let killable = !is_own && self.sessions.contains_key(name);
-                if killable {
-                    vec![MenuItem::CopyName, MenuItem::KillSession]
-                } else {
-                    vec![MenuItem::CopyName]
-                }
-            },
-        }
-    }
-
-    /// Run an item — or, for a destructive one, arm it and wait for the second
-    /// click. A failed action keeps the menu open carrying the message.
-    fn activate_menu_item(&mut self, item: MenuItem) -> bool {
-        let Some(menu) = &self.menu else { return false };
-        let target = menu.target.clone();
-        let armed_item = menu.armed.and_then(|i| menu.items.get(i).copied());
-        if item.is_destructive() && armed_item != Some(item) {
-            let idx = menu.items.iter().position(|i| *i == item);
-            if let Some(menu) = &mut self.menu {
-                menu.armed = idx;
-                menu.error = None;
-            }
-            return true;
-        }
-        match self.run_menu_action(item, &target) {
-            Ok(()) => self.menu = None,
-            Err(e) => {
-                if let Some(menu) = &mut self.menu {
-                    menu.armed = None;
-                    menu.error = Some(e);
-                }
-            },
-        }
-        true
-    }
-
-    fn run_menu_action(&mut self, item: MenuItem, target: &RowTarget) -> Result<(), String> {
-        match (item, target) {
-            (MenuItem::CopyId, RowTarget::Agent(sid)) => {
-                copy_to_clipboard(sid.as_str());
-                Ok(())
-            },
-            (MenuItem::Dismiss, RowTarget::Agent(sid)) => {
-                self.dismiss_agent(sid);
-                Ok(())
-            },
-            (MenuItem::CopyName, RowTarget::Session { name, .. }) => {
-                copy_to_clipboard(name.as_str());
-                Ok(())
-            },
-            (MenuItem::KillSession, RowTarget::Session { name, .. }) => kill_sessions(&[name]),
-            // The item lists are built per target kind, so a mismatch means the
-            // two went out of sync — surface it rather than swallow the click.
-            (item, _) => Err(format!("{} n/a here", item.label())),
-        }
-    }
-
-    /// Draw the open menu over the rendered rows, just under its anchor. The
-    /// anchor is re-derived from `row_ranges` every render — rows shift as
-    /// agents come and go, and a target that left the viewport closes its menu.
-    fn overlay_menu(
-        &mut self,
-        frame: &mut Vec<String>,
-        rows: usize,
-        cols: usize,
-        colors: &AgentColors,
-    ) {
-        let Some(menu) = &self.menu else { return };
-        let anchor = self
-            .row_ranges
-            .iter()
-            .find(|(_, t)| *t == menu.target)
-            .map(|(r, _)| *r);
-        let Some(anchor) = anchor else {
-            self.menu = None;
-            return;
-        };
-        let body: Vec<(Option<MenuItem>, String, bool)> = match &menu.error {
-            Some(e) => vec![(None, e.clone(), true)],
-            None => menu
-                .items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let armed = menu.armed == Some(i);
-                    let label = if armed { item.confirm_label() } else { item.label() };
-                    (Some(*item), label.to_string(), armed)
-                })
-                .collect(),
-        };
-        // Prefer directly under the anchor; slide up only as far as needed to
-        // keep the whole menu on screen.
-        let height = body.len().min(rows);
-        let start = (anchor + 1).min(rows.saturating_sub(height));
-        // `frame` holds only the rows the list filled — a menu opened on a short
-        // list hangs past the end of it, so grow the frame into the blank space
-        // below rather than silently dropping the items that don't fit.
-        let needed = (start + height).min(rows);
-        while frame.len() < needed {
-            frame.push(render_padding(colors, cols));
-        }
-        for (i, (item, label, armed)) in body.into_iter().enumerate() {
-            let row = start + i;
-            if row >= frame.len() {
-                break;
-            }
-            frame[row] = render_menu_row(&label, armed, colors, cols);
-            if let Some(item) = item {
-                self.menu_rows.push((row, item));
-            }
-        }
-    }
-
     fn cells_frame(&mut self, rows: usize, cols: usize, colors: &AgentColors) -> Vec<String> {
         let all_agents = self.current_agents().to_vec();
         self.prune_dismissed_overlay(&all_agents);
@@ -1246,16 +1026,11 @@ impl State {
             let line = &lines[abs_idx];
             let rendered = match line {
                 Line::Padding => render_padding(colors, cols),
-                Line::Header { label, unrouted_in_group, open_elsewhere, switch_to, is_session } => {
+                Line::Header { label, unrouted_in_group, open_elsewhere, switch_to } => {
                     let is_active = !session.is_empty() && label.as_str() == session.as_str();
-                    if *is_session {
-                        self.row_ranges.push((
-                            visible_row,
-                            RowTarget::Session {
-                                name: label.clone(),
-                                switchable: switch_to.is_some(),
-                            },
-                        ));
+                    if let Some(name) = switch_to {
+                        self.row_ranges
+                            .push((visible_row, RowTarget::Session(name.clone())));
                     }
                     render_header(
                         label,
@@ -1327,9 +1102,6 @@ impl State {
                     .to_string(),
             );
         }
-
-        // Last, so the menu sits over the rows rather than under a scroll arrow.
-        self.overlay_menu(&mut frame, rows, cols, colors);
 
         frame
     }
@@ -1452,9 +1224,6 @@ enum Line {
         /// readmodel (switching to a name with no live session would silently
         /// create one).
         switch_to: Option<String>,
-        /// False for the sessionless / bg-agents pseudo-groups, whose labels
-        /// name no session — they get no click target and no menu.
-        is_session: bool,
     },
     AgentRow {
         sid: String,
@@ -1587,7 +1356,6 @@ fn build_lines(
                 GroupLabel::Session(name) if !is_own && meta.is_some() => Some(name.clone()),
                 _ => None,
             },
-            is_session: matches!(g.label, GroupLabel::Session(_)),
         });
         for row in &g.rows {
             let a = &row.agent;
@@ -1728,37 +1496,6 @@ fn hard_split(s: &str, width: usize) -> Vec<String> {
 fn render_padding(colors: &AgentColors, cols: usize) -> String {
     let pad: String = std::iter::repeat(' ').take(cols).collect();
     style!(colors.text, colors.bar_bg).paint(pad).to_string()
-}
-
-/// A right-click menu row. It reads as a raised surface over the list: the
-/// selection pair for a normal item, the theme's red once a destructive item is
-/// armed (or when the row carries a failure), which is also the only colour in
-/// the panel that means "this will not be undone".
-fn render_menu_row(label: &str, armed: bool, colors: &AgentColors, cols: usize) -> String {
-    let (fg, bg) = if armed {
-        (colors.on_color, colors.error)
-    } else {
-        (colors.selected_fg, colors.selected_bg)
-    };
-    let mut text = String::from(" ");
-    for c in label.chars() {
-        let cw = c.to_string().width();
-        if text.width() + cw > cols {
-            break;
-        }
-        text.push(c);
-    }
-    if text.width() < label.width() + 1 {
-        while text.width() + 1 > cols && text.width() > 1 {
-            text.pop();
-        }
-        text.push('\u{2026}');
-    }
-    let pad: String = std::iter::repeat(' ')
-        .take(cols.saturating_sub(text.width()))
-        .collect();
-    text.push_str(&pad);
-    style!(fg, bg).paint(text).to_string()
 }
 
 fn render_header(
