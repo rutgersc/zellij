@@ -66,7 +66,10 @@ pub enum AgentHost {
     /// are inherited, not authoritative: a `herdr server` first launched from a
     /// zellij pane hands `ZELLIJ_SESSION_NAME` to every pane it later spawns.
     /// Rendered as its own group in error styling — never routed to.
-    Ambiguous { zellij: ZellijRef, herdr: HerdrRef },
+    Ambiguous {
+        zellij: ZellijRef,
+        herdr: HerdrRef,
+    },
 }
 
 impl Default for AgentHost {
@@ -115,7 +118,11 @@ impl AgentHost {
 /// without redeclaring the schema.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
+    #[serde(default = "default_provider")]
+    pub provider: String,
     pub session_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -157,6 +164,21 @@ pub struct Agent {
     /// (no field) reads as all-live.
     #[serde(default = "default_true")]
     pub active: bool,
+}
+
+fn default_provider() -> String {
+    "claude".to_string()
+}
+
+impl Agent {
+    pub fn identity(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.provider,
+            self.session_id,
+            self.agent_id.as_deref().unwrap_or("")
+        )
+    }
 }
 
 fn default_true() -> bool {
@@ -225,13 +247,17 @@ struct SeenRecord {
 /// directly (not the daemon). Daemon only deletes orphans on agent death.
 pub fn read_seen_events(dir: &Path) -> HashMap<String, i64> {
     let mut out = HashMap::new();
-    let Ok(entries) = fs::read_dir(dir) else { return out };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
         if let Ok(rec) = serde_json::from_str::<SeenRecord>(&content) {
             out.insert(rec.session_id, rec.seen_at_ms);
         }
@@ -256,11 +282,17 @@ mod host_wire_format {
     fn parses_every_variant_the_daemon_emits() {
         assert_eq!(
             host(r#"{"kind":"zellij","session":"foam","pane_id":22}"#),
-            AgentHost::Zellij(ZellijRef { session: "foam".into(), pane_id: Some(22) })
+            AgentHost::Zellij(ZellijRef {
+                session: "foam".into(),
+                pane_id: Some(22)
+            })
         );
         assert_eq!(
             host(r#"{"kind":"herdr","workspace":"w5","pane_id":"w5:p1"}"#),
-            AgentHost::Herdr(HerdrRef { workspace: "w5".into(), pane_id: "w5:p1".into() })
+            AgentHost::Herdr(HerdrRef {
+                workspace: "w5".into(),
+                pane_id: "w5:p1".into()
+            })
         );
         assert_eq!(host(r#"{"kind":"unattached"}"#), AgentHost::Unattached);
         assert_eq!(
@@ -269,8 +301,14 @@ mod host_wire_format {
                     "herdr":{"workspace":"w5","pane_id":"w5:p1"}}"#
             ),
             AgentHost::Ambiguous {
-                zellij: ZellijRef { session: "foam".into(), pane_id: Some(22) },
-                herdr: HerdrRef { workspace: "w5".into(), pane_id: "w5:p1".into() },
+                zellij: ZellijRef {
+                    session: "foam".into(),
+                    pane_id: Some(22)
+                },
+                herdr: HerdrRef {
+                    workspace: "w5".into(),
+                    pane_id: "w5:p1".into()
+                },
             }
         );
     }
@@ -305,7 +343,10 @@ mod host_wire_format {
         .expect("agent row must parse");
         assert_eq!(
             snap.agents[0].host,
-            AgentHost::Herdr(HerdrRef { workspace: "w5".into(), pane_id: "w5:p1".into() })
+            AgentHost::Herdr(HerdrRef {
+                workspace: "w5".into(),
+                pane_id: "w5:p1".into()
+            })
         );
     }
 }
