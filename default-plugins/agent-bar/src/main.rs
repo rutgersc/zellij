@@ -93,9 +93,21 @@ const SPIN_SECS: f64 = 0.1;
 /// Spinner frames, one column wide each (braille reads cleanly in the marker
 /// cell). The in-flight row's age in fast ticks indexes this, mod its length.
 const SPIN_FRAMES: [char; 10] = [
-    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}',
-    '\u{2827}', '\u{2807}', '\u{280F}',
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280F}',
 ];
+
+fn focus_command(agent: &Agent, session_id: &str) -> String {
+    let agent_id = agent
+        .agent_id
+        .as_deref()
+        .map(|id| format!(" --agent-id {id}"))
+        .unwrap_or_default();
+    format!(
+        "mux focus-agent --provider {}{agent_id} {}",
+        agent.provider, session_id
+    )
+}
 /// Safety cap: drop an in-flight row after this many fast ticks (~10s) even if
 /// its RunCommandResult never arrives, so a lost result can't spin forever.
 const MAX_SPIN_TICKS: u32 = 100;
@@ -436,7 +448,11 @@ impl ZellijPlugin for State {
                 // spins), otherwise the normal poll cadence. This is the only
                 // set_timeout outside load, so exactly one timer is ever
                 // pending and the two rates can't stack.
-                self.cur_timeout = if self.in_flight.is_empty() { POLL_SECS } else { SPIN_SECS };
+                self.cur_timeout = if self.in_flight.is_empty() {
+                    POLL_SECS
+                } else {
+                    SPIN_SECS
+                };
                 set_timeout(self.cur_timeout);
                 changed
             },
@@ -454,7 +470,11 @@ impl ZellijPlugin for State {
                 true
             },
             Event::Mouse(Mouse::LeftClick(line, _col)) => {
-                let row = if line < 0 { return false } else { line as usize };
+                let row = if line < 0 {
+                    return false;
+                } else {
+                    line as usize
+                };
                 let hit = self
                     .row_ranges
                     .iter()
@@ -473,7 +493,7 @@ impl ZellijPlugin for State {
                         if let Some(idx) = self
                             .display_order()
                             .iter()
-                            .position(|a| a.session_id == sid)
+                            .position(|a| a.identity() == sid)
                         {
                             self.selected_idx = Some(idx);
                             self.follow_selection = true;
@@ -537,7 +557,7 @@ impl ZellijPlugin for State {
                     if let Some(sid) = self
                         .selected_idx
                         .and_then(|i| agents.get(i))
-                        .map(|a| a.session_id.clone())
+                        .map(Agent::identity)
                     {
                         // Go to the selected agent's pane, best effort — routes a
                         // live OR dead row. A dead agent's zellij pane usually
@@ -551,7 +571,7 @@ impl ZellijPlugin for State {
                 }
                 if activate {
                     if let Some(agent) = self.selected_idx.and_then(|i| agents.get(i)) {
-                        let sid = agent.session_id.clone();
+                        let sid = agent.identity();
                         // Enter acknowledges the row's attention (clears the
                         // yellow) even for select-only bg agents — that's their
                         // only way to be marked seen (no pane to focus).
@@ -592,12 +612,12 @@ impl ZellijPlugin for State {
                     // Copy the exact CLI behind the go-to-pane action:
                     // `mux focus-agent <focus_sid>`. Only rows that route to a pane
                     // have a command — bg / orphan rows carry no focus target.
-                    if let Some(target) = self
+                    if let Some((agent, target)) = self
                         .selected_idx
                         .and_then(|i| agents.get(i))
-                        .and_then(|a| self.focus_targets.get(&a.session_id))
+                        .and_then(|a| self.focus_targets.get(&a.identity()).map(|t| (a, t)))
                     {
-                        copy_to_clipboard(format!("mux focus-agent {target}"));
+                        copy_to_clipboard(focus_command(agent, target));
                         return true;
                     }
                     return false;
@@ -622,7 +642,11 @@ impl ZellijPlugin for State {
                 // otherwise looks exactly like success.
                 self.dispatch_error = (exit_code != Some(0)).then(|| {
                     let msg = String::from_utf8_lossy(&stderr);
-                    let msg = msg.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
+                    let msg = msg
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .last()
+                        .unwrap_or("");
                     match msg.trim() {
                         "" => format!("focus failed (exit {})", exit_code.unwrap_or(-1)),
                         m => m.to_owned(),
@@ -711,7 +735,10 @@ impl ZellijPlugin for State {
 impl State {
     fn current_agents(&self) -> &[Agent] {
         match &self.load {
-            LoadState::Polling { last: Some(ReadResult::Ok(a)), .. } => a,
+            LoadState::Polling {
+                last: Some(ReadResult::Ok(a)),
+                ..
+            } => a,
             _ => &[],
         }
     }
@@ -735,8 +762,12 @@ impl State {
     }
 
     fn am_focused(&self) -> bool {
-        let Some(own) = self.own_plugin_id else { return false };
-        let Some(idx) = self.active_tab_idx else { return false };
+        let Some(own) = self.own_plugin_id else {
+            return false;
+        };
+        let Some(idx) = self.active_tab_idx else {
+            return false;
+        };
         self.pane_manifest
             .panes
             .get(&idx)
@@ -763,7 +794,10 @@ impl State {
             return None;
         }
         if let Some(prev) = self.last_external_focused_pane {
-            if let Some(idx) = agents.iter().position(|a| a.host.zellij_pane_id() == Some(prev)) {
+            if let Some(idx) = agents
+                .iter()
+                .position(|a| a.host.zellij_pane_id() == Some(prev))
+            {
                 return Some(idx);
             }
         }
@@ -782,13 +816,12 @@ impl State {
     /// heartbeat, and `mux focus-agent` verifies the pane and aborts loudly if it
     /// is actually gone. bg / orphan rows carry no target and never route.
     fn focus_row(&mut self, sid: &str, allow_dead: bool) {
-        let is_dead = self
+        let agent = self
             .current_agents()
             .iter()
-            .find(|a| a.session_id == sid)
-            .map(|a| !a.active)
-            .unwrap_or(false);
-        if is_dead && !allow_dead {
+            .find(|a| a.identity() == sid)
+            .cloned();
+        if agent.as_ref().is_some_and(|a| !a.active) && !allow_dead {
             return;
         }
         if let Some(target) = self.focus_targets.get(sid).cloned() {
@@ -797,43 +830,64 @@ impl State {
             // this attempt's own result if this one fails too.
             self.dispatch_error = None;
             self.in_flight.insert(sid.to_string(), 0);
-            let _ = self.dispatch_focus_agent(&target, sid);
+            if let Some(agent) = agent {
+                let _ = self.dispatch_focus_agent(&agent, &target, sid);
+            }
         }
     }
 
-    fn dispatch_focus_agent(&self, focus_sid: &str, echo_sid: &str) -> String {
+    fn dispatch_focus_agent(&self, agent: &Agent, focus_sid: &str, echo_sid: &str) -> String {
         let label = focus_sid.get(..8).unwrap_or(focus_sid).to_string();
         let mut ctx = BTreeMap::new();
         ctx.insert("click_label".into(), label.clone());
         ctx.insert("session_id".into(), echo_sid.to_string());
-        run_command(&["mux", "focus-agent", focus_sid], ctx);
+        let mut args = vec!["mux", "focus-agent", "--provider", agent.provider.as_str()];
+        if let Some(agent_id) = agent.agent_id.as_deref() {
+            args.extend(["--agent-id", agent_id]);
+        }
+        args.push(focus_sid);
+        run_command(&args, ctx);
         label
     }
 
     fn effective_seen_at(&self, agent: &Agent) -> i64 {
         let disk = self.seen_disk.get(&agent.session_id).copied().unwrap_or(0);
-        let overlay = self.seen_overlay.get(&agent.session_id).copied().unwrap_or(0);
+        let overlay = self
+            .seen_overlay
+            .get(&agent.session_id)
+            .copied()
+            .unwrap_or(0);
         disk.max(overlay)
     }
 
-    fn acknowledge_agent(&mut self, session_id: &str) {
-        let Some(agent) = self.current_agents().iter().find(|a| a.session_id == session_id)
-        else { return };
+    fn acknowledge_agent(&mut self, identity: &str) {
+        let Some(agent) = self
+            .current_agents()
+            .iter()
+            .find(|a| a.identity() == identity)
+        else {
+            return;
+        };
         if agent.attention_at_ms == 0 {
             return;
         }
         let at_ms = agent.attention_at_ms;
-        let entry = self.seen_overlay.entry(session_id.to_string()).or_insert(0);
+        let session_id = agent.session_id.clone();
+        let entry = self.seen_overlay.entry(session_id.clone()).or_insert(0);
         if at_ms > *entry {
             *entry = at_ms;
         }
-        let Some(dir) = &self.seen_events_dir else { return };
+        let Some(dir) = &self.seen_events_dir else {
+            return;
+        };
         let _ = std::fs::create_dir_all(dir);
         let event = serde_json::json!({
             "session_id": session_id,
             "seen_at_ms": at_ms,
         });
-        let Ok(json) = serde_json::to_vec(&event) else { return };
+        let Ok(json) = serde_json::to_vec(&event) else {
+            return;
+        };
         let target = dir.join(format!("{session_id}.json"));
         let tmp = dir.join(format!("{session_id}.json.tmp"));
         if std::fs::write(&tmp, &json).is_ok() {
@@ -858,13 +912,17 @@ impl State {
     /// hides it); a later resume bumps `updated_at` past this and re-surfaces it.
     fn dismiss_agent(&mut self, session_id: &str) {
         self.dismissed_overlay.insert(session_id.to_string());
-        let Some(dir) = &self.dismissed_events_dir else { return };
+        let Some(dir) = &self.dismissed_events_dir else {
+            return;
+        };
         let _ = std::fs::create_dir_all(dir);
         let event = serde_json::json!({
             "session_id": session_id,
             "dismissed_at_ms": now_ms(),
         });
-        let Ok(json) = serde_json::to_vec(&event) else { return };
+        let Ok(json) = serde_json::to_vec(&event) else {
+            return;
+        };
         let target = dir.join(format!("{session_id}.json"));
         let tmp = dir.join(format!("{session_id}.json.tmp"));
         if std::fs::write(&tmp, &json).is_ok() {
@@ -906,7 +964,14 @@ impl State {
             Ok(snapshot) => snapshot
                 .live_sessions
                 .into_iter()
-                .map(|s| (s.name, SessionMeta { clients: s.connected_clients }))
+                .map(|s| {
+                    (
+                        s.name,
+                        SessionMeta {
+                            clients: s.connected_clients,
+                        },
+                    )
+                })
                 .collect(),
             // Only fails when the server's session-scan state is missing, which
             // can't recover — drop the list rather than keep asserting stale
@@ -921,7 +986,9 @@ impl State {
     }
 
     fn refresh_seen_disk(&mut self) -> bool {
-        let Some(dir) = &self.seen_events_dir else { return false };
+        let Some(dir) = &self.seen_events_dir else {
+            return false;
+        };
         let new = agents::read_seen_events(dir);
         if new == self.seen_disk {
             return false;
@@ -940,7 +1007,12 @@ impl State {
         self.prune_overlay(&raw_agents);
         self.refresh_seen_disk();
 
-        let session = self.mode_info.session_name.as_deref().unwrap_or("").to_string();
+        let session = self
+            .mode_info
+            .session_name
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
         // Panes "in view" right now = the non-suppressed terminal panes of
         // THIS session's active tab. An agent whose pane is among them is on
         // screen (its tab is the active one) — that's what green now signals,
@@ -983,7 +1055,7 @@ impl State {
                 && agent.host.zellij_session() == Some(session.as_str())
                 && matches!(agent.host.zellij_pane_id(), Some(pid) if in_view_pane_ids.contains(&pid));
             flags.insert(
-                agent.session_id.clone(),
+                agent.identity(),
                 Flags {
                     unrouted,
                     needs_attention: unseen,
@@ -1006,15 +1078,15 @@ impl State {
         for g in &groups {
             for r in &g.rows {
                 if let Some(t) = &r.focus_sid {
-                    self.focus_targets.insert(r.agent.session_id.clone(), t.clone());
+                    self.focus_targets.insert(r.agent.identity(), t.clone());
                 }
             }
         }
 
         // Clamp selected_idx in case agents went away between ticks.
-        self.selected_idx = self.selected_idx.and_then(|i| {
-            display.len().checked_sub(1).map(|max| i.min(max))
-        });
+        self.selected_idx = self
+            .selected_idx
+            .and_then(|i| display.len().checked_sub(1).map(|max| i.min(max)));
 
         // Names wrap inside `cols - OUTER_PAD - AGENT_INDENT` (col 0 + the `>`
         // marker + the space are reserved on the left). Headers use
@@ -1030,14 +1102,19 @@ impl State {
         let selected_sid = self
             .selected_idx
             .and_then(|i| display.get(i))
-            .map(|a| a.session_id.clone());
+            .map(Agent::identity);
 
         let end = (self.scroll_offset + rows).min(lines.len());
         for (visible_row, abs_idx) in (self.scroll_offset..end).enumerate() {
             let line = &lines[abs_idx];
             let rendered = match line {
                 Line::Padding => render_padding(colors, cols),
-                Line::Header { label, unrouted_in_group, open_elsewhere, switch_to } => {
+                Line::Header {
+                    label,
+                    unrouted_in_group,
+                    open_elsewhere,
+                    switch_to,
+                } => {
                     let is_active = !session.is_empty() && label.as_str() == session.as_str();
                     if let Some(name) = switch_to {
                         self.row_ranges
@@ -1117,12 +1194,7 @@ impl State {
         frame
     }
 
-    fn adjust_scroll(
-        &mut self,
-        agent_row_starts: &[(usize, usize)],
-        lines: &[Line],
-        rows: usize,
-    ) {
+    fn adjust_scroll(&mut self, agent_row_starts: &[(usize, usize)], lines: &[Line], rows: usize) {
         let follow = std::mem::take(&mut self.follow_selection);
         let range = self
             .selected_idx
@@ -1300,10 +1372,19 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
                 .into_iter()
                 .map(|t| {
                     let sid = t.session_id.clone();
-                    Row { agent: t, is_child: false, is_last_child: false, focus_sid: Some(sid) }
+                    Row {
+                        agent: t,
+                        is_child: false,
+                        is_last_child: false,
+                        focus_sid: Some(sid),
+                    }
                 })
                 .collect();
-            Group { label, rows, any_unrouted }
+            Group {
+                label,
+                rows,
+                any_unrouted,
+            }
         })
         .collect();
 
@@ -1314,7 +1395,9 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
     groups.sort_by(|a, b| {
         a.label.rank().cmp(&b.label.rank()).then_with(|| {
             let (a, b) = (a.label.as_str(), b.label.as_str());
-            a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a.cmp(b))
         })
     });
 
@@ -1324,7 +1407,12 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
         bg.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
         let rows = bg
             .into_iter()
-            .map(|a| Row { agent: a, is_child: false, is_last_child: false, focus_sid: None })
+            .map(|a| Row {
+                agent: a,
+                is_child: false,
+                is_last_child: false,
+                focus_sid: None,
+            })
             .collect();
         groups.push(Group {
             label: GroupLabel::BackgroundAgents,
@@ -1372,7 +1460,7 @@ fn build_lines(
         });
         for row in &g.rows {
             let a = &row.agent;
-            let f = flags.get(&a.session_id).copied().unwrap_or(Flags {
+            let f = flags.get(&a.identity()).copied().unwrap_or(Flags {
                 unrouted: false,
                 needs_attention: false,
                 is_in_view: false,
@@ -1387,12 +1475,16 @@ fn build_lines(
             // Children render single-line, name aligned under the parent's
             // name; the `└`/`├` connector lives in the marker columns (rendered
             // by render_agent_line), not in the text. Parents wrap to MAX_NAME_LINES.
-            let max_lines = if row.is_child { MAX_CHILD_NAME_LINES } else { MAX_NAME_LINES };
+            let max_lines = if row.is_child {
+                MAX_CHILD_NAME_LINES
+            } else {
+                MAX_NAME_LINES
+            };
             let wrapped = wrap_text(&name, content_w, max_lines);
             let start = lines.len();
             for (i, w) in wrapped.into_iter().enumerate() {
                 lines.push(Line::AgentRow {
-                    sid: a.session_id.clone(),
+                    sid: a.identity(),
                     status: a.status.clone(),
                     text: w,
                     needs_attention: f.needs_attention,
@@ -1620,7 +1712,11 @@ fn render_agent_line(
     // reporting"; yellow overrides with "and it wants you now".
     let is_unknown = !dead && matches!(status, AgentStatus::Unknown(_));
     let alert = !dead && (needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown);
-    let alert_color = if is_unknown && !needs_attention { colors.error } else { colors.yellow };
+    let alert_color = if is_unknown && !needs_attention {
+        colors.error
+    } else {
+        colors.yellow
+    };
     let in_view = is_in_view && !dead;
 
     // Selection is the dominant signal: when a row is selected it claims the
@@ -1633,7 +1729,11 @@ fn render_agent_line(
     //           survives selection here — green outranks alert.)
     // col 3   → selected grey · alert · in-view green · neutral.  (selection
     //           outranks everything on the body.)
-    let col0_bg = if selected { colors.selected_bg } else { colors.bar_bg };
+    let col0_bg = if selected {
+        colors.selected_bg
+    } else {
+        colors.bar_bg
+    };
     let mid_bg = if in_view {
         colors.green
     } else if alert {
@@ -1698,7 +1798,11 @@ fn render_agent_line(
         spin
     } else if is_child {
         // Connector sits in the marker column, directly under the parent's `>`.
-        if is_last_child { '\u{2514}' } else { '\u{251c}' } // └ / ├
+        if is_last_child {
+            '\u{2514}'
+        } else {
+            '\u{251c}'
+        } // └ / ├
     } else if dead {
         '\u{2020}' // † — tracked-but-not-active
     } else if is_bg {
@@ -1715,9 +1819,17 @@ fn render_agent_line(
     // name fg. The unrouted `✗` stays error red (its own signal), swapping to
     // on-colour only where red wouldn't read.
     let marker_fg = if dead {
-        if selected { colors.selected_fg } else { name_fg }
+        if selected {
+            colors.selected_fg
+        } else {
+            name_fg
+        }
     } else if unrouted && !is_bg && spinner.is_none() {
-        if in_view || alert { colors.on_color } else { colors.error }
+        if in_view || alert {
+            colors.on_color
+        } else {
+            colors.error
+        }
     } else if selected {
         colors.selected_fg
     } else if in_view || alert {
