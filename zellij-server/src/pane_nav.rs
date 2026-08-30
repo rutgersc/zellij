@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 /// One live tab of the recording session: (stable id, display position, name).
 pub type TabSnapshot = (usize, usize, String);
 
-/// Backstop only — dead tabs are pruned continuously, so the tree stays far
-/// below this in practice.
-const MAX_NODES: usize = 64;
+/// How many visits the tree keeps. Deliberately small: this is a jump history
+/// you read at a glance, not an archive.
+const MAX_NODES: usize = 10;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Node {
@@ -160,86 +160,101 @@ fn refresh_session(state: &mut NavState, session: &str, tabs: &[TabSnapshot]) ->
     changed
 }
 
-/// Trim to `MAX_NODES` by dropping the oldest leaves. Never touches the cursor
-/// or its ancestors — the path you are standing on outranks any age rule.
+/// Trim to `MAX_NODES` by dropping the oldest visits. Only the cursor is spared
+/// — the node you are standing on outranks any age rule.
+///
+/// Dropping the *oldest* rather than the oldest leaf is what makes the cap hold:
+/// navigation is overwhelmingly linear, and a chain has exactly one leaf, which
+/// is usually the cursor. A leaf-only rule therefore had nothing it was allowed
+/// to drop and the tree grew without bound.
 fn prune(state: &mut NavState) {
     while state.nodes.len() > MAX_NODES {
-        let mut protected = vec![state.cursor];
-        let mut walk = state.node(state.cursor).and_then(|n| n.parent);
-        while let Some(id) = walk {
-            protected.push(id);
-            walk = state.node(id).and_then(|n| n.parent);
-        }
         // Ids are monotonic, so they order nodes chronologically without
         // depending on `at`, whose one-second resolution ties constantly.
-        let oldest_leaf = state
+        let oldest = state
             .nodes
             .iter()
-            .filter(|n| !protected.contains(&n.id) && state.children_of(n.id).next().is_none())
-            .min_by_key(|n| n.id)
-            .map(|n| n.id);
-        match oldest_leaf {
+            .map(|n| n.id)
+            .filter(|id| *id != state.cursor)
+            .min();
+        match oldest {
+            // Splicing (see `remove_node`) keeps the rest of the chain hanging
+            // together: the second-oldest node simply becomes a root.
             Some(id) => remove_node(state, id),
             None => break,
         }
     }
 }
 
-pub fn record(session: &str, tab_id: usize, tabs: &[TabSnapshot]) {
+/// What folding one visit into the tree did.
+enum Visit {
+    /// It is in the tree. `changed` is false for the echo of a move `step` (or
+    /// the picker) just made, which the funnel reports back a moment later.
+    Folded { changed: bool },
+    /// The snapshot could not account for the visit, so the tree was left alone.
+    Refused,
+}
+
+/// Reports whether the visit made it into the tree. `false` means the caller
+/// must not remember this visit as done — nothing was recorded, and only
+/// asking again can fix that.
+#[must_use]
+pub fn record(session: &str, tab_id: usize, tabs: &[TabSnapshot]) -> bool {
     let mut state = load();
-    // The funnel fires on every session-state report, so most calls are a
-    // no-op echo; writing regardless would churn the file all day.
-    if apply(&mut state, session, tab_id, tabs) {
-        store(&state);
+    match apply(&mut state, session, tab_id, tabs) {
+        Visit::Folded { changed } => {
+            // The funnel fires on every session-state report, so most calls are
+            // a no-op echo; writing regardless would churn the file all day.
+            if changed {
+                store(&state);
+            }
+            true
+        },
+        Visit::Refused => false,
     }
 }
 
-/// Record a tab change. Revisiting the cursor's parent or one of its children
-/// only moves the cursor — otherwise ping-ponging between two tabs would grow a
-/// node per hop, and vim likewise adds nothing when you redo into a state that
-/// already exists. Anything else is genuinely new and branches off the cursor.
-fn apply(state: &mut NavState, session: &str, tab_id: usize, tabs: &[TabSnapshot]) -> bool {
-    let refreshed = refresh_session(state, session, tabs);
-
-    if state.node(state.cursor).is_some_and(|n| n.is(session, tab_id)) {
-        return refreshed;
-    }
+/// Record a tab change: every hop gets its own node, hanging off the cursor.
+/// Revisiting a tab the tree already holds is still a visit — a back/forward
+/// stack that silently swallowed the hops you make between two tabs is exactly
+/// what stopped the tree from matching what you actually did.
+///
+/// The one hop that is *not* navigation is landing on the tab the cursor already
+/// names: that is the focus funnel echoing a move `step` (or the picker) just
+/// made, so it must stay a no-op or every back would append a node.
+fn apply(state: &mut NavState, session: &str, tab_id: usize, tabs: &[TabSnapshot]) -> Visit {
+    // A snapshot that does not hold the client's own active tab is a torn view
+    // of the session — mid tab-close, mid layout-apply. It has to be refused
+    // before `refresh_session` touches anything: that reads every tab missing
+    // from the snapshot as closed and drops its nodes, and the visit itself
+    // cannot be added in their place, so the session leaves the tree with
+    // nothing to show for it.
     let Some((_, tab_position, tab_name)) = tabs.iter().find(|(id, _, _)| *id == tab_id) else {
-        return refreshed;
+        return Visit::Refused;
     };
+    let (tab_position, tab_name) = (*tab_position, tab_name.clone());
 
-    let adjacent = state
-        .children_of(state.cursor)
-        .chain(
-            state
-                .node(state.cursor)
-                .and_then(|n| n.parent)
-                .and_then(|p| state.node(p)),
-        )
-        .find(|n| n.is(session, tab_id))
-        .map(|n| n.id);
-
-    match adjacent {
-        Some(id) => state.set_cursor(id),
-        None => {
-            let id = state.next_id;
-            state.next_id += 1;
-            let parent = state.node(state.cursor).map(|n| n.id);
-            state.nodes.push(Node {
-                id,
-                session: session.to_string(),
-                tab_id,
-                tab_position: *tab_position,
-                tab_name: tab_name.clone(),
-                parent,
-                last_child: None,
-                at: now(),
-            });
-            state.set_cursor(id);
-        },
+    let refreshed = refresh_session(state, session, tabs);
+    if state.node(state.cursor).is_some_and(|n| n.is(session, tab_id)) {
+        return Visit::Folded { changed: refreshed };
     }
+
+    let id = state.next_id;
+    state.next_id += 1;
+    let parent = state.node(state.cursor).map(|n| n.id);
+    state.nodes.push(Node {
+        id,
+        session: session.to_string(),
+        tab_id,
+        tab_position,
+        tab_name,
+        parent,
+        last_child: None,
+        at: now(),
+    });
+    state.set_cursor(id);
     prune(state);
-    true
+    Visit::Folded { changed: true }
 }
 
 /// Step the cursor one place along the tree; returns the (session, tab id, tab
@@ -295,6 +310,10 @@ mod tests {
         state.node(state.cursor).unwrap().tab_id
     }
 
+    fn changed(visit: Visit) -> bool {
+        matches!(visit, Visit::Folded { changed: true })
+    }
+
     #[test]
     fn linear_visits_form_a_chain() {
         let live = tabs(&[1, 2, 3]);
@@ -329,13 +348,84 @@ mod tests {
     }
 
     #[test]
-    fn ping_pong_between_two_tabs_adds_no_nodes() {
+    fn ping_pong_between_two_tabs_records_every_hop() {
         let live = tabs(&[1, 2]);
         let mut state = NavState::default();
         [1, 2, 1, 2, 1].iter().for_each(|t| go(&mut state, *t, &live));
 
+        assert_eq!(state.nodes.len(), 5);
+        assert_eq!(
+            state.nodes.iter().map(|n| n.tab_id).collect::<Vec<_>>(),
+            vec![1, 2, 1, 2, 1]
+        );
+    }
+
+    #[test]
+    fn stepping_back_does_not_append_the_tab_it_lands_on() {
+        let live = tabs(&[1, 2]);
+        let mut state = NavState::default();
+        [1, 2].iter().for_each(|t| go(&mut state, *t, &live));
+
+        advance(&mut state, false).unwrap();
+        // The focus funnel echoes the move `advance` just made.
+        assert!(!changed(apply(&mut state, S, 1, &live)));
         assert_eq!(state.nodes.len(), 2);
-        assert_eq!(cursor_tab(&state), 1);
+    }
+
+    #[test]
+    fn a_snapshot_missing_the_visited_tab_leaves_the_tree_alone() {
+        let live = tabs(&[1, 2]);
+        let mut state = NavState::default();
+        [1, 2].iter().for_each(|t| go(&mut state, *t, &live));
+
+        // What the funnel reports mid tab-close: an active tab that the snapshot
+        // of its own session does not contain. Acting on it used to prune every
+        // node of the session and add nothing back.
+        assert!(matches!(apply(&mut state, S, 2, &[]), Visit::Refused));
+
+        assert_eq!(state.nodes.len(), 2);
+        assert_eq!(cursor_tab(&state), 2);
+    }
+
+    #[test]
+    fn the_history_keeps_only_the_newest_visits() {
+        let live = tabs(&[1, 2]);
+        let mut state = NavState::default();
+        (0..MAX_NODES * 2).for_each(|i| go(&mut state, 1 + i % 2, &live));
+
+        assert_eq!(state.nodes.len(), MAX_NODES);
+        // The survivors are the last MAX_NODES ids handed out, and the oldest of
+        // them is a root — `remove_node` spliced the chain back together.
+        let ids: Vec<usize> = state.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, (MAX_NODES..MAX_NODES * 2).collect::<Vec<_>>());
+        assert_eq!(state.nodes[0].parent, None);
+    }
+
+    #[test]
+    fn pruning_spares_the_cursor_even_when_it_is_the_oldest_node() {
+        // Built by hand: `apply` always prunes with the cursor on the node it
+        // just pushed, so the guard is only reachable from a state loaded off
+        // disk after the user stepped back.
+        let mut state = NavState::default();
+        (0..MAX_NODES + 3).for_each(|i| {
+            state.nodes.push(Node {
+                id: i,
+                session: S.to_string(),
+                tab_id: i,
+                tab_position: i,
+                tab_name: format!("tab{i}"),
+                parent: (i > 0).then(|| i - 1),
+                last_child: None,
+                at: 0,
+            })
+        });
+        state.next_id = MAX_NODES + 3;
+        state.cursor = 0;
+
+        prune(&mut state);
+
+        assert_eq!(state.nodes.len(), MAX_NODES);
+        assert!(state.node(0).is_some());
     }
 
     #[test]
@@ -372,9 +462,18 @@ mod tests {
         let live = tabs(&[1, 2]);
         let mut state = NavState::default();
 
-        assert!(apply(&mut state, S, 1, &live), "first visit creates the root");
-        assert!(!apply(&mut state, S, 1, &live), "echo of the cursor changes nothing");
-        assert!(apply(&mut state, S, 2, &live), "a genuine move changes the tree");
+        assert!(
+            changed(apply(&mut state, S, 1, &live)),
+            "first visit creates the root"
+        );
+        assert!(
+            !changed(apply(&mut state, S, 1, &live)),
+            "echo of the cursor changes nothing"
+        );
+        assert!(
+            changed(apply(&mut state, S, 2, &live)),
+            "a genuine move changes the tree"
+        );
     }
 
     #[test]
