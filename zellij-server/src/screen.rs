@@ -7230,9 +7230,14 @@ impl Screen {
             }
             if let Some(&tab_id) = self.active_tab_ids.get(&client_id) {
                 if self.last_nav_recorded.get(&client_id) != Some(&tab_id) {
-                    self.last_nav_recorded.insert(client_id, tab_id);
+                    // Remember the visit only once it is actually in the tree.
+                    // Committing first and recording after loses the visit for
+                    // good on a torn snapshot: the memo says done, and a session
+                    // whose client never leaves that tab never asks again.
                     let tabs = self.tab_snapshot();
-                    crate::pane_nav::record(&self.session_name, tab_id, &tabs);
+                    if crate::pane_nav::record(&self.session_name, tab_id, &tabs) {
+                        self.last_nav_recorded.insert(client_id, tab_id);
+                    }
                 }
             }
         }
