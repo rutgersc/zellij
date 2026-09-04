@@ -35,7 +35,8 @@
 //!
 //! An agent whose live heartbeat is gone is kept as *tracked-but-not-active*
 //! (the daemon carries it forward as `active: false`): it renders dim with a
-//! `†` marker and no in-view/alert tint, so the list stays a durable history
+//! and no in-view/alert tint, its age still ticking up, so the list stays a
+//! durable history
 //! until the user clears it. `x` dismisses the selected inactive row — it
 //! writes an `AgentDismissed` tombstone to `agent-dismissed-events/` (the
 //! daemon then drops it from the readmodel) and hides it optimistically. Live
@@ -54,7 +55,7 @@
 //! gone. `y` yanks the id, `x` dismisses an inactive row, Esc returns focus to
 //! the previous pane. Rows with no resolvable focus target (bg / orphan
 //! children) only select. While that `mux` command is in flight a braille
-//! spinner replaces the row's `>` marker (col 1), so a slow focus shows work
+//! spinner replaces the row's age gutter, so a slow focus shows work
 //! happening right where you clicked; it clears on the matching
 //! RunCommandResult (or, as a safety net, after MAX_SPIN_TICKS). If that result
 //! carries a non-zero exit, `mux`'s own stderr becomes a red banner on the last
@@ -117,14 +118,21 @@ const MAX_NAME_LINES: usize = 4;
 /// Nested bg children render on a single line — visually subordinate to their
 /// parent (which wraps up to MAX_NAME_LINES).
 const MAX_CHILD_NAME_LINES: usize = 1;
-/// Width of col 0 — the leftmost cell of every agent row. Shows the selection
-/// grey when keyboard-selected, otherwise neutral. It's the innermost (least
-/// dominant) layer of the per-column state stack (see palette block below).
+/// Width of the header strip's leading cell — a header_bg space giving the
+/// session title a 1-col lead instead of butting against the pane edge. Agent
+/// rows have no such margin: their gutter starts at col 0.
 const OUTER_PAD: usize = 1;
-/// After col 0, two more cols before the wrapped name: col 1 = the `>` row
-/// marker (or `✗` if unrouted), col 2 = a single space. Both sit in the
-/// per-column state stack; the marker glyph rides on col 1's bg.
-const AGENT_INDENT: usize = 2;
+/// The age gutter: cols 0..3 of every agent row, holding the right-aligned
+/// time-since-last-activity (`1m`, `44m`, ` 4h`, `9d+`). It replaces the old
+/// `>` marker and does that marker's job — an aligned rail down the left edge
+/// that says where each agent block starts — while carrying information the
+/// `>` didn't. Exactly wide enough for the widest bucket `format_age` emits.
+const AGE_W: usize = 3;
+/// One column between the gutter and the name, so `44m` can't run into a title.
+/// Together with AGE_W this is the agent row's total left indent.
+const AGE_GAP: usize = 1;
+/// Total cols an agent row spends before the wrapped name starts.
+const AGENT_INDENT: usize = AGE_W + AGE_GAP;
 const SESSIONLESS_LABEL: &str = "sessionless";
 const AMBIGUOUS_LABEL: &str = "ambiguous host";
 const HERDR_LABEL: &str = "herdr";
@@ -133,13 +141,12 @@ const HERDR_LABEL: &str = "herdr";
 // session picker later). Concurrent states are composited as a PER-COLUMN
 // priority stack across the row's first columns (a z-stack projected onto the
 // left edge — lower-priority states "peek out" to the left as the dominant one
-// takes the body). Columns: 0 | 1 (`>`) | 2 (space) | 3.. (name).
+// takes the body). Columns: 0..3 (age gutter) | 3 (gap) | 4.. (name).
 //
-//   col 0      → grey if selected, else neutral.
-//   col 1 & 2  → in-view green · else alert (yellow, or red if unknown) · else
+//   gutter+gap → in-view green · else alert (yellow, or red if unknown) · else
 //                selected grey · else neutral.   (context tint survives
-//                selection here — the middle keeps its green/yellow.)
-//   col 3 name → selected grey · else alert (yellow/red) · else in-view green
+//                selection here — the gutter keeps its green/yellow.)
+//   name       → selected grey · else alert (yellow/red) · else in-view green
 //                · else neutral.   (selection outranks everything on the body,
 //                so a highlighted row is unmissable even when green/yellow.)
 // Within alert, needs-attention outranks unknown: red is the unattended shade,
@@ -152,9 +159,9 @@ const HERDR_LABEL: &str = "herdr";
 //   unknown → on-colour (its body is red, or yellow once it needs attention).
 //   idle /  → text on a neutral body, on-colour on a green/yellow body
 //   waiting    (colourless states carry no hue to lose).
-// The `>` marker rides on col 1 (the middle): selection wins first (selected-fg,
-// matching the name so the selected row's marker + name are one solid highlight),
-// else on-colour over a tinted middle, else the name fg.
+// The age rides on the gutter: selection wins first (selected-fg, matching the
+// name so the selected row's age + name are one solid highlight), else on-colour
+// over a tinted gutter, else the name fg.
 //
 // All colours resolve from `mode_info.style.colors` so a ChangeTheme repaints
 // everything at once — green/yellow/on-colour/magenta come from ribbon_selected,
@@ -306,6 +313,13 @@ struct State {
     /// fast ticks — used both as the spinner frame index and the
     /// MAX_SPIN_TICKS safety cap.
     in_flight: HashMap<String, u32>,
+    /// Last age label rendered per agent identity. The readmodel is byte-identical
+    /// between polls for an idle agent, so `same_result` alone would hold the
+    /// frame and freeze every clock in the gutter at whatever it read when the
+    /// agent last changed. Comparing the *label* rather than `updated_at_ms`
+    /// repaints exactly on a bucket flip (`59m` → `1h`) and not on the ~2400
+    /// ticks in between.
+    age_labels: HashMap<String, String>,
     /// Adaptive-timer accounting: the interval the currently-pending Timer was
     /// armed at, and elapsed time accumulated toward the next readmodel poll.
     cur_timeout: f64,
@@ -427,6 +441,9 @@ impl ZellijPlugin for State {
                         *last = Some(new);
                     }
                     if self.refresh_seen_disk() {
+                        changed = true;
+                    }
+                    if self.refresh_age_labels() {
                         changed = true;
                     }
                 }
@@ -1088,12 +1105,19 @@ impl State {
             .selected_idx
             .and_then(|i| display.len().checked_sub(1).map(|max| i.min(max)));
 
-        // Names wrap inside `cols - OUTER_PAD - AGENT_INDENT` (col 0 + the `>`
-        // marker + the space are reserved on the left). Headers use
-        // `cols - OUTER_PAD`.
-        let name_wrap_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
-        let (lines, agent_row_starts) =
-            build_lines(&groups, &flags, name_wrap_w, &self.sessions, &session);
+        // Names wrap inside `cols - AGENT_INDENT` (the age gutter + its gap are
+        // reserved on the left), matching `render_agent_line`'s own budget
+        // exactly — a wrap width narrower than the render width silently loses a
+        // column of every title. Headers use `cols - OUTER_PAD`.
+        let name_wrap_w = cols.saturating_sub(AGENT_INDENT);
+        let (lines, agent_row_starts) = build_lines(
+            &groups,
+            &flags,
+            name_wrap_w,
+            &self.sessions,
+            &session,
+            now_ms(),
+        );
 
         // Scroll so selected agent's first line is visible.
         self.adjust_scroll(&agent_row_starts, &lines, rows);
@@ -1133,6 +1157,7 @@ impl State {
                     sid,
                     status,
                     text,
+                    age,
                     needs_attention,
                     unrouted,
                     is_in_view,
@@ -1151,6 +1176,7 @@ impl State {
                         .map(|&age| SPIN_FRAMES[age as usize % SPIN_FRAMES.len()]);
                     render_agent_line(
                         text,
+                        age,
                         status.clone(),
                         *needs_attention,
                         *unrouted,
@@ -1192,6 +1218,26 @@ impl State {
         }
 
         frame
+    }
+
+    /// Recompute every agent's age label and report whether any of them moved.
+    /// Read-only against the readmodel — the labels here exist only to answer
+    /// "does the gutter look different now than it did last poll".
+    fn refresh_age_labels(&mut self) -> bool {
+        let LoadState::Polling { last, .. } = &self.load else {
+            return false;
+        };
+        let Some(ReadResult::Ok(agents)) = last else {
+            return false;
+        };
+        let now = now_ms();
+        let fresh: HashMap<String, String> = agents
+            .iter()
+            .map(|a| (a.identity(), format_age(now, a.updated_at_ms)))
+            .collect();
+        let changed = fresh != self.age_labels;
+        self.age_labels = fresh;
+        changed
     }
 
     fn adjust_scroll(&mut self, agent_row_starts: &[(usize, usize)], lines: &[Line], rows: usize) {
@@ -1287,11 +1333,11 @@ struct Flags {
     unrouted: bool,
     needs_attention: bool,
     is_in_view: bool,
-    /// False for tracked-but-not-active agents — rendered dim with a `†`
-    /// marker, no in-view/alert tint.
+    /// False for tracked-but-not-active agents — rendered dim, no in-view/alert
+    /// tint. The age gutter keeps running, so the row says when it went quiet.
     active: bool,
-    /// A background (`run_in_background`) agent — rendered with a neutral `∙`
-    /// marker instead of `>`/`✗`, and never clickable (no pane to focus).
+    /// A background (`run_in_background`) agent — never clickable (no pane to
+    /// focus), and never marked `✗` for it. Its own group header says it's bg.
     is_bg: bool,
 }
 
@@ -1314,20 +1360,25 @@ enum Line {
         sid: String,
         status: AgentStatus,
         text: String,
+        /// Pre-formatted, `AGE_W`-wide time since last activity. Computed once
+        /// per build (not per render) so every row in a frame is aged against
+        /// the same instant, and so the repaint-dedupe can compare the label
+        /// the user actually sees rather than the raw millis behind it.
+        age: String,
         needs_attention: bool,
         unrouted: bool,
         is_in_view: bool,
         active: bool,
-        /// True on the first wrap-line of an agent — the `>` (or `✗` if
-        /// unrouted, `†` if inactive) row marker shows only on this line so
-        /// adjacent agents with the same bg tint stay visually distinct.
+        /// True on the first wrap-line of an agent — the age gutter (or `✗` if
+        /// unrouted) fills only on this line so adjacent agents with the same
+        /// bg tint stay visually distinct.
         is_first_wrap_line: bool,
-        /// A nested bg child — the `>` marker column becomes the `└`/`├`
-        /// connector (under the parent's `>`) so it reads as subordinate.
+        /// A nested bg child — the age gutter becomes the `└`/`├` connector,
+        /// sitting under the parent's age, so it reads as subordinate.
         is_child: bool,
         /// Last child of its parent → `└`, otherwise `├`.
         is_last_child: bool,
-        /// A background agent — neutral `∙` marker, select-only.
+        /// A background agent — select-only.
         is_bg: bool,
     },
 }
@@ -1433,6 +1484,7 @@ fn build_lines(
     content_w: usize,
     sessions: &HashMap<String, SessionMeta>,
     own_session: &str,
+    now: i64,
 ) -> (Vec<Line>, Vec<(usize, usize)>) {
     let mut lines: Vec<Line> = Vec::new();
     let mut agent_rows: Vec<(usize, usize)> = Vec::new();
@@ -1481,12 +1533,14 @@ fn build_lines(
                 MAX_NAME_LINES
             };
             let wrapped = wrap_text(&name, content_w, max_lines);
+            let age = format_age(now, a.updated_at_ms);
             let start = lines.len();
             for (i, w) in wrapped.into_iter().enumerate() {
                 lines.push(Line::AgentRow {
                     sid: a.identity(),
                     status: a.status.clone(),
                     text: w,
+                    age: age.clone(),
                     needs_attention: f.needs_attention,
                     unrouted: f.unrouted,
                     is_in_view: f.is_in_view,
@@ -1611,10 +1665,11 @@ fn render_header(
     colors: &AgentColors,
     cols: usize,
 ) -> String {
-    // The header strip spans the full row width in header_bg — unlike agent
-    // rows it has no bar_bg margin, so it extends past OUTER_PAD to the left
-    // edge. The leading col is a header_bg space, giving the title a 1-col
-    // lead instead of butting against the edge.
+    // The header strip spans the full row width in header_bg. Its leading col
+    // (OUTER_PAD) is a header_bg space, giving the title a 1-col lead instead of
+    // butting against the pane edge — a session name therefore starts one col
+    // right of an agent's age gutter and three left of an agent's title, so the
+    // two kinds of row are never mistaken for each other.
     let body_w = cols.saturating_sub(OUTER_PAD);
     let mut text_budget = body_w;
     let mut trimmed = String::new();
@@ -1683,6 +1738,7 @@ fn render_header(
 
 fn render_agent_line(
     text: &str,
+    age: &str,
     status: AgentStatus,
     needs_attention: bool,
     unrouted: bool,
@@ -1698,8 +1754,10 @@ fn render_agent_line(
     cols: usize,
 ) -> String {
     // Tracked-but-not-active rows carry no live signal — they render dim with a
-    // `†` marker and none of the in-view/alert tints. `dead` short-circuits all
-    // of those so a frozen busy/waiting/unknown status doesn't paint a stale hue.
+    // none of the in-view/alert tints. `dead` short-circuits all of those so a
+    // frozen busy/waiting/unknown status doesn't paint a stale hue. The age is
+    // the exception — it keeps rendering, and is the row's clearest signal:
+    // "dim, 4h" says died-a-while-ago in a way a `†` never could.
     let dead = !active;
     // Per-column priority stack (see the palette block at the top of this
     // file). `alert` = needs-attention / waiting / unknown; it shows yellow,
@@ -1720,20 +1778,14 @@ fn render_agent_line(
     let in_view = is_in_view && !dead;
 
     // Selection is the dominant signal: when a row is selected it claims the
-    // BODY (col 3) bg + the name fg outright, so the highlight is unmissable
-    // even on a green/yellow row. Only the MIDDLE (col 1/2) keeps the context
-    // tint, so a selected row still shows a sliver of its green/yellow there.
+    // BODY bg + the name fg outright, so the highlight is unmissable even on a
+    // green/yellow row. Only the GUTTER keeps the context tint, so a selected
+    // row still shows a sliver of its green/yellow down the left edge.
     //
-    // col 0   → selected grey, else neutral.
-    // col 1/2 → in-view green · alert · selected grey · neutral.  (context tint
-    //           survives selection here — green outranks alert.)
-    // col 3   → selected grey · alert · in-view green · neutral.  (selection
-    //           outranks everything on the body.)
-    let col0_bg = if selected {
-        colors.selected_bg
-    } else {
-        colors.bar_bg
-    };
+    // gutter + gap → in-view green · alert · selected grey · neutral.  (context
+    //                tint survives selection here — green outranks alert.)
+    // body         → selected grey · alert · in-view green · neutral. (selection
+    //                outranks everything on the body.)
     let mid_bg = if in_view {
         colors.green
     } else if alert {
@@ -1788,37 +1840,43 @@ fn render_agent_line(
         style.paint(s).to_string()
     };
 
-    // Marker (col 1), first wrap-line only (blanked on continuations so stacked
-    // agents stay distinct). An in-flight click spinner preempts the static
-    // marker on the first wrap-line, so the "working" feedback lands exactly on
-    // the row you clicked.
-    let marker_char = if !is_first_wrap_line {
-        ' '
+    // What the gutter shows, first wrap-line only (blank on continuations so
+    // stacked agents stay distinct). The age is the default; three states
+    // preempt it, all right-aligned into the same `AGE_W` cells:
+    //
+    //   spinner  — an in-flight click, so the "working" feedback lands exactly
+    //              on the row you clicked. Transient, and while it spins the age
+    //              is the least interesting thing about the row.
+    //   `└`/`├`  — a nested bg child's connector. Structural, not optional: it
+    //              is what makes the child read as subordinate to the parent
+    //              whose gutter it sits under. Children forfeit their age.
+    //   `✗`      — no pane to route to. Kept because it changes what a click
+    //              does; also flagged on the group header.
+    //
+    // The old `†` (dead) and `∙` (bg) glyphs are gone. Both said something the
+    // row already says better: a dead row renders dim AND now carries the age
+    // that tells you *when* it went quiet, and bg agents sit under their own
+    // "bg agents" header.
+    let pad_to_gutter = |glyph: String| format!("{}{glyph}", " ".repeat(AGE_W - 1));
+    let gutter = if !is_first_wrap_line {
+        " ".repeat(AGE_W)
     } else if let Some(spin) = spinner {
-        spin
+        pad_to_gutter(spin.to_string())
     } else if is_child {
-        // Connector sits in the marker column, directly under the parent's `>`.
-        if is_last_child {
-            '\u{2514}'
-        } else {
-            '\u{251c}'
-        } // └ / ├
-    } else if dead {
-        '\u{2020}' // † — tracked-but-not-active
-    } else if is_bg {
-        '\u{2219}' // ∙ — background agent: select-only, no pane to route to
-    } else if unrouted {
-        '\u{2717}' // ✗
+        pad_to_gutter(if is_last_child { "\u{2514}" } else { "\u{251c}" }.to_string()) // └ / ├
+    } else if unrouted && !is_bg {
+        pad_to_gutter(UNROUTED.to_string())
     } else {
-        '>'
+        age.to_string()
     };
-    // The marker rides on `mid_bg`, NOT the body. Selection wins first so a
-    // selected row's `>` matches its name (both `selected_fg`) and the cursor
-    // reads as one solid highlight — even when the middle keeps a green/yellow
-    // tint. Otherwise the marker takes on-colour over a tinted middle, else the
-    // name fg. The unrouted `✗` stays error red (its own signal), swapping to
-    // on-colour only where red wouldn't read.
-    let marker_fg = if dead {
+    // The gutter rides on `mid_bg`, NOT the body. Selection wins first so a
+    // selected row's age matches its name (both `selected_fg`) and the cursor
+    // reads as one solid highlight — even when the gutter keeps a green/yellow
+    // tint. Otherwise it takes on-colour over a tinted gutter, else the name fg
+    // (so a busy row's age carries the same magenta its title does). The
+    // unrouted `✗` stays error red (its own signal), swapping to on-colour only
+    // where red wouldn't read.
+    let gutter_fg = if dead {
         if selected {
             colors.selected_fg
         } else {
@@ -1838,8 +1896,8 @@ fn render_agent_line(
         name_fg
     };
 
-    // Width budget: col 0 (1) + marker (1) + space (1) + name/pad = cols.
-    let name_w = cols.saturating_sub(OUTER_PAD).saturating_sub(AGENT_INDENT);
+    // Width budget: age gutter (AGE_W) + gap (AGE_GAP) + name/pad = cols.
+    let name_w = cols.saturating_sub(AGENT_INDENT);
     let mut visible = String::new();
     let mut w = 0;
     for c in text.chars() {
@@ -1852,19 +1910,19 @@ fn render_agent_line(
     }
     let pad: String = std::iter::repeat(' ').take(name_w - w).collect();
 
-    // Col 2 is the connector's horizontal arm (`─`, same fg as the marker) on a
-    // child's first line, else a plain space.
-    let (col2_char, col2_fg) = if is_child && is_first_wrap_line {
-        ("\u{2500}".to_string(), marker_fg)
+    // The gap column is the connector's horizontal arm (`─`, same fg as the
+    // gutter) on a child's first line, else the plain space that keeps `44m`
+    // off the title.
+    let (gap_char, gap_fg) = if is_child && is_first_wrap_line {
+        ("\u{2500}".repeat(AGE_GAP), gutter_fg)
     } else {
-        (" ".to_string(), name_fg)
+        (" ".repeat(AGE_GAP), name_fg)
     };
 
     let mut row = String::new();
-    row.push_str(&paint(name_fg, col0_bg, " ".to_string())); // col 0
-    row.push_str(&paint(marker_fg, mid_bg, marker_char.to_string())); // col 1: marker / connector
-    row.push_str(&paint(col2_fg, mid_bg, col2_char)); // col 2: space or `─` arm
-    row.push_str(&paint(name_fg, body_bg, visible)); // col 3: name
+    row.push_str(&paint(gutter_fg, mid_bg, gutter)); // age / connector / ✗ / spinner
+    row.push_str(&paint(gap_fg, mid_bg, gap_char)); // space, or the `─` arm
+    row.push_str(&paint(name_fg, body_bg, visible)); // name
     row.push_str(&paint(name_fg, body_bg, pad));
     row
 }
@@ -1940,9 +1998,212 @@ fn same_agents(a: &[Agent], b: &[Agent]) -> bool {
         })
 }
 
+/// Time since an agent's last activity, right-aligned to exactly `AGE_W` cols.
+///
+/// The ladder trades precision for width — three columns is the whole budget on
+/// an 18-col bar, so each bucket is the coarsest unit that still separates rows
+/// a user would act on differently:
+///
+///   <60s    → `now`
+///   1..59m  → `1m` .. `59m`
+///   1..23h  → `1h` .. `23h`
+///   1..9d   → `1d` .. `9d`
+///   >9d     → `9d+`
+///
+/// `updated_at_ms == 0` means the daemon never wrote one — rendered `?` rather
+/// than guessed at, since a fabricated `now` on a week-old row is worse than an
+/// admitted gap. A timestamp in the future (clock skew) clamps to `now`.
+fn format_age(now: i64, updated_at_ms: i64) -> String {
+    let label = if updated_at_ms == 0 {
+        "?".to_string()
+    } else {
+        let secs = (now - updated_at_ms).max(0) / 1000;
+        let mins = secs / 60;
+        let hours = mins / 60;
+        let days = hours / 24;
+        if mins < 1 {
+            "now".to_string()
+        } else if mins < 60 {
+            format!("{mins}m")
+        } else if hours < 24 {
+            format!("{hours}h")
+        } else if days <= 9 {
+            format!("{days}d")
+        } else {
+            "9d+".to_string()
+        }
+    };
+    let pad: String = std::iter::repeat(' ')
+        .take(AGE_W.saturating_sub(label.width()))
+        .collect();
+    format!("{pad}{label}")
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The gutter's whole job is to be an aligned rail: every agent block starts at
+/// the same column, and the name starts at the same column on the first wrap
+/// line as on the continuations. Nothing in `render_agent_line` enforces that —
+/// it emits three independently-sized pieces — so these render real rows,
+/// strip the styling, and assert the plain-text geometry.
+#[cfg(test)]
+mod row_geometry {
+    use super::*;
+
+    const COLS: usize = 16;
+
+    fn plain(styled: &str) -> String {
+        let mut out = String::new();
+        let mut chars = styled.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        text: &str,
+        age: &str,
+        first: bool,
+        child: bool,
+        unrouted: bool,
+        spinner: Option<char>,
+    ) -> String {
+        let colors = AgentColors::from_palette(&ModeInfo::default().style.colors);
+        plain(&render_agent_line(
+            text,
+            age,
+            AgentStatus::Idle,
+            false,
+            unrouted,
+            false,
+            true,
+            first,
+            child,
+            true,
+            false,
+            false,
+            spinner,
+            &colors,
+            COLS,
+        ))
+    }
+
+    /// Every row is exactly `cols` wide — a short name pads out rather than
+    /// leaving the previous frame's pixels behind.
+    #[test]
+    fn every_row_fills_the_width() {
+        for r in [
+            row("statusline", " 1m", true, false, false, None),
+            row("cache", "   ", false, false, false, None),
+            row("child", "   ", true, true, false, None),
+            row("unrouted", "44m", true, false, true, None),
+            row("", "9d+", true, false, false, None),
+        ] {
+            assert_eq!(r.width(), COLS, "{r:?}");
+        }
+    }
+
+    /// The load-bearing alignment: the name starts at the same column whether
+    /// the gutter holds an age, a connector, a `✗`, a spinner, or nothing.
+    #[test]
+    fn the_name_always_starts_at_the_same_column() {
+        assert_eq!(row("statusline", " 1m", true, false, false, None), " 1m statusline  ");
+        assert_eq!(row("cache", "   ", false, false, false, None), "    cache       ");
+        assert_eq!(row("bg-fork", "   ", true, true, false, None), "  └─bg-fork     ");
+        assert_eq!(row("no-pane", "44m", true, false, true, None), "  ✗ no-pane     ");
+        assert_eq!(row("clicked", " 4h", true, false, false, Some('*')), "  * clicked     ");
+    }
+
+    /// A name longer than the budget is cut, never wrapped into the gutter of
+    /// the row below it.
+    #[test]
+    fn an_overlong_name_truncates_inside_its_own_row() {
+        assert_eq!(
+            row("ticket-lifecycle-dispatch", "23h", true, false, false, None),
+            "23h ticket-lifec"
+        );
+    }
+
+    /// The widest possible gutter still leaves the full name budget.
+    #[test]
+    fn the_name_budget_is_cols_minus_the_indent() {
+        let r = row("012345678901234567", "9d+", true, false, false, None);
+        assert_eq!(r, "9d+ 012345678901");
+        assert_eq!(r.width() - AGENT_INDENT, COLS - AGENT_INDENT);
+    }
+}
+
+/// The gutter is exactly `AGE_W` wide and the render does no truncation, so a
+/// label one col too long would shove every title right by one and ragged-edge
+/// the whole panel. These pin both the ladder and that width.
+#[cfg(test)]
+mod age_ladder {
+    use super::*;
+
+    const NOW: i64 = 1_787_519_000_000;
+    const MIN: i64 = 60 * 1000;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+
+    fn age_ago(ms: i64) -> String {
+        format_age(NOW, NOW - ms)
+    }
+
+    #[test]
+    fn every_bucket_renders_its_label() {
+        assert_eq!(age_ago(0), "now");
+        assert_eq!(age_ago(59 * 1000), "now");
+        assert_eq!(age_ago(MIN), " 1m");
+        assert_eq!(age_ago(44 * MIN), "44m");
+        assert_eq!(age_ago(59 * MIN), "59m");
+        assert_eq!(age_ago(HOUR), " 1h");
+        assert_eq!(age_ago(23 * HOUR), "23h");
+        assert_eq!(age_ago(DAY), " 1d");
+        assert_eq!(age_ago(9 * DAY), " 9d");
+        assert_eq!(age_ago(10 * DAY), "9d+");
+    }
+
+    /// 66m reads `1h`, not `66m` — minutes stop at 59 so the day buckets fit.
+    #[test]
+    fn minutes_roll_over_at_the_hour() {
+        assert_eq!(age_ago(66 * MIN), " 1h");
+    }
+
+    /// A row the daemon never stamped says so. Inventing `now` for it would
+    /// paint a week-dead agent as freshly active.
+    #[test]
+    fn missing_timestamp_is_admitted_not_guessed() {
+        assert_eq!(format_age(NOW, 0), "  ?");
+    }
+
+    /// Clock skew (an agent stamped in the future) must not underflow into a
+    /// giant label — it clamps to the freshest bucket.
+    #[test]
+    fn future_timestamp_clamps_to_now() {
+        assert_eq!(format_age(NOW, NOW + HOUR), "now");
+    }
+
+    #[test]
+    fn no_label_ever_exceeds_the_gutter() {
+        let samples = [0, 1, 30 * 1000, MIN, 59 * MIN, HOUR, 23 * HOUR, DAY, 400 * DAY];
+        for ms in samples {
+            assert_eq!(age_ago(ms).width(), AGE_W, "{ms}ms overflowed the gutter");
+        }
+        assert_eq!(format_age(NOW, 0).width(), AGE_W);
+    }
 }
