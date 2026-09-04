@@ -153,6 +153,13 @@ pub struct Agent {
     /// appear in creation order regardless of activity. Default 0.
     #[serde(default)]
     pub started_at_ms: i64,
+    /// Wall-clock millis of the agent's last activity, mirrored from Claude's
+    /// own `~/.claude/sessions/<pid>.json` `updatedAt` via the daemon. It moves
+    /// on real activity (status transitions, turn boundaries), NOT on a liveness
+    /// ping — an idle session's value goes stale by hours, which is exactly what
+    /// makes it renderable as an age. 0 = the daemon never wrote one.
+    #[serde(default)]
+    pub updated_at_ms: i64,
     /// Wall-clock millis of the latest attention-worthy event. 0 = none.
     /// `seen_at_ms` is **not** in the readmodel — it's read separately from
     /// `agent-seen-events/` since seen-state is plugin-owned.
@@ -332,6 +339,30 @@ mod host_wire_format {
         );
         assert_eq!(h.zellij_pane_id(), None);
         assert_eq!(h.zellij_session(), None);
+    }
+
+    /// `updated_at_ms` is what the bar renders as an age. The daemon has always
+    /// written it (`agent_bar.rs`'s `Agent`, sourced from Claude's `updatedAt`);
+    /// this crate only started reading it. Pinned so a rename on the writer side
+    /// surfaces as a red test rather than as every row showing `?`.
+    #[test]
+    fn agent_row_carries_its_last_activity() {
+        let snap: Snapshot = serde_json::from_str(
+            r#"{"agents":[{"session_id":"a1","status":"idle","started_at_ms":100,
+                 "updated_at_ms":1787518959950,"attention_at_ms":0,"active":false}]}"#,
+        )
+        .expect("agent row must parse");
+        assert_eq!(snap.agents[0].updated_at_ms, 1787518959950);
+    }
+
+    /// A snapshot from a daemon that predates the field must still parse — the
+    /// bar degrades to a blank age column, not to an empty panel.
+    #[test]
+    fn missing_last_activity_defaults_to_zero() {
+        let snap: Snapshot =
+            serde_json::from_str(r#"{"agents":[{"session_id":"a1","status":"idle"}]}"#)
+                .expect("agent row must parse");
+        assert_eq!(snap.agents[0].updated_at_ms, 0);
     }
 
     #[test]
