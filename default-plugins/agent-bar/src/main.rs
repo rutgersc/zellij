@@ -114,7 +114,7 @@ fn focus_command(agent: &Agent, session_id: &str) -> String {
 const MAX_SPIN_TICKS: u32 = 100;
 /// Hard cap on rows used to render a single agent's name. Past this we
 /// truncate with `…` — the full name is still on the snapshot.
-const MAX_NAME_LINES: usize = 4;
+const MAX_NAME_LINES: usize = 3;
 /// Nested bg children render on a single line — visually subordinate to their
 /// parent (which wraps up to MAX_NAME_LINES).
 const MAX_CHILD_NAME_LINES: usize = 1;
