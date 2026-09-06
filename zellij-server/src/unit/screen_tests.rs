@@ -10044,6 +10044,25 @@ fn new_tabs_are_created_at_the_size_of_the_client_creating_them() {
 }
 
 #[test]
+fn new_tabs_without_any_client_match_the_existing_tabs() {
+    let mut screen = create_non_mirrored_screen(Size { cols: 200, rows: 60 });
+    let client_size = Size { cols: 80, rows: 24 };
+    screen.set_client_size(1, client_size);
+    new_tab(&mut screen, 1, 0);
+    screen.remove_client(1).expect("TEST");
+
+    screen
+        .new_tab(1, (vec![], vec![]), None, None)
+        .expect("TEST");
+
+    assert_eq!(
+        screen.tabs.get(&1).unwrap().size,
+        client_size,
+        "A tab created with no client attached takes the size of its siblings"
+    );
+}
+
+#[test]
 fn applying_a_layout_to_an_existing_tab_keeps_its_viewer_derived_size() {
     let initial_size = Size {
         cols: 200,

@@ -2255,6 +2255,7 @@ impl Screen {
                     .and_then(|client_id| self.client_sizes.get(&client_id).copied())
             })
             .or_else(|| self.client_sizes.values().next().copied())
+            .or_else(|| self.tabs.values().next().map(|tab| tab.size))
             .unwrap_or_default()
     }
 
