@@ -171,6 +171,41 @@ pub struct Agent {
     /// (no field) reads as all-live.
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Display-only: the last multiplexer pane the daemon saw this agent in,
+    /// as a label — never a terminal id. `None` when the daemon has nothing
+    /// to report, or predates the field.
+    #[serde(default)]
+    pub last_seen_in: Option<Glimpse>,
+}
+
+/// Where an agent was last seen displayed, as a label the daemon already
+/// resolved — never a terminal id. Exposes only `render` so callers can't be
+/// tempted to reach for the raw label or re-derive a pane reference from it;
+/// a fresh decision about where to focus goes through `mux focus-agent`, not
+/// through this struct.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Glimpse {
+    label: String,
+    as_of_ms: i64,
+}
+
+impl Glimpse {
+    pub fn render(&self, now_ms: i64) -> String {
+        let age_ms = now_ms.saturating_sub(self.as_of_ms);
+        if age_ms < 60_000 {
+            return self.label.clone();
+        }
+        let minutes = age_ms / 60_000;
+        if minutes < 60 {
+            return format!("{} · {}m ago", self.label, minutes);
+        }
+        let hours = minutes / 60;
+        if hours < 24 {
+            return format!("{} · {}h ago", self.label, hours);
+        }
+        let days = hours / 24;
+        format!("{} · {}d ago", self.label, days)
+    }
 }
 
 fn default_provider() -> String {
@@ -363,6 +398,49 @@ mod host_wire_format {
             serde_json::from_str(r#"{"agents":[{"session_id":"a1","status":"idle"}]}"#)
                 .expect("agent row must parse");
         assert_eq!(snap.agents[0].updated_at_ms, 0);
+    }
+
+    #[test]
+    fn agent_row_carries_its_last_seen_in() {
+        let snap: Snapshot = serde_json::from_str(
+            r#"{"agents":[{"session_id":"a1","status":"idle",
+                 "last_seen_in":{"label":"wezterm pane 7, window 0","as_of_ms":1757500000000}}]}"#,
+        )
+        .expect("agent row must parse");
+        let glimpse = snap.agents[0]
+            .last_seen_in
+            .as_ref()
+            .expect("last_seen_in must be Some");
+        assert_eq!(glimpse.render(1757500000000), "wezterm pane 7, window 0");
+        assert_eq!(
+            glimpse.render(1757500000000 + 120_000),
+            "wezterm pane 7, window 0 · 2m ago"
+        );
+    }
+
+    #[test]
+    fn last_seen_in_renders_day_bucket_past_24h() {
+        let snap: Snapshot = serde_json::from_str(
+            r#"{"agents":[{"session_id":"a1","status":"idle",
+                 "last_seen_in":{"label":"wezterm pane 7, window 0","as_of_ms":1757500000000}}]}"#,
+        )
+        .expect("agent row must parse");
+        let glimpse = snap.agents[0]
+            .last_seen_in
+            .as_ref()
+            .expect("last_seen_in must be Some");
+        assert_eq!(
+            glimpse.render(1757500000000 + 26 * 60 * 60 * 1000),
+            "wezterm pane 7, window 0 · 1d ago"
+        );
+    }
+
+    #[test]
+    fn missing_last_seen_in_defaults_to_none() {
+        let snap: Snapshot =
+            serde_json::from_str(r#"{"agents":[{"session_id":"a1","status":"idle"}]}"#)
+                .expect("agent row must parse");
+        assert_eq!(snap.agents[0].last_seen_in, None);
     }
 
     #[test]
