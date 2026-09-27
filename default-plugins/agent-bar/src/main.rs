@@ -320,10 +320,6 @@ struct State {
     /// repaints exactly on a bucket flip (`59m` → `1h`) and not on the ~2400
     /// ticks in between.
     age_labels: HashMap<String, String>,
-    /// The instant `refresh_age_labels` last aged the gutter against. Rendering
-    /// the glimpse suffix off the same value keeps `2m ago` moving on the poll
-    /// cadence the repaint-dedupe already watches, instead of drifting per frame.
-    age_now_ms: i64,
     /// Adaptive-timer accounting: the interval the currently-pending Timer was
     /// armed at, and elapsed time accumulated toward the next readmodel poll.
     cur_timeout: f64,
@@ -1120,7 +1116,7 @@ impl State {
             name_wrap_w,
             &self.sessions,
             &session,
-            self.tick_now_ms(),
+            now_ms(),
         );
 
         // Scroll so selected agent's first line is visible.
@@ -1196,16 +1192,6 @@ impl State {
                         cols,
                     )
                 },
-                Line::Glimpse { sid, text } => {
-                    self.row_ranges
-                        .push((visible_row, RowTarget::Agent(sid.clone())));
-                    render_glimpse_line(
-                        text,
-                        selected_sid.as_deref() == Some(sid.as_str()),
-                        colors,
-                        cols,
-                    )
-                },
             };
             frame.push(rendered);
         }
@@ -1247,32 +1233,11 @@ impl State {
         let now = now_ms();
         let fresh: HashMap<String, String> = agents
             .iter()
-            .map(|a| {
-                let glimpse = a
-                    .last_seen_in
-                    .as_ref()
-                    .map(|g| g.render(now))
-                    .unwrap_or_default();
-                (
-                    a.identity(),
-                    format!("{}|{glimpse}", format_age(now, a.updated_at_ms)),
-                )
-            })
+            .map(|a| (a.identity(), format_age(now, a.updated_at_ms)))
             .collect();
         let changed = fresh != self.age_labels;
         self.age_labels = fresh;
-        self.age_now_ms = now;
         changed
-    }
-
-    /// The tick's `now`, so a frame's ages and glimpse suffixes agree with the
-    /// labels the repaint-dedupe compared. Zero before the first refresh.
-    fn tick_now_ms(&self) -> i64 {
-        if self.age_now_ms == 0 {
-            now_ms()
-        } else {
-            self.age_now_ms
-        }
     }
 
     fn adjust_scroll(&mut self, agent_row_starts: &[(usize, usize)], lines: &[Line], rows: usize) {
@@ -1416,10 +1381,6 @@ enum Line {
         /// A background agent — select-only.
         is_bg: bool,
     },
-    /// Display-only trailer under a top-level agent's name lines: where the
-    /// daemon last saw it, as a label. Part of that agent's row range, so a
-    /// click on it selects and focuses the same agent as its name lines.
-    Glimpse { sid: String, text: String },
 }
 
 /// Group interactive agents by zellij session (flat top-level rows). Every live
@@ -1590,16 +1551,6 @@ fn build_lines(
                     is_bg: f.is_bg,
                 });
             }
-            let glimpse = a
-                .last_seen_in
-                .as_ref()
-                .filter(|_| !row.is_child && !f.is_bg)
-                .map(|g| g.render(now))
-                .and_then(|label| wrap_text(&label, content_w, 1).into_iter().next());
-            lines.extend(glimpse.map(|text| Line::Glimpse {
-                sid: a.identity(),
-                text,
-            }));
             let end_exclusive = lines.len();
             agent_rows.push((start, end_exclusive));
         }
@@ -1974,30 +1925,6 @@ fn render_agent_line(
     row.push_str(&paint(name_fg, body_bg, visible)); // name
     row.push_str(&paint(name_fg, body_bg, pad));
     row
-}
-
-/// The glimpse trailer: indented under the name, dim `text` on `bar_bg` so it
-/// sits below every status hue in the stack — it carries no state, only a
-/// label. A selected row keeps its highlight pair across all of its lines.
-fn render_glimpse_line(text: &str, selected: bool, colors: &AgentColors, cols: usize) -> String {
-    let (fg, bg) = if selected {
-        (colors.selected_fg, colors.selected_bg)
-    } else {
-        (colors.text, colors.bar_bg)
-    };
-    let paint = |s: String| {
-        let style = style!(fg, bg);
-        if selected { style } else { style.dimmed() }
-            .paint(s)
-            .to_string()
-    };
-    let name_w = cols.saturating_sub(AGENT_INDENT);
-    let pad = name_w.saturating_sub(text.width());
-    paint(format!(
-        "{}{text}{}",
-        " ".repeat(AGENT_INDENT.min(cols)),
-        " ".repeat(pad)
-    ))
 }
 
 fn diag_frame(
