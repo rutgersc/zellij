@@ -25,7 +25,7 @@
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
-//! attention/waiting (yellow, red if unknown and unattended), in-view (green), and selection
+//! waiting (cyan), attention (yellow), unknown and unattended (red), in-view (green), and selection
 //! (grey) each claim columns by priority, so combinations layer rather than
 //! overwrite (see the palette block below). `✗` after the session header marks
 //! agents in that zellij session with no pane to focus; it never appears on a
@@ -149,8 +149,9 @@ const HERDR_LABEL: &str = "herdr";
 //   name       → selected grey · else alert (yellow/red) · else in-view green
 //                · else neutral.   (selection outranks everything on the body,
 //                so a highlighted row is unmissable even when green/yellow.)
-// Within alert, needs-attention outranks unknown: red is the unattended shade,
-// yellow claims the row the moment it actually wants you.
+// Within alert: waiting cyan > needs-attention yellow > unknown red. Cyan is
+// "blocked on you" (open question, permission), yellow is "turn finished",
+// red is the unattended shade.
 //
 // Name fg: selection overrides the status hue (selected-fg on selected-bg is a
 // high-contrast pair); otherwise it encodes status, picking a hue legible on
@@ -181,8 +182,12 @@ struct AgentColors {
     /// a foreground-legible hue distinct from green/yellow/red, so a busy
     /// agent reads clearly on every body bg (neutral, grey, green, yellow).
     magenta: PaletteColor,
-    /// The "yellow" — bg for waiting / needs-attention.
+    /// The "yellow" — bg for needs-attention (turn finished, unseen).
     yellow: PaletteColor,
+    /// The "cyan" — bg for waiting: blocked on the user (open question,
+    /// permission, plan approval). Outranks yellow so "answer me" never reads
+    /// as "done".
+    cyan: PaletteColor,
     /// Foreground to use on top of `green` or `yellow`. Comes from the
     /// theme's ribbon_selected.base so it matches whatever fg the user's
     /// theme already uses on its active-tab green.
@@ -212,6 +217,7 @@ impl AgentColors {
             // legible as a foreground.
             magenta: p.text_unselected.emphasis_3,
             yellow: p.exit_code_error.emphasis_0,
+            cyan: p.text_unselected.emphasis_1,
             on_color: p.ribbon_selected.base,
             text: p.text_unselected.base,
             bar_bg: p.text_unselected.background,
@@ -1770,7 +1776,10 @@ fn render_agent_line(
     // reporting"; yellow overrides with "and it wants you now".
     let is_unknown = !dead && matches!(status, AgentStatus::Unknown(_));
     let alert = !dead && (needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown);
-    let alert_color = if is_unknown && !needs_attention {
+    let is_waiting = !dead && matches!(status, AgentStatus::Waiting);
+    let alert_color = if is_waiting {
+        colors.cyan
+    } else if is_unknown && !needs_attention {
         colors.error
     } else {
         colors.yellow
@@ -1819,7 +1828,7 @@ fn render_agent_line(
     } else if is_unknown {
         colors.on_color // body is red
     } else if body_tinted {
-        colors.on_color // green / yellow body
+        colors.on_color // green / yellow / cyan body
     } else {
         colors.text
     };
@@ -1830,11 +1839,12 @@ fn render_agent_line(
     // stays full-strength so the cursor is unmistakable.
     let dim = dead && !selected;
     let paint = |fg: PaletteColor, bg: PaletteColor, s: String| {
-        let mut style = style!(fg, bg);
+        let faded = if dim { fade(fg, bg) } else { None };
+        let mut style = style!(faded.unwrap_or(fg), bg);
         if bold {
             style = style.bold();
         }
-        if dim {
+        if dim && faded.is_none() {
             style = style.dimmed();
         }
         style.paint(s).to_string()
@@ -1925,6 +1935,20 @@ fn render_agent_line(
     row.push_str(&paint(name_fg, body_bg, visible)); // name
     row.push_str(&paint(name_fg, body_bg, pad));
     row
+}
+
+const FADE_TOWARD_BG: u16 = 55;
+
+fn fade(fg: PaletteColor, bg: PaletteColor) -> Option<PaletteColor> {
+    match (fg, bg) {
+        (PaletteColor::Rgb((fr, fg_, fb)), PaletteColor::Rgb((br, bg_, bb))) => {
+            let mix = |f: u8, b: u8| {
+                ((f as u16 * (100 - FADE_TOWARD_BG) + b as u16 * FADE_TOWARD_BG) / 100) as u8
+            };
+            Some(PaletteColor::Rgb((mix(fr, br), mix(fg_, bg_), mix(fb, bb))))
+        }
+        _ => None,
+    }
 }
 
 fn diag_frame(
