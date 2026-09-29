@@ -6046,39 +6046,49 @@ impl Grid {
                 line = last_line;
                 col = col.min(row_len(self, line).saturating_sub(1));
             },
-            // Step (scrolling at the edge) to the next/previous blank line. The
-            // first step always moves, so starting on a blank line skips it.
-            // `lines_above.len()` not advancing past a scroll means we hit the
-            // buffer edge with no blank found — stop there.
+            // Vim's `{` / `}`: step off the current blank run first, then stop on
+            // the next blank line. Without the first pass a cursor sitting in
+            // whitespace just walks one line at a time. A step that cannot move
+            // (buffer edge, nothing left to scroll) ends the motion where it is.
             CopyMotion::ParagraphForward => {
-                loop {
-                    if line < last_line {
-                        line += 1;
-                    } else {
-                        let prev_above = self.lines_above.len();
-                        self.scroll_down_one_line();
-                        if self.lines_above.len() == prev_above {
-                            break;
-                        }
+                fn step(g: &mut Grid, line: &mut isize, last_line: isize) -> bool {
+                    if *line < last_line {
+                        *line += 1;
+                        return true;
                     }
-                    if is_blank(self, line) {
+                    let prev_above = g.lines_above.len();
+                    g.scroll_down_one_line();
+                    g.lines_above.len() != prev_above
+                }
+                while is_blank(self, line) {
+                    if !step(self, &mut line, last_line) {
+                        break;
+                    }
+                }
+                while !is_blank(self, line) {
+                    if !step(self, &mut line, last_line) {
                         break;
                     }
                 }
                 col = 0;
             },
             CopyMotion::ParagraphBackward => {
-                loop {
-                    if line > 0 {
-                        line -= 1;
-                    } else {
-                        let prev_above = self.lines_above.len();
-                        self.scroll_up_one_line();
-                        if self.lines_above.len() == prev_above {
-                            break;
-                        }
+                fn step(g: &mut Grid, line: &mut isize) -> bool {
+                    if *line > 0 {
+                        *line -= 1;
+                        return true;
                     }
-                    if is_blank(self, line) {
+                    let prev_above = g.lines_above.len();
+                    g.scroll_up_one_line();
+                    g.lines_above.len() != prev_above
+                }
+                while is_blank(self, line) {
+                    if !step(self, &mut line) {
+                        break;
+                    }
+                }
+                while !is_blank(self, line) {
+                    if !step(self, &mut line) {
                         break;
                     }
                 }
