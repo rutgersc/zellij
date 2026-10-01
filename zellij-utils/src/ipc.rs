@@ -21,6 +21,7 @@ use crate::client_server_contract::client_server_contract::{
 use prost::Message;
 
 mod enum_conversions;
+mod peer_closed;
 mod protobuf_conversion;
 
 #[cfg(test)]

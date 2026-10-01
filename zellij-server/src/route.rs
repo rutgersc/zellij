@@ -2970,6 +2970,10 @@ pub(crate) fn route_thread_main(
                 // retry on loop around
                 retry_queue = deferred_instructions;
             },
+            None if receiver.peer_closed() => {
+                let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
+                break 'route_loop;
+            },
             None => {
                 consecutive_unknown_messages_received += 1;
                 if consecutive_unknown_messages_received == 1 {
