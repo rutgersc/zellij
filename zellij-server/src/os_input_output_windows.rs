@@ -30,12 +30,15 @@ use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcess, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOEXW,
     STARTUPINFOW,
 };
 
 use zellij_utils::{errors::prelude::*, input::command::RunCommand};
+
+#[path = "os_input_output_windows/pane_job.rs"]
+mod pane_job;
 
 pub use async_trait::async_trait;
 
@@ -414,7 +417,7 @@ fn spawn_child_process(
             std::ptr::null(),      // lpProcessAttributes
             std::ptr::null(),      // lpThreadAttributes
             0,                     // bInheritHandles = FALSE
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             env_block.as_ptr().cast(),              // lpEnvironment
             cwd_ptr,                                // lpCurrentDirectory
             &si.StartupInfo as *const STARTUPINFOW, // lpStartupInfo
@@ -432,6 +435,9 @@ fn spawn_child_process(
 }
 
 fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
+    if pane_job::terminate_tree(pid) {
+        return Ok(());
+    }
     unsafe {
         let handle = OpenProcess(
             PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -550,7 +556,7 @@ impl WindowsPtyBackend {
                 },
             };
 
-        // Thread handle is not needed after spawn.
+        pane_job::contain_and_resume(process_handle, thread_handle, child_pid);
         unsafe { CloseHandle(thread_handle) };
 
         // 6. Store per-terminal state
@@ -574,6 +580,7 @@ impl WindowsPtyBackend {
                 let mut code: u32 = 0;
                 GetExitCodeProcess(process_handle, &mut code);
                 CloseHandle(process_handle);
+                pane_job::release(child_pid);
                 code
             };
             quit_cb(
