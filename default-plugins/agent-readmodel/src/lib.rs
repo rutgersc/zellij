@@ -59,6 +59,9 @@ impl<'de> Deserialize<'de> for AgentStatus {
 pub enum AgentHost {
     Zellij(ZellijRef),
     Herdr(HerdrRef),
+    /// Started by T3 Code; displayed in T3's own UI, no multiplexer pane, never
+    /// a routing target.
+    T3,
     /// No multiplexer — a bare terminal, or a background agent, which has no
     /// pane by construction (`kind` separates those two).
     Unattached,
@@ -301,6 +304,7 @@ mod host_wire_format {
                 pane_id: "w5:p1".into()
             })
         );
+        assert_eq!(host(r#"{"kind":"t3"}"#), AgentHost::T3);
         assert_eq!(host(r#"{"kind":"unattached"}"#), AgentHost::Unattached);
         assert_eq!(
             host(

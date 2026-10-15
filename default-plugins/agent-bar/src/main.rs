@@ -136,6 +136,7 @@ const AGENT_INDENT: usize = AGE_W + AGE_GAP;
 const SESSIONLESS_LABEL: &str = "sessionless";
 const AMBIGUOUS_LABEL: &str = "ambiguous host";
 const HERDR_LABEL: &str = "herdr";
+const T3_LABEL: &str = "t3";
 
 // Agent-state palette — a shared colour vocabulary (agent-bar today, the mux
 // session picker later). Concurrent states are composited as a PER-COLUMN
@@ -1064,7 +1065,7 @@ impl State {
             // even focus the pane to clear it. Only hosts with no UI of their own
             // get the yellow. Ambiguous keeps it: no host owns those rows.
             let unseen = agent.active
-                && !matches!(agent.host, AgentHost::Herdr(_))
+                && !matches!(agent.host, AgentHost::Herdr(_) | AgentHost::T3)
                 && !matches!(agent.status, AgentStatus::Busy)
                 && agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
@@ -1301,6 +1302,9 @@ enum GroupLabel {
     /// env vars were present. Its own group so the conflict is visible instead
     /// of silently landing in someone's session.
     Ambiguous,
+    /// Agents started by T3 Code. Their own group, labelled T3, beside the
+    /// sessionless one: T3 owns the view, so rows here are never routable.
+    T3,
     Sessionless,
     /// All background (`run_in_background`) agents. They're daemon-owned, have no
     /// pane of their own, and are reached through Claude's agent view rather than
@@ -1315,6 +1319,7 @@ impl GroupLabel {
             GroupLabel::Session(s) => s.as_str(),
             GroupLabel::Herdr => HERDR_LABEL,
             GroupLabel::Ambiguous => AMBIGUOUS_LABEL,
+            GroupLabel::T3 => T3_LABEL,
             GroupLabel::Sessionless => SESSIONLESS_LABEL,
             GroupLabel::BackgroundAgents => "bg agents",
         }
@@ -1328,8 +1333,9 @@ impl GroupLabel {
             GroupLabel::Session(_) => 0,
             GroupLabel::Herdr => 1,
             GroupLabel::Ambiguous => 2,
-            GroupLabel::Sessionless => 3,
-            GroupLabel::BackgroundAgents => 4,
+            GroupLabel::T3 => 3,
+            GroupLabel::Sessionless => 4,
+            GroupLabel::BackgroundAgents => 5,
         }
     }
 }
@@ -1405,6 +1411,7 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
         AgentHost::Zellij(z) => GroupLabel::Session(z.session.clone()),
         AgentHost::Herdr(_) => GroupLabel::Herdr,
         AgentHost::Ambiguous { .. } => GroupLabel::Ambiguous,
+        AgentHost::T3 => GroupLabel::T3,
         AgentHost::Unattached => GroupLabel::Sessionless,
     };
 
