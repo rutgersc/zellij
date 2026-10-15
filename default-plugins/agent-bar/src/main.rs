@@ -19,9 +19,11 @@
 //! group appears only once an agent reports itself there, since the plugin
 //! can't reach herdr's socket from the wasm sandbox.
 //!
-//! Herdr rows never take the yellow attention tint — herdr raises that signal in
-//! its own UI, and this bar can't focus the pane to clear it, so repeating it
-//! would be a second alert for one event with no way to dismiss it here.
+//! Herdr rows never take the yellow attention, cyan waiting or red unknown tint —
+//! herdr raises those signals in its own UI, and this bar can't focus the pane
+//! to clear them, so repeating them would be a second alert for one event with
+//! no way to dismiss it here. Closed (inactive) herdr rows are hidden from the
+//! bar only; they stay in the working set, where herdr and Pit Wall show them.
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
@@ -136,6 +138,7 @@ const AGENT_INDENT: usize = AGE_W + AGE_GAP;
 const SESSIONLESS_LABEL: &str = "sessionless";
 const AMBIGUOUS_LABEL: &str = "ambiguous host";
 const HERDR_LABEL: &str = "herdr";
+const T3_LABEL: &str = "t3";
 
 // Agent-state palette — a shared colour vocabulary (agent-bar today, the mux
 // session picker later). Concurrent states are composited as a PER-COLUMN
@@ -767,12 +770,15 @@ impl State {
     }
 
     /// Agents minus those optimistically dismissed this session (the daemon
-    /// hasn't dropped them from the readmodel yet). The render and selection
-    /// paths both work off this so an `x` dismiss takes effect instantly.
+    /// hasn't dropped them from the readmodel yet) and closed herdr / T3 agents,
+    /// which their host shows instead. The render and selection paths both work
+    /// off this so an `x` dismiss takes effect instantly and the cursor indexes
+    /// the rows on screen.
     fn visible_agents(&self) -> Vec<Agent> {
         self.current_agents()
             .iter()
             .filter(|a| !self.dismissed_overlay.contains(&a.session_id))
+            .filter(|a| a.active || !matches!(a.host, AgentHost::Herdr(_) | AgentHost::T3))
             .cloned()
             .collect()
     }
@@ -1023,10 +1029,7 @@ impl State {
     fn cells_frame(&mut self, rows: usize, cols: usize, colors: &AgentColors) -> Vec<String> {
         let all_agents = self.current_agents().to_vec();
         self.prune_dismissed_overlay(&all_agents);
-        let raw_agents: Vec<Agent> = all_agents
-            .into_iter()
-            .filter(|a| !self.dismissed_overlay.contains(&a.session_id))
-            .collect();
+        let raw_agents = self.visible_agents();
         self.prune_overlay(&raw_agents);
         self.refresh_seen_disk();
 
@@ -1059,12 +1062,14 @@ impl State {
             // re-raises it with a fresh `attention_at_ms`. Without this the
             // alert lingers when you type on a pane you're already viewing (the
             // done→busy flip has no acknowledge path of its own).
-            // Herdr raises its own attention signal for its agents, so repeating
-            // it here would be a second alert for one event — in a bar that can't
-            // even focus the pane to clear it. Only hosts with no UI of their own
-            // get the yellow. Ambiguous keeps it: no host owns those rows.
+            // Herdr raises its own attention, waiting and state signals for its
+            // agents, so repeating them here would be a second alert for one
+            // event — in a bar that can't even focus the pane to clear it. Only
+            // hosts with no UI of their own get the tints. Ambiguous keeps them:
+            // no host owns those rows.
+            let host_owns_alerts = matches!(agent.host, AgentHost::Herdr(_) | AgentHost::T3);
             let unseen = agent.active
-                && !matches!(agent.host, AgentHost::Herdr(_))
+                && !host_owns_alerts
                 && !matches!(agent.status, AgentStatus::Busy)
                 && agent.attention_at_ms > 0
                 && agent.attention_at_ms > self.effective_seen_at(agent);
@@ -1085,6 +1090,7 @@ impl State {
                     is_in_view,
                     active: agent.active,
                     is_bg: agent.kind == "bg",
+                    host_owns_alerts,
                 },
             );
         }
@@ -1172,6 +1178,7 @@ impl State {
                     is_child,
                     is_last_child,
                     is_bg,
+                    host_owns_alerts,
                 } => {
                     let selected = selected_sid.as_deref() == Some(sid.as_str());
                     self.row_ranges
@@ -1192,6 +1199,7 @@ impl State {
                         *is_child,
                         *is_last_child,
                         *is_bg,
+                        *host_owns_alerts,
                         selected,
                         spinner,
                         colors,
@@ -1301,6 +1309,9 @@ enum GroupLabel {
     /// env vars were present. Its own group so the conflict is visible instead
     /// of silently landing in someone's session.
     Ambiguous,
+    /// Agents started by T3 Code. Their own group, labelled T3, beside the
+    /// sessionless one: T3 owns the view, so rows here are never routable.
+    T3,
     Sessionless,
     /// All background (`run_in_background`) agents. They're daemon-owned, have no
     /// pane of their own, and are reached through Claude's agent view rather than
@@ -1315,6 +1326,7 @@ impl GroupLabel {
             GroupLabel::Session(s) => s.as_str(),
             GroupLabel::Herdr => HERDR_LABEL,
             GroupLabel::Ambiguous => AMBIGUOUS_LABEL,
+            GroupLabel::T3 => T3_LABEL,
             GroupLabel::Sessionless => SESSIONLESS_LABEL,
             GroupLabel::BackgroundAgents => "bg agents",
         }
@@ -1328,8 +1340,9 @@ impl GroupLabel {
             GroupLabel::Session(_) => 0,
             GroupLabel::Herdr => 1,
             GroupLabel::Ambiguous => 2,
-            GroupLabel::Sessionless => 3,
-            GroupLabel::BackgroundAgents => 4,
+            GroupLabel::T3 => 3,
+            GroupLabel::Sessionless => 4,
+            GroupLabel::BackgroundAgents => 5,
         }
     }
 }
@@ -1345,6 +1358,9 @@ struct Flags {
     /// A background (`run_in_background`) agent — never clickable (no pane to
     /// focus), and never marked `✗` for it. Its own group header says it's bg.
     is_bg: bool,
+    /// The host (herdr, T3) shows its own attention / waiting / unknown
+    /// signals, so the row takes none of those tints here.
+    host_owns_alerts: bool,
 }
 
 enum Line {
@@ -1386,6 +1402,7 @@ enum Line {
         is_last_child: bool,
         /// A background agent — select-only.
         is_bg: bool,
+        host_owns_alerts: bool,
     },
 }
 
@@ -1405,6 +1422,7 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
         AgentHost::Zellij(z) => GroupLabel::Session(z.session.clone()),
         AgentHost::Herdr(_) => GroupLabel::Herdr,
         AgentHost::Ambiguous { .. } => GroupLabel::Ambiguous,
+        AgentHost::T3 => GroupLabel::T3,
         AgentHost::Unattached => GroupLabel::Sessionless,
     };
 
@@ -1524,6 +1542,7 @@ fn build_lines(
                 is_in_view: false,
                 active: true,
                 is_bg: false,
+                host_owns_alerts: false,
             });
             let name = if a.name.trim().is_empty() {
                 a.session_id.get(..8).unwrap_or(&a.session_id).to_string()
@@ -1555,6 +1574,7 @@ fn build_lines(
                     is_child: row.is_child,
                     is_last_child: row.is_last_child,
                     is_bg: f.is_bg,
+                    host_owns_alerts: f.host_owns_alerts,
                 });
             }
             let end_exclusive = lines.len();
@@ -1754,6 +1774,7 @@ fn render_agent_line(
     is_child: bool,
     is_last_child: bool,
     is_bg: bool,
+    host_owns_alerts: bool,
     selected: bool,
     spinner: Option<char>,
     colors: &AgentColors,
@@ -1774,9 +1795,10 @@ fn render_agent_line(
     // heartbeat), so an always-red row would swallow the one signal that still
     // arrives for it — the Stop hook's attention event. Red keeps meaning "not
     // reporting"; yellow overrides with "and it wants you now".
-    let is_unknown = !dead && matches!(status, AgentStatus::Unknown(_));
-    let alert = !dead && (needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown);
-    let is_waiting = !dead && matches!(status, AgentStatus::Waiting);
+    let tintable = !dead && !host_owns_alerts;
+    let is_unknown = tintable && matches!(status, AgentStatus::Unknown(_));
+    let alert = tintable && (needs_attention || matches!(status, AgentStatus::Waiting) || is_unknown);
+    let is_waiting = tintable && matches!(status, AgentStatus::Waiting);
     let alert_color = if is_waiting {
         colors.cyan
     } else if is_unknown && !needs_attention {
@@ -2119,6 +2141,7 @@ mod row_geometry {
             first,
             child,
             true,
+            false,
             false,
             false,
             spinner,
