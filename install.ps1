@@ -15,16 +15,20 @@
 # wezterm/zellij that was holding the destination locked, without
 # rebuilding from scratch.
 #
+# `-Web` builds with web_server_capability (`zellij web`, remote attach).
+#
 # Idempotent. Re-run after any pull or to refresh the install.
 
 [CmdletBinding()]
 param(
-    [switch]$CopyOnly
+    [switch]$CopyOnly,
+    [switch]$Web
 )
 
 $ErrorActionPreference = 'Stop'
 $repo     = $PSScriptRoot
-$cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$cargoBin = Join-Path $cargoHome 'bin'
 $cache    = Join-Path $env:LOCALAPPDATA 'zellij-conpty'
 
 # OpenSSL build deps live under Strawberry Perl on this machine.
@@ -65,14 +69,21 @@ if (-not $CopyOnly) {
     # `cargo install` does NOT rebuild the bundled wasm plugins, so it re-embeds
     # whatever stale plugins sit in target/ (unstripped, ~8MB each -> ~124MB binary).
     # xtask build-release rebuilds the plugins under [profile.release] (strip=true),
-    # shrinking each to ~2MB and the no-web binary to ~40MB.
+    # shrinking each to ~2MB and the no-web binary to ~40MB. `-Web` rebakes the
+    # plugins the same way, then builds the binary with web_server_capability.
     #
     # zellijctl is the small client-only dispatcher mux shells out to; it's not
     # part of the xtask release, so build it explicitly (links zellij-client +
     # zellij-utils only — no plugins, no server, no vendored_curl/OpenSSL step).
     Push-Location $repo
     try {
-        cargo xtask ci build-release --no-web
+        if ($Web) {
+            cargo xtask build --release --plugins-only
+            if ($LASTEXITCODE -ne 0) { throw "plugin build failed (exit $LASTEXITCODE)" }
+            cargo build --release --features web_server_capability
+        } else {
+            cargo xtask ci build-release --no-web
+        }
         if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
         cargo build --release -p zellijctl
         if ($LASTEXITCODE -ne 0) { throw "zellijctl build failed (exit $LASTEXITCODE)" }

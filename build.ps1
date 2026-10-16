@@ -3,7 +3,7 @@
 #
 # Split out from install.ps1 so you can rebuild while a zellij session is
 # still up, then swap the binary on your own schedule: run `.\copy.ps1`
-# (which stops zellij and copies the freshly built .exe into ~/.cargo/bin)
+# (which stops zellij and copies the freshly built .exe into $CARGO_HOME/bin)
 # whenever you're ready. Nothing in here kills a process or copies anything.
 #
 # Builds the same artifacts install.ps1 does:
@@ -17,9 +17,15 @@
 # When it finishes the binaries sit in target/release/ ready for copy.ps1.
 # Because build-release rebakes plugins, expect zellij-utils/assets/plugins/*.wasm
 # to change too — stage those alongside any plugin source change when you commit.
+#
+# `-Web` builds with web_server_capability (`zellij web`, remote attach):
+# plugins are rebaked via `cargo xtask build --release --plugins-only`, then
+# the binary via `cargo build --release --features web_server_capability`.
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$Web
+)
 
 $ErrorActionPreference = 'Stop'
 $repo = $PSScriptRoot
@@ -29,7 +35,13 @@ $env:PATH = "C:\Strawberry\perl\bin;$env:PATH"
 
 Push-Location $repo
 try {
-    cargo xtask ci build-release --no-web
+    if ($Web) {
+        cargo xtask build --release --plugins-only
+        if ($LASTEXITCODE -ne 0) { throw "plugin build failed (exit $LASTEXITCODE)" }
+        cargo build --release --features web_server_capability
+    } else {
+        cargo xtask ci build-release --no-web
+    }
     if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     cargo build --release -p zellijctl
     if ($LASTEXITCODE -ne 0) { throw "zellijctl build failed (exit $LASTEXITCODE)" }
