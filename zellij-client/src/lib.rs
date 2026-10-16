@@ -866,6 +866,8 @@ pub fn start_remote_client(
     let full_screen_ws = os_input.get_terminal_size();
 
     os_input.set_raw_mode();
+    #[cfg(windows)]
+    stdin_handler_windows::enable_vt_input();
     stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes()).unwrap();
     if is_nested_inside_zellij_pane {
         let announce = nested_session::NestedSessionMessage::Announce {
