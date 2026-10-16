@@ -5,12 +5,13 @@
 # (the dispatcher mux shells out to). zellijctl is optional here: if it hasn't
 # been built yet we warn loudly and still install zellij, rather than silently
 # leaving mux pointed at a missing binary.
-$cargoBin = "$env:USERPROFILE\.cargo\bin"
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$cargoBin = Join-Path $cargoHome 'bin'
 $src      = "$PSScriptRoot\target\release\zellij.exe"
 $srcCtl   = "$PSScriptRoot\target\release\zellijctl.exe"
 
 if (-not (Test-Path $src)) {
-    Write-Error "No release build found at $src. Run 'cargo build --release' first."
+    Write-Error "No release build found at $src. Run '.\build.ps1' first."
     exit 1
 }
 
