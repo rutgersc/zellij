@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod happy_eyeballs;
 pub mod http_client;
 pub mod websockets;
 
