@@ -24,6 +24,8 @@
 //! to clear them, so repeating them would be a second alert for one event with
 //! no way to dismiss it here. Closed (inactive) herdr rows are hidden from the
 //! bar only; they stay in the working set, where herdr and Pit Wall show them.
+//! Clicking the herdr header collapses the group to its header, which then
+//! shows `N ▸` for the rows it holds back; clicking again expands it (`▾`).
 //!
 //! Status carries through the name fg (magenta=busy, white=idle/waiting,
 //! red=unknown). The row's first columns are a per-column priority stack:
@@ -258,6 +260,8 @@ enum RowTarget {
     Agent(String),
     /// A live session's header — switches this client to it.
     Session(String),
+    /// The herdr group header — collapses or expands its rows.
+    ToggleHerdr,
 }
 
 #[derive(Default)]
@@ -308,6 +312,8 @@ struct State {
     dismissed_events_dir: Option<PathBuf>,
     /// Keyboard cursor — agent index in display order (groups → agents).
     selected_idx: Option<usize>,
+    /// The herdr group shows only its header, with a count of the rows it hides.
+    herdr_collapsed: bool,
     own_plugin_id: Option<u32>,
     was_focused: bool,
     last_external_focused_pane: Option<u32>,
@@ -513,6 +519,20 @@ impl ZellijPlugin for State {
                     // session or pointlessly re-attach the one we're in.
                     Some(RowTarget::Session(name)) => {
                         switch_session(Some(&name));
+                        true
+                    },
+                    Some(RowTarget::ToggleHerdr) => {
+                        let selected = self
+                            .selected_idx
+                            .and_then(|i| self.display_order().get(i).map(Agent::identity));
+                        self.herdr_collapsed = !self.herdr_collapsed;
+                        self.selected_idx = selected
+                            .and_then(|sid| {
+                                self.display_order()
+                                    .iter()
+                                    .position(|a| a.identity() == sid)
+                            })
+                            .or(self.selected_idx);
                         true
                     },
                     Some(RowTarget::Agent(sid)) => {
@@ -784,7 +804,7 @@ impl State {
     }
 
     fn display_order(&self) -> Vec<Agent> {
-        grouped(&self.visible_agents(), &self.sessions)
+        grouped(&self.visible_agents(), &self.sessions, self.herdr_collapsed)
             .into_iter()
             .flat_map(|g| g.rows.into_iter().map(|r| r.agent))
             .collect()
@@ -1095,7 +1115,7 @@ impl State {
             );
         }
 
-        let groups = grouped(&raw_agents, &self.sessions);
+        let groups = grouped(&raw_agents, &self.sessions, self.herdr_collapsed);
         let display: Vec<Agent> = groups
             .iter()
             .flat_map(|g| g.rows.iter().map(|r| r.agent.clone()))
@@ -1150,16 +1170,21 @@ impl State {
                     unrouted_in_group,
                     open_elsewhere,
                     switch_to,
+                    toggle,
                 } => {
                     let is_active = !session.is_empty() && label.as_str() == session.as_str();
                     if let Some(name) = switch_to {
                         self.row_ranges
                             .push((visible_row, RowTarget::Session(name.clone())));
                     }
+                    if toggle.is_some() {
+                        self.row_ranges.push((visible_row, RowTarget::ToggleHerdr));
+                    }
                     render_header(
                         label,
                         *unrouted_in_group,
                         *open_elsewhere,
+                        *toggle,
                         is_active,
                         colors,
                         cols,
@@ -1279,6 +1304,15 @@ struct Group {
     label: GroupLabel,
     rows: Vec<Row>,
     any_unrouted: bool,
+    /// Rows a collapsed group holds back; 0 for an expanded one.
+    hidden: usize,
+}
+
+/// The collapse state a header's toggle shows.
+#[derive(Clone, Copy)]
+enum Toggle {
+    Expanded,
+    Collapsed(usize),
 }
 
 /// A single display row: an agent plus its place in the parent/child tree.
@@ -1377,6 +1411,8 @@ enum Line {
         /// readmodel (switching to a name with no live session would silently
         /// create one).
         switch_to: Option<String>,
+        /// The collapse button, on the herdr header only.
+        toggle: Option<Toggle>,
     },
     AgentRow {
         sid: String,
@@ -1415,7 +1451,11 @@ enum Line {
 /// render as full top-level rows (wrap to `MAX_NAME_LINES`, not the single-line
 /// child form). `display_order` and `build_lines` both consume this, so their
 /// row order stays in lockstep.
-fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Group> {
+fn grouped(
+    agents: &[Agent],
+    sessions: &HashMap<String, SessionMeta>,
+    herdr_collapsed: bool,
+) -> Vec<Group> {
     let is_bg = |a: &Agent| a.kind == "bg";
 
     let key_of = |a: &Agent| match &a.host {
@@ -1443,6 +1483,11 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
             // by definition, so flagging it would mark the header permanently.
             let any_unrouted = matches!(label, GroupLabel::Session(_))
                 && tops.iter().any(|a| a.host.zellij_pane_id().is_none());
+            let hidden = if herdr_collapsed && label == GroupLabel::Herdr {
+                std::mem::take(&mut tops).len()
+            } else {
+                0
+            };
             let rows = tops
                 .into_iter()
                 .map(|t| {
@@ -1459,6 +1504,7 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
                 label,
                 rows,
                 any_unrouted,
+                hidden,
             }
         })
         .collect();
@@ -1493,6 +1539,7 @@ fn grouped(agents: &[Agent], sessions: &HashMap<String, SessionMeta>) -> Vec<Gro
             label: GroupLabel::BackgroundAgents,
             rows,
             any_unrouted: false,
+            hidden: 0,
         });
     }
 
@@ -1533,6 +1580,10 @@ fn build_lines(
                 GroupLabel::Session(name) if !is_own && meta.is_some() => Some(name.clone()),
                 _ => None,
             },
+            toggle: (g.label == GroupLabel::Herdr).then_some(match g.hidden {
+                0 => Toggle::Expanded,
+                n => Toggle::Collapsed(n),
+            }),
         });
         for row in &g.rows {
             let a = &row.agent;
@@ -1687,6 +1738,7 @@ fn render_header(
     label: &str,
     unrouted_in_group: bool,
     open_elsewhere: bool,
+    toggle: Option<Toggle>,
     is_active: bool,
     colors: &AgentColors,
     cols: usize,
@@ -1696,8 +1748,14 @@ fn render_header(
     // butting against the pane edge — a session name therefore starts one col
     // right of an agent's age gutter and three left of an agent's title, so the
     // two kinds of row are never mistaken for each other.
+    let button = match toggle {
+        None => String::new(),
+        Some(Toggle::Expanded) => " \u{25BE} ".to_string(),
+        Some(Toggle::Collapsed(n)) => format!(" {n} \u{25B8} "),
+    };
     let body_w = cols.saturating_sub(OUTER_PAD);
-    let mut text_budget = body_w;
+    let button = if button.width() < body_w { button } else { String::new() };
+    let mut text_budget = body_w - button.width();
     let mut trimmed = String::new();
     for c in label.chars() {
         let cw = c.to_string().width();
@@ -1758,6 +1816,7 @@ fn render_header(
     }
     let trailing: String = std::iter::repeat(' ').take(text_budget).collect();
     body.push_str(&style!(h_fg, h_bg).paint(trailing).to_string());
+    body.push_str(&style!(colors.accent, h_bg).bold().paint(button).to_string());
     let outer = style!(h_fg, h_bg).paint(" ".to_string()).to_string();
     format!("{outer}{body}")
 }
@@ -2252,5 +2311,59 @@ mod age_ladder {
             assert_eq!(age_ago(ms).width(), AGE_W, "{ms}ms overflowed the gutter");
         }
         assert_eq!(format_age(NOW, 0).width(), AGE_W);
+    }
+}
+
+#[cfg(test)]
+mod herdr_toggle {
+    use super::*;
+
+    fn plain(styled: &str) -> String {
+        let mut out = String::new();
+        let mut chars = styled.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn header(toggle: Option<Toggle>, cols: usize) -> String {
+        let colors = AgentColors::from_palette(&ModeInfo::default().style.colors);
+        plain(&render_header(HERDR_LABEL, false, false, toggle, false, &colors, cols))
+    }
+
+    #[test]
+    fn expanded_shows_the_down_triangle_at_the_right_edge() {
+        let h = header(Some(Toggle::Expanded), 20);
+        assert_eq!(h.width(), 20);
+        assert!(h.ends_with(" \u{25BE} "), "{h:?}");
+        assert!(h.starts_with(" herdr"), "{h:?}");
+    }
+
+    #[test]
+    fn collapsed_shows_the_hidden_count() {
+        let h = header(Some(Toggle::Collapsed(3)), 20);
+        assert_eq!(h.width(), 20);
+        assert!(h.ends_with(" 3 \u{25B8} "), "{h:?}");
+    }
+
+    #[test]
+    fn a_header_without_a_toggle_has_no_button() {
+        let h = header(None, 20);
+        assert!(!h.contains('\u{25BE}') && !h.contains('\u{25B8}'), "{h:?}");
+    }
+
+    #[test]
+    fn too_narrow_a_pane_drops_the_button_not_the_width() {
+        let h = header(Some(Toggle::Collapsed(12)), 5);
+        assert_eq!(h.width(), 5);
     }
 }
